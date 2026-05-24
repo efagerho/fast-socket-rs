@@ -1,0 +1,15 @@
+[package]
+name = "fast-socket-xdp-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fast-socket-xdp-prog"
+path = "src/main.rs"
+required-features = ["ebpf"]
+
+[features]
+ebpf = []
+
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = "0.1"

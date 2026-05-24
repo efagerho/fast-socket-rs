@@ -1,0 +1,10 @@
+[package]
+name = "fast-socket-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[[bench]]
+name = "workload_fit"
+harness = false

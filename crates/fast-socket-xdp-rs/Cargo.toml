@@ -1,0 +1,13 @@
+[package]
+name = "fast-socket-xdp-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossbeam-queue = "0.3"
+fast-socket-rs = { path = "../fast-socket-rs" }
+fast-socket-xdp-ebpf = { path = "../fast-socket-xdp-ebpf" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.13"
+libc = "0.2"
