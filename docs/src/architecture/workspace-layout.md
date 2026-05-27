@@ -44,3 +44,10 @@ This crate contains benchmark and profiling entry points: OS/XDP sender and
 listener binaries plus perf helper scripts. It may use multiple backend crates
 because it measures end-to-end behavior rather than defining reusable library
 abstractions.
+
+`examples`
+
+This crate contains runnable API examples. `blast` demonstrates a generic
+`UdpSocket` transmit loop over either OS UDP or AF_XDP UDP. `pong-server`
+demonstrates a multi-queue reflection server that keeps backend construction in
+`main` and passes each concrete socket to a generic UDP loop.

@@ -15,9 +15,5 @@ name = "blast"
 path = "src/bin/blast.rs"
 
 [[bin]]
-name = "ping-client"
-path = "src/bin/ping-client.rs"
-
-[[bin]]
 name = "pong-server"
 path = "src/bin/pong-server.rs"

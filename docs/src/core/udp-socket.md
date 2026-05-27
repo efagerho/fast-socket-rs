@@ -99,9 +99,9 @@ The OS backend implements `UdpSocket` directly. It uses readiness polling and
 copy-based receive semantics. Its completion drain is an inlined no-op because
 the kernel owns completion work.
 
-The AF_XDP backend implements `UdpSocket` through `XdpUdpSocket`. It owns an
-`XdpIpPacketSocket`, local IPv4 UDP address, and UDP egress resolver. The
-resolver maps each remote IPv4 address to the XDP egress data needed to build
+The AF_XDP backend implements `UdpSocket` through `XdpUdpSocket`. Users build it
+from interface, queue, local IPv4 UDP address, and router configuration. The
+router maps each remote IPv4 address to the XDP egress data needed to build
 Ethernet, IPv4, and UDP headers in the backend path.
 
 The core crate has no generic UDP-over-IP adapter. Backends that expose UDP

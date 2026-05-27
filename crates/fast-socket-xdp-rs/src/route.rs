@@ -232,7 +232,7 @@ impl EgressResolver<V4Only, XdpEgress> for RouteSnapshot {
 }
 
 /// Queue-local route state with cold-path update adoption.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct XdpLocalRoutes {
     snapshot: Box<RouteSnapshot>,
     pending: VecDeque<RouteSnapshot>,

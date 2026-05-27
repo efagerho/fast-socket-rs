@@ -6,7 +6,7 @@ The dependency graph is simple:
 - `fast-socket-os-rs` depends on `fast-socket-rs`.
 - `fast-socket-xdp-rs` depends on `fast-socket-rs` and the eBPF support crate.
 - `fast-socket-xdp-ebpf` is a backend support crate, not part of the core API.
-- Benchmark crates may depend on any implementation they measure.
+- Benchmark and example crates may depend on any implementation they exercise.
 
 The core crate must not include conditional backend logic such as "if this is
 XDP" or "if this is an OS socket." Backend selection happens by choosing a

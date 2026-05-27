@@ -24,6 +24,7 @@ The current workspace shape is:
   plus Linux routing support.
 - `fast-socket-xdp-ebpf`: embedded eBPF/XDP program for AF_XDP redirection.
 - `benchmarks`: benchmark harnesses and runnable OS/XDP sender/listener tools.
+- `examples`: small API examples, including `blast` and `pong-server`.
 
 The core principle is one-way dependency flow. Backends depend on the core
 crate; the core crate does not depend on backends. Backend crates avoid

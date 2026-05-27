@@ -2,13 +2,17 @@
 
 use core::num::NonZeroUsize;
 use std::io;
+use std::net::SocketAddrV4;
 
 use fast_socket_rs::{BufferLayout, HugePageSize, IfIndex, NumaNode, QueueBufferConfig, QueueId};
 
 use crate::program::{AttachMode, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
 use crate::route::RouteSnapshot;
-use crate::socket::{BusyPollXdpIpPacketSocket, ReadinessXdpIpPacketSocket, XdpIpPacketSocket};
+use crate::socket::{
+    BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
+    ReadinessXdpUdpSocket, XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpRouter, XdpUdpSocket,
+};
 
 /// Configuration for one AF_XDP queue socket.
 #[derive(Clone, Debug)]
@@ -84,6 +88,14 @@ impl Default for XdpIpPacketSocketConfig {
 #[derive(Clone, Debug)]
 pub struct XdpIpPacketSocketBuilder {
     config: XdpIpPacketSocketConfig,
+}
+
+/// Builder for an AF_XDP UDP socket.
+#[derive(Clone, Debug)]
+pub struct XdpUdpSocketBuilder<R = XdpQueueLocalRouter> {
+    config: XdpIpPacketSocketConfig,
+    local_addr: SocketAddrV4,
+    router: R,
 }
 
 impl XdpIpPacketSocketBuilder {
@@ -205,5 +217,162 @@ impl XdpIpPacketSocketBuilder {
     #[must_use]
     pub fn into_config(self) -> XdpIpPacketSocketConfig {
         self.config
+    }
+}
+
+impl XdpUdpSocketBuilder<XdpQueueLocalRouter> {
+    /// Creates a builder for `ifindex`, `queue_id`, and a local IPv4 UDP address.
+    #[must_use]
+    pub fn new(ifindex: IfIndex, queue_id: QueueId, local_addr: SocketAddrV4) -> Self {
+        Self {
+            config: XdpIpPacketSocketConfig {
+                ifindex,
+                queue_id,
+                bind_udp_port: Some(local_addr.port()),
+                ..XdpIpPacketSocketConfig::default()
+            },
+            local_addr,
+            router: XdpQueueLocalRouter::default(),
+        }
+    }
+
+    /// Seeds the queue-local route, neighbor, and link cache.
+    #[must_use]
+    pub fn route_snapshot(mut self, snapshot: RouteSnapshot) -> Self {
+        self.config.route_snapshot = snapshot.clone();
+        self.router = XdpQueueLocalRouter::new(snapshot);
+        self
+    }
+}
+
+impl<R> XdpUdpSocketBuilder<R> {
+    /// Sets queue buffer configuration.
+    #[must_use]
+    pub fn buffers(mut self, buffers: QueueBufferConfig) -> Self {
+        self.config.buffers = buffers;
+        self
+    }
+
+    /// Sets the NUMA node hint.
+    #[must_use]
+    pub const fn numa_node(mut self, numa_node: NumaNode) -> Self {
+        self.config.numa_node = Some(numa_node);
+        self
+    }
+
+    /// Sets the hugepage preference.
+    #[must_use]
+    pub const fn huge_page_size(mut self, huge_page_size: HugePageSize) -> Self {
+        self.config.huge_page_size = huge_page_size;
+        self
+    }
+
+    /// Sets ring sizes.
+    #[must_use]
+    pub const fn rings(mut self, rings: RingSizes) -> Self {
+        self.config.rings = rings;
+        self
+    }
+
+    /// Sets AF_XDP mode.
+    #[must_use]
+    pub const fn mode(mut self, mode: XdpMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    /// Sets the IP-layer MTU used to size UDP datagrams.
+    #[must_use]
+    pub const fn mtu(mut self, mtu: usize) -> Self {
+        self.config.mtu = mtu;
+        self
+    }
+
+    /// Sets the total UMEM frame count for live sockets.
+    #[must_use]
+    pub const fn frame_count(mut self, frame_count: u32) -> Self {
+        self.config.frame_count = frame_count;
+        self
+    }
+
+    /// Sets the XDP attach mode for live sockets.
+    #[must_use]
+    pub const fn attach_mode(mut self, attach_mode: AttachMode) -> Self {
+        self.config.attach_mode = attach_mode;
+        self
+    }
+
+    /// Sets custom XDP program bytes for live sockets.
+    #[must_use]
+    pub const fn program_bytes(mut self, program_bytes: &'static [u8]) -> Self {
+        self.config.program_bytes = Some(program_bytes);
+        self
+    }
+
+    /// Reuses a pre-attached XDP program for live sockets.
+    #[must_use]
+    pub fn attached_program(mut self, program: XdpProgramHandle) -> Self {
+        self.config.attached_program = Some(program);
+        self
+    }
+
+    /// Sets the UDP destination port used by UDP-filtered redirect programs.
+    #[must_use]
+    pub const fn bind_udp_port(mut self, port: u16) -> Self {
+        self.config.bind_udp_port = Some(port);
+        self
+    }
+
+    /// Disables UDP destination-port filtering for the loaded XDP program.
+    #[must_use]
+    pub const fn without_udp_port_filter(mut self) -> Self {
+        self.config.bind_udp_port = None;
+        self
+    }
+
+    /// Uses a custom UDP egress router.
+    #[must_use]
+    pub fn router<N>(self, router: N) -> XdpUdpSocketBuilder<N> {
+        XdpUdpSocketBuilder {
+            config: self.config,
+            local_addr: self.local_addr,
+            router,
+        }
+    }
+
+    /// Builds the first-pass busy-poll UDP socket.
+    #[must_use]
+    pub fn open_busy_poll(self) -> BusyPollXdpUdpSocket<R>
+    where
+        R: XdpUdpRouter,
+    {
+        let ip = XdpIpPacketSocket::new_busy_poll(self.config);
+        XdpUdpSocket::from_ip_socket(ip, self.local_addr, self.router)
+    }
+
+    /// Builds a live busy-poll AF_XDP UDP socket.
+    pub fn open_busy_poll_live(self) -> io::Result<BusyPollXdpUdpSocket<R>>
+    where
+        R: XdpUdpRouter,
+    {
+        let ip = XdpIpPacketSocket::new_busy_poll_live(self.config)?;
+        Ok(XdpUdpSocket::from_ip_socket(
+            ip,
+            self.local_addr,
+            self.router,
+        ))
+    }
+
+    /// Builds a live readiness-driven AF_XDP UDP socket.
+    pub fn open_readiness_live(self) -> io::Result<ReadinessXdpUdpSocket<R>>
+    where
+        R: XdpUdpRouter,
+    {
+        let ip = XdpIpPacketSocket::new_readiness_live(self.config)?;
+        Ok(XdpUdpSocket::from_ip_socket(
+            ip,
+            self.local_addr,
+            self.router,
+        ))
     }
 }

@@ -53,25 +53,20 @@ Use `--mode xdp` for the AF_XDP-backed socket. The blaster creates one thread
 and one `UdpSocket`, then sends 64-byte UDP payloads as fast as the backend
 accepts them.
 
-The examples crate also includes a multi-queue ping/pong pair:
+The examples crate also includes a multi-queue reflection server:
 
 ```bash
 cargo run -p fast-socket-examples --bin pong-server -- \
   --device eth0 \
   --target 192.0.2.20:9000 \
   --mode os
-
-cargo run -p fast-socket-examples --bin ping-client -- \
-  --device eth0 \
-  --target 192.0.2.10:9000 \
-  --mode os
 ```
 
-Both binaries create one socket per NIC queue and pin worker threads to the
-queue CPUs. In OS mode they use `SO_REUSEPORT` and `SO_INCOMING_CPU`; in XDP
-mode they bind one AF_XDP UDP socket per queue. For `pong-server`, `--target`
-names the expected peer endpoint; the server binds the device IP with that port
-and uses the peer IP for XDP egress resolution.
+`pong-server` creates one socket per NIC queue and pins worker threads to the
+queue CPUs. In OS mode it uses `SO_REUSEPORT` and `SO_INCOMING_CPU`; in XDP mode
+it binds one AF_XDP UDP socket per queue. `--target` names the expected peer
+endpoint; the server binds the device IP with that port and uses the peer IP for
+XDP egress resolution.
 
 ## Documentation
 

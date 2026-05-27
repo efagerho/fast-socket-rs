@@ -20,7 +20,7 @@ fn blaster<S>(socket: &mut S, target: SocketAddr) -> Result<(), BoxError>
 where
     S: UdpSocket,
 {
-    let mut sequence = 0u64;
+    let mut count = 0u64;
     let mut payload = [0u8; PAYLOAD_LEN];
     let mut tx_buffers: Vec<UdpTxBufferMut<S>> = Vec::with_capacity(BATCH_SIZE);
     let mut batch: Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>> =
@@ -33,10 +33,9 @@ where
         socket.allocate_tx_batch(&mut tx_buffers, BATCH_SIZE)?;
 
         while let Some(mut packet) = tx_buffers.pop() {
-            write_sequence(&mut payload, sequence);
+            write_sequence(&mut payload, count + batch.len() as u64);
             packet.extend_from_slice(&payload)?;
             batch.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), target)));
-            sequence = sequence.wrapping_add(1);
         }
 
         if batch.is_empty() {
@@ -47,10 +46,9 @@ where
 
         let accepted = socket.send(batch.as_mut_slice())?;
         if accepted < batch.len() {
-            let rejected = batch.len() - accepted;
-            sequence = sequence.wrapping_sub(rejected as u64);
             socket.drain_tx_completions()?;
         }
+        count += accepted as u64;
     }
 
     Ok(())
@@ -69,9 +67,10 @@ transmit type, wraps it in `UdpTransmit`, and marks the slot `TxSlot::Ready`.
 
 `send` accepts a prefix of submitted slots and consumes those packets by turning
 their slots into `TxSlot::Taken`. A short accept is not an error, so the loop
-rewinds the sequence number for the unaccepted tail and drains completions
-before retrying. This preserves one sequence number per submitted packet while
-honoring the batch API's prefix-accept contract.
+drains completions before retrying. Sequence numbers are derived from the number
+of accepted packets plus the packet's index in the current batch, so rebuilding
+an unaccepted tail reuses the same sequence range while honoring the batch API's
+prefix-accept contract.
 
 `drain_tx_completions` stays in the generic loop even though the OS backend does
 not need explicit transmit completions. For zero-copy backends such as AF_XDP,

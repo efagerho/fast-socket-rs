@@ -27,7 +27,7 @@
   - [Future DPDK Backend](backends/dpdk.md)
 - [Code Examples](code-examples.md)
   - [Packet Blaster](code-examples/packet-blaster.md)
-  - [Ping/Pong](code-examples/ping-pong.md)
+  - [Reflection Server](code-examples/reflection-server.md)
 - [Benchmarking](benchmarking.md)
 - [Testing Strategy](testing-strategy.md)
 - [Open Questions](open-questions.md)

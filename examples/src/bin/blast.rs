@@ -13,8 +13,7 @@ use fast_socket_rs::{
     UdpTransmit, UdpTxBuffer, UdpTxBufferMut,
 };
 use fast_socket_xdp_rs::{
-    BusyPollXdpUdpSocket, RouteSnapshot, XdpIpPacketSocketBuilder, XdpUdpSocket, if_name_to_index,
-    resolve_xdp_queue_slot,
+    BusyPollXdpUdpSocket, RouteSnapshot, XdpUdpSocket, if_name_to_index, resolve_xdp_queue_slot,
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -124,12 +123,11 @@ fn open_xdp_socket(device: &str, target: SocketAddrV4) -> Result<BusyPollXdpUdpS
     let egress = routes
         .egress_v4_for_interface(*target.ip(), slot.ifindex, slot.queue)
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", target.ip()))?;
-    let ip_socket = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
+    Ok(XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
         .mtu(egress.mtu as usize)
         .route_snapshot(routes)
         .bind_udp_port(local.port())
-        .open_busy_poll_live()?;
-    Ok(XdpUdpSocket::new(ip_socket, local))
+        .open_busy_poll_live()?)
 }
 
 fn open_os_socket(device: &str, target: SocketAddr) -> Result<OsUdpSocket, BoxError> {

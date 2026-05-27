@@ -14,9 +14,9 @@ use fast_socket_rs::{
     BufferPool, IfIndex, PacketBufferMut, QueueId, RecvBatch, TxSlot, UdpSocket, UdpTransmit,
 };
 use fast_socket_xdp_rs::{
-    BusyPollXdpUdpSocket, RouteSnapshot, XdpIpPacketSocketBuilder, XdpPacketBuf, XdpPacketBufMut,
-    XdpProgramHandle, XdpQueueSlot, XdpUdpSocket, cpu_for_xdp_queue, if_index_to_name,
-    resolve_xdp_queue_slot, xdp_queue_slots_for_interface,
+    BusyPollXdpUdpSocket, RouteSnapshot, XdpPacketBuf, XdpPacketBufMut, XdpProgramHandle,
+    XdpQueueSlot, XdpUdpSocket, cpu_for_xdp_queue, if_index_to_name, resolve_xdp_queue_slot,
+    xdp_queue_slots_for_interface,
 };
 
 const USAGE: &str = "usage: xdp-sender <blast|ping> (--ifindex N | --iface NAME) [--queue N | --all-queues] --local IPv4:PORT --dest IPv4:PORT [--payload-len N] [--count N] [--duration-ms N] [--rate PPS]";
@@ -133,15 +133,14 @@ fn open_udp_socket(
     let egress = routes
         .egress_v4_for_interface(*dest.ip(), slot.ifindex, slot.queue)
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", dest.ip()))?;
-    let mut builder = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
+    let mut builder = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
         .mtu(egress.mtu as usize)
         .route_snapshot(routes.clone())
         .bind_udp_port(local.port());
     if let Some(program) = program {
         builder = builder.attached_program(program.clone());
     }
-    let ip_socket = builder.open_busy_poll_live()?;
-    Ok(XdpUdpSocket::new(ip_socket, local))
+    Ok(builder.open_busy_poll_live()?)
 }
 
 fn blast<S>(

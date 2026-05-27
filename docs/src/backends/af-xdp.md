@@ -58,15 +58,15 @@ rejects descriptor ranges outside their UMEM frame, accepts IPv4 and IPv6
 frames, drops IP fragments, wraps the UMEM frame as an `XdpPacketBufMut`, and
 exposes only the IP datagram to `IpPacketSocket::recv`.
 
-`XdpUdpSocket` wraps an `XdpIpPacketSocket` with a local IPv4 UDP address and
-resolved `XdpEgress`. On live receive it parses Ethernet, IPv4, and UDP in one
-pass, filters by local address and port, wraps only the UDP payload, and returns
-`UdpReceive` with `UdpRecvMeta`. On transmit it validates queue-local egress,
-builds IPv4 and UDP headers, prepares the Ethernet or VLAN header once per
-batch, and submits through the AF_XDP TX path. The live UDP path overrides
-`allocate_tx_batch` so callers can obtain multiple TX buffers with one
-reclaim-list batch. The current direct UDP implementation is IPv4-only and
-reports default UDP capabilities.
+`XdpUdpSocket` is constructed through a UDP-level builder from interface, queue,
+local IPv4 UDP address, and router configuration. On live receive it parses
+Ethernet, IPv4, and UDP in one pass, filters by local address and port, wraps
+only the UDP payload, and returns `UdpReceive` with `UdpRecvMeta`. On transmit it
+resolves each remote address through its router, validates queue-local egress,
+builds IPv4 and UDP headers, prepares the Ethernet or VLAN header, and submits
+through the AF_XDP TX path. The live UDP path overrides `allocate_tx_batch` so
+callers can obtain multiple TX buffers with one reclaim-list batch. The current
+direct UDP implementation is IPv4-only and reports default UDP capabilities.
 
 Live IP packet transmit validates the egress interface and queue, checks MTU and
 ethertype, prepares a valid prefix up to TX ring availability, prepends the
@@ -91,9 +91,9 @@ netlink resolver.
 
 Routing uses queue-local snapshots. `RouteSnapshot` is built from netlink route,
 neighbor, and link dumps. UDP sockets resolve each remote address through an
-`XdpUdpEgressResolver`; the default resolver reads the wrapped IP socket's
-queue-local snapshot. `XdpRouteMonitor` can publish refreshed snapshots to queue
-owners, and each queue adopts updates outside its packet path.
+`XdpUdpRouter`; the default `XdpQueueLocalRouter` owns queue-local route state.
+`XdpRouteMonitor` can publish refreshed snapshots to queue owners, and each
+queue adopts updates outside its packet path.
 
 For tests and unprivileged bring-up, an in-memory first-pass mode queues
 normalized packets and submitted Ethernet frames without opening a live AF_XDP

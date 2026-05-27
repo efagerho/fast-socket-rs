@@ -36,7 +36,7 @@ pub mod umem;
 #[cfg(target_os = "linux")]
 pub use buffer::{XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
 #[cfg(target_os = "linux")]
-pub use config::{XdpIpPacketSocketBuilder, XdpIpPacketSocketConfig};
+pub use config::{XdpIpPacketSocketBuilder, XdpIpPacketSocketConfig, XdpUdpSocketBuilder};
 #[cfg(target_os = "linux")]
 pub use egress::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, XdpEgress};
 #[cfg(target_os = "linux")]
@@ -59,8 +59,8 @@ pub use route_monitor::{XdpRouteMonitor, XdpRouteMonitorHandle};
 #[cfg(target_os = "linux")]
 pub use socket::{
     BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
-    ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalUdpResolver,
-    XdpUdpEgressResolver, XdpUdpSocket,
+    ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalRouter,
+    XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
 };
 #[cfg(target_os = "linux")]
 pub use umem::{AllocError, PageAlignedMemory, Umem};
