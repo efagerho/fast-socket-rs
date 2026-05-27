@@ -25,6 +25,8 @@
   - [OS Backend](backends/os.md)
   - [AF_XDP Backend](backends/af-xdp.md)
   - [Future DPDK Backend](backends/dpdk.md)
+- [Code Examples](code-examples.md)
+  - [Packet Blaster](code-examples/packet-blaster.md)
 - [Benchmarking](benchmarking.md)
 - [Testing Strategy](testing-strategy.md)
 - [Open Questions](open-questions.md)

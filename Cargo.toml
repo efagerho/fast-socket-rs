@@ -5,6 +5,7 @@ members = [
     "crates/fast-socket-xdp-rs",
     "crates/fast-socket-xdp-ebpf",
     "benchmarks",
+    "examples",
 ]
 resolver = "3"
 
