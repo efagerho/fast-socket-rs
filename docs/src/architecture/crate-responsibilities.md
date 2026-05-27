@@ -1,8 +1,8 @@
 # Crate Responsibilities
 
 The core crate owns shared vocabulary. A type or trait belongs in
-`fast-socket-rs` when more than one backend or future adapter can use it
-without knowing how that backend is implemented.
+`fast-socket-rs` when multiple backends or adapters can use it without knowing
+backend internals.
 
 Core-owned responsibilities include:
 
@@ -14,8 +14,7 @@ Core-owned responsibilities include:
 - polling driver traits and canonical driver types.
 
 Backend crates own concrete capabilities. A type belongs in a backend crate when
-it describes a real operating-system, kernel, NIC, memory, or file-descriptor
-detail.
+it describes an OS, kernel, NIC, memory, or file-descriptor detail.
 
 Backend-owned responsibilities include:
 
@@ -27,12 +26,11 @@ Backend-owned responsibilities include:
 - device-specific statistics and capability mapping;
 - unsafe code required to call kernel or driver APIs.
 
-This split is important for both API clarity and code generation. For example,
-`XdpEgress` belongs in `fast-socket-xdp-rs` because it contains MAC addresses,
-VLAN state, an interface index, an AF_XDP queue id, and an ethertype. The core
-crate only needs to know that it implements `IpPacketEgress`.
+This split protects API clarity and code generation. `XdpEgress` belongs in
+`fast-socket-xdp-rs` because it contains MAC addresses, VLAN state, an
+interface index, an AF_XDP queue id, and an ethertype. The core crate only needs
+to know that it implements `IpPacketEgress`.
 
-Future backend-agnostic adapters should live in the core crate only after a real
-shared use case proves their trait bounds and packet-ownership rules. Until
-then, direct backend implementations should keep backend-specific parsing,
-header construction, and offload behavior in backend crates.
+Backend-agnostic adapters should move into the core crate only after a shared
+use case proves their trait bounds and ownership rules. Until then, backends
+keep parsing, header construction, and offload behavior in backend crates.

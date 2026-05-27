@@ -1,22 +1,20 @@
 # Architecture
 
-The architecture has two implemented layers, with room for an optional adapter
-layer above IP packet backends.
+The architecture has two implemented layers and room for adapters above IP
+packet backends.
 
-At the center is `fast-socket-rs`, the backend-agnostic core crate. It defines
-the public traits, buffer model, packet metadata, policy types, route and egress
-vocabulary. It does not open OS sockets, load XDP programs, allocate DPDK
-memory, or depend on backend crates.
+`fast-socket-rs` is the backend-agnostic core crate. It defines public traits,
+the buffer model, packet metadata, policy types, and route/egress vocabulary.
+It does not open OS sockets, load XDP programs, allocate DPDK memory, or depend
+on backend crates.
 
-Backend crates sit below the core API. They own concrete socket state,
-backend-specific buffer pools, file descriptors, rings, UMEM, route snapshots,
-and device integration. A backend crate implements the core traits using its own
-associated types.
+Backend crates sit below the core API. They own socket state, buffer pools,
+file descriptors, rings, UMEM, route snapshots, and device integration. Each
+backend implements the core traits with its own associated types.
 
-Backend-agnostic adapters can be added above IP packet backends when there is a
-clear shared use case, but none are part of the current core crate. Backends
-implement `UdpSocket` directly when they want to expose optimized UDP payload
-I/O.
+Backend-agnostic adapters can sit above IP packet backends when a shared use
+case appears. None are in the core crate today. Backends implement `UdpSocket`
+directly when they expose optimized UDP payload I/O.
 
 The current workspace shape is:
 
@@ -28,6 +26,6 @@ The current workspace shape is:
 - `benchmarks`: benchmark harnesses and runnable OS/XDP sender/listener tools.
 
 The core principle is one-way dependency flow. Backends depend on the core
-crate. The core crate does not depend on backends. Backend crates also avoid
-depending on each other unless a future design has a strong reason to share a
-backend-specific implementation detail.
+crate; the core crate does not depend on backends. Backend crates avoid
+depending on each other unless a future design needs shared backend-specific
+code.

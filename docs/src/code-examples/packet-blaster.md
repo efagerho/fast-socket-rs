@@ -1,12 +1,10 @@
 # Packet Blaster
 
-The packet blaster sends fixed-size UDP payloads to one target as quickly as the
-selected backend can accept them. The complete example program chooses either an
-OS-backed or AF_XDP-backed socket in `main`, then hands that concrete socket to a
-generic `blaster` function.
+The packet blaster sends fixed-size UDP payloads to one target as fast as the
+backend accepts them. The full program chooses an OS-backed or AF_XDP-backed
+socket in `main`, then passes it to generic `blaster`.
 
-The hot loop can be written against the `UdpSocket` trait instead of either
-backend type:
+The hot loop uses `UdpSocket`, not a backend type:
 
 ```rust,ignore
 use std::net::SocketAddr;
@@ -59,28 +57,24 @@ where
 }
 ```
 
-Each payload is exactly 64 bytes. `write_sequence` stores the current `u64`
-sequence number in the first eight bytes, which gives receivers a cheap way to
-spot gaps or reordering without changing the socket API. The loop does not rate
-limit; it keeps filling transmit buffers and submitting batches until shutdown
-is requested.
+Each payload is 64 bytes. `write_sequence` stores the current `u64` sequence in
+the first eight bytes, giving receivers a cheap gap or reordering check. The
+loop does not rate limit; it fills transmit buffers and submits batches until
+shutdown.
 
-The important API boundary is the transmit buffer pool. `allocate_tx_batch`
-fills caller-owned scratch space with mutable buffers from the socket's
-`TxPool`. The loop writes the UDP payload into each buffer, freezes it into the
-socket's immutable transmit buffer type, wraps it in `UdpTransmit`, and marks the
-slot as `TxSlot::Ready`.
+The key API boundary is the transmit buffer pool. `allocate_tx_batch` fills
+caller-owned scratch space with mutable buffers from the socket's `TxPool`. The
+loop writes each UDP payload, freezes the buffer into the socket's immutable
+transmit type, wraps it in `UdpTransmit`, and marks the slot `TxSlot::Ready`.
 
-`send` accepts a prefix of the submitted slots and consumes those packets by
-turning their slots into `TxSlot::Taken`. A short accept is not an error by
-itself, so the loop rewinds the sequence number for the unaccepted tail and
-drains transmit completions before trying again. That preserves the simple
-one-sequence-per-successfully-submitted-packet model while still honoring the
-batch API's prefix-accept contract.
+`send` accepts a prefix of submitted slots and consumes those packets by turning
+their slots into `TxSlot::Taken`. A short accept is not an error, so the loop
+rewinds the sequence number for the unaccepted tail and drains completions
+before retrying. This preserves one sequence number per submitted packet while
+honoring the batch API's prefix-accept contract.
 
-`drain_tx_completions` is part of the generic loop even though the OS backend
-does not need explicit transmit completion work. For zero-copy backends such as
-AF_XDP, it returns completed frames to the socket-owned pool so later
-`allocate_tx_batch` calls can reuse them. This is what lets the same loop run
-over both concrete socket implementations without knowing which backend it is
-driving.
+`drain_tx_completions` stays in the generic loop even though the OS backend does
+not need explicit transmit completions. For zero-copy backends such as AF_XDP,
+it returns completed frames to the socket-owned pool so later
+`allocate_tx_batch` calls can reuse them. The same loop can drive both sockets
+without knowing the backend.

@@ -1,7 +1,7 @@
 # Workspace Layout
 
-The repository is a Cargo workspace. Each crate has a narrow responsibility so
-that backend-specific code does not leak into the core API.
+The repository is a Cargo workspace. Each crate has a narrow responsibility, so
+backend-specific code stays out of the core API.
 
 `crates/fast-socket-rs`
 
@@ -18,18 +18,17 @@ This is the core crate. It owns:
 
 This crate implements direct OS-backed UDP. It wraps `std::net::UdpSocket`,
 puts it in nonblocking mode, uses readiness polling, and provides queue-local
-slab-backed packet buffers. On Linux it uses `sendmmsg` and `recvmmsg`; on other
-platforms it falls back to per-packet `send_to` and `recv_from`.
+slab-backed packet buffers. Linux uses `sendmmsg` and `recvmmsg`; other
+platforms use per-packet `send_to` and `recv_from`.
 
 `crates/fast-socket-xdp-rs`
 
-This crate implements AF_XDP-oriented IP packet and UDP socket backends. It owns
-XDP socket configuration, UMEM-backed buffers, ring access, egress handles,
-route snapshots, netlink integration, route-monitor fanout, and XDP program
-loading. Its `IpPacketSocket` implementation presents complete IP datagrams to
-the core API, while `XdpUdpSocket` implements `UdpSocket` directly for IPv4 UDP
-payload I/O. The live backend still receives and transmits Ethernet frames at
-the NIC.
+This crate implements AF_XDP IP packet and UDP backends. It owns XDP socket
+configuration, UMEM-backed buffers, rings, egress handles, route snapshots,
+netlink integration, route-monitor fanout, and XDP program loading.
+`IpPacketSocket` presents complete IP datagrams to the core API. `XdpUdpSocket`
+implements `UdpSocket` directly for IPv4 UDP payload I/O. The live backend
+still receives and transmits Ethernet frames at the NIC.
 
 `crates/fast-socket-xdp-ebpf`
 
@@ -41,7 +40,7 @@ traffic on the kernel path.
 
 `benchmarks`
 
-This crate contains benchmark and profiling entry points, including runnable
-OS/XDP sender and listener binaries plus perf helper scripts. It is allowed to
-use multiple backend crates because it measures end-to-end behavior rather than
-defining reusable library abstractions.
+This crate contains benchmark and profiling entry points: OS/XDP sender and
+listener binaries plus perf helper scripts. It may use multiple backend crates
+because it measures end-to-end behavior rather than defining reusable library
+abstractions.

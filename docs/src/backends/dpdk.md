@@ -1,8 +1,8 @@
 # Future DPDK Backend
 
-The DPDK backend is intentionally future work. The core API is shaped so that a
-DPDK implementation should fit, but the project should not pretend to know all
-DPDK-specific requirements before one exists.
+The DPDK backend is future work. The core API is shaped so a DPDK
+implementation should fit, but the project should not predesign every
+DPDK-specific requirement.
 
 The likely DPDK backend shape is:
 
@@ -15,15 +15,14 @@ The likely DPDK backend shape is:
   path;
 - optionally implement `RawDevice` for port capabilities and statistics.
 
-The existing IP packet boundary should still hold. DPDK may receive and transmit
-Ethernet frames at the device, but the public `IpPacketSocket` should expose
-complete IP datagrams. The backend would normalize received frames by trimming
-L2 headers and would prepend L2 headers during transmit from a resolved egress
-handle.
+The existing IP packet boundary should hold. DPDK may receive and transmit
+Ethernet frames at the device, but public `IpPacketSocket` should expose
+complete IP datagrams. The backend would trim L2 headers on receive and prepend
+them during transmit from a resolved egress handle.
 
-A direct DPDK `UdpSocket` would expose UDP payloads instead. Like `XdpUdpSocket`,
-it should keep UDP parsing, header construction, offloads, and mbuf details in
-the backend-specific path rather than relying on a generic UDP-over-IP adapter.
+A direct DPDK `UdpSocket` would expose UDP payloads. Like `XdpUdpSocket`, it
+should keep UDP parsing, header construction, offloads, and mbuf details in the
+backend path instead of relying on a generic UDP-over-IP adapter.
 
 Several questions should wait for implementation pressure:
 
@@ -38,5 +37,5 @@ Several questions should wait for implementation pressure:
   API.
 
 The first DPDK pass should be conservative: implement IP packet I/O, prove the
-buffer model, add direct UDP only when the backend-specific path is clear, and
-only then promote shared concepts into the core crate.
+buffer model, add direct UDP only when the backend path is clear, then promote
+shared concepts into the core crate.

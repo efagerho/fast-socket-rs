@@ -1,9 +1,8 @@
 # Goals and Non-Goals
 
-Fast Socket exists to make high-rate packet I/O explicit without forcing every
-caller to care about one specific backend. The public API should feel like one
-design, while still letting each backend keep the representation that makes it
-fast.
+Fast Socket makes high-rate packet I/O explicit without tying callers to one
+backend. The public API stays consistent while each backend keeps its fast
+representation.
 
 ## Goals
 
@@ -18,9 +17,8 @@ fast.
 
 ## Zero-Overhead Rules
 
-The zero-overhead requirement is a design constraint, not a slogan. It means
-unused abstractions must not leak measurable cost into steady-state packet
-paths.
+Zero overhead means unused abstractions must not add measurable cost to
+steady-state packet paths.
 
 - use static dispatch for steady-state packet operations;
 - avoid trait objects in send, receive, completion, and polling loops unless a
@@ -32,13 +30,13 @@ paths.
 - keep completion draining explicit for zero-copy transmit paths;
 - keep device control and statistics off the ordinary packet trait.
 
-A direct OS UDP socket should not instantiate IP packet routing code. A plain
-`IpPacketSocket` should not carry UDP adapter branches. A socket that does not
-need a doorbell should get an inlined no-op `notify_tx`.
+A direct OS UDP socket must not instantiate IP packet routing code. A plain
+`IpPacketSocket` must not carry UDP adapter branches. A socket that does not
+need a doorbell gets an inlined no-op `notify_tx`.
 
-When a choice is fixed by socket construction, it should be represented by
-associated types or concrete generic parameters rather than runtime enums.
-`IpFamily`, polling drivers, egress handles, and packet policies are examples.
+Choices fixed at socket construction belong in associated types or generic
+parameters, not runtime enums. Examples include `IpFamily`, polling drivers,
+egress handles, and packet policies.
 
 Copy boundaries must be visible. OS UDP receive copies packet bytes into
 pool-owned buffers. XDP live receive can wrap UMEM frames directly. Relocating
@@ -48,7 +46,7 @@ that still report prefix-ordered send acceptance.
 
 ## Non-Goals
 
-The current design intentionally does not try to provide:
+The current design does not provide:
 
 - API compatibility with any earlier socket crate.
 - A single trait object that erases all backend differences in the hot path.
@@ -57,5 +55,5 @@ The current design intentionally does not try to provide:
 - A DPDK backend before there is enough concrete implementation pressure to
   design it well.
 
-The book should record the reasoning behind these choices. When implementation
-experience changes the design, the docs should change with it.
+The book records these choices and should change when implementation experience
+changes the design.

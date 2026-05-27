@@ -3,8 +3,7 @@
 The `IpPacketSocket` packet boundary is a complete IP datagram. Byte zero is the
 first byte of the IPv4 or IPv6 header.
 
-This is the most important packet-model decision in the project. It means an IP
-packet item is not:
+An IP packet item is not:
 
 - an Ethernet frame;
 - a UDP payload;
@@ -13,9 +12,9 @@ packet item is not:
 
 The IP header is part of the packet bytes. Metadata may duplicate selected
 facts, such as source address, destination address, hop limit, checksum status,
-or egress, but it is not the source of truth for a missing header.
+or egress, but it is not a substitute for the header.
 
-This boundary has several advantages:
+This boundary provides:
 
 - Future adapters can construct outer packets by prepending headers to an
   existing payload or inner datagram.
@@ -25,5 +24,5 @@ This boundary has several advantages:
 - ARP, neighbor resolution, VLAN tagging, and source MAC selection stay in
   backend egress resolution rather than the core packet I/O API.
 
-If the project later needs a true link-layer API, it should be a separate
-lower-level abstraction. It should not replace the main IP packet socket boundary.
+If the project later needs a link-layer API, it should be a separate lower-level
+abstraction, not a replacement for the IP packet socket boundary.

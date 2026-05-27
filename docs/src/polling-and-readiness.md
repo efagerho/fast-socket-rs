@@ -1,8 +1,7 @@
 # Polling and Readiness
 
-Polling behavior is selected by the socket's concrete `Driver` associated type.
-This keeps worker-loop shape generic while avoiding runtime mode branches in the
-socket hot path.
+The socket's concrete `Driver` associated type selects polling behavior. Worker
+loops stay generic without runtime mode branches in the socket hot path.
 
 `PollDriver` exposes:
 
@@ -17,8 +16,8 @@ on an external event source such as a file descriptor. On Unix, `WakeHandle`
 borrows an fd. On non-Unix platforms it is an opaque borrowed token.
 
 `BusyPollDriver` is for sockets owned by a dedicated worker loop. Its `wait`
-operation returns `Spurious`, and its wake handle is `None`. Those methods are
-small no-ops that should inline away in optimized code.
+returns `Spurious`, and its wake handle is `None`. Those no-ops should inline
+away.
 
 Marker traits classify sockets by driver type:
 
@@ -34,7 +33,6 @@ readiness-driven AF_XDP sockets by cloning the AF_XDP fd into an
 shape through aliases such as `BusyPollXdpIpPacketSocket`, `BusyPollXdpUdpSocket`,
 `ReadinessXdpIpPacketSocket`, and `ReadinessXdpUdpSocket`.
 
-A typical worker loop can call `driver.wait`, then receive, send, drain
-completions, and notify transmit as needed. The important point is that the
-socket type, not a runtime enum, determines which waiting behavior is compiled
-into that loop.
+A worker loop can call `driver.wait`, then receive, send, drain completions,
+and notify transmit. The socket type, not a runtime enum, determines the waiting
+behavior compiled into that loop.
