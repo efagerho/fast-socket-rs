@@ -28,6 +28,7 @@
 - [Code Examples](code-examples.md)
   - [Packet Blaster](code-examples/packet-blaster.md)
   - [Reflection Server](code-examples/reflection-server.md)
+  - [Custom Router](code-examples/custom-router.md)
 - [Benchmarking](benchmarking.md)
 - [Testing Strategy](testing-strategy.md)
 - [Open Questions](open-questions.md)

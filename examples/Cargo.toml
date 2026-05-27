@@ -17,3 +17,7 @@ path = "src/bin/blast.rs"
 [[bin]]
 name = "pong-server"
 path = "src/bin/pong-server.rs"
+
+[[bin]]
+name = "custom-router"
+path = "src/bin/custom-router.rs"
