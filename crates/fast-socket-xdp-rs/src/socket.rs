@@ -9,12 +9,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, Error,
-    IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion,
-    NumaNode, OwnedPacketBuffer, PacketBuffer, PacketBufferMut, PollDriver, QueueAffinity, QueueId,
-    RawDevice, RawDeviceStats, ReadinessDriver, ReadinessSource, RecvBatch, SendError, TxSlot,
-    UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome,
-    WakeHandle,
+    BufferPool, BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind,
+    EgressResolver, Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
+    IpPacketTransmit, IpVersion, NumaNode, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
+    PollDriver, QueueAffinity, QueueId, RawDevice, RawDeviceStats, ReadinessDriver,
+    ReadinessSource, RecvBatch, SendError, TxSlot, UdpCapabilities, UdpReceive, UdpRecvMeta,
+    UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -47,10 +47,11 @@ pub type BusyPollXdpIpPacketSocket = XdpIpPacketSocket<BusyPollDriver>;
 pub type ReadinessXdpIpPacketSocket = XdpIpPacketSocket<ReadinessDriver<XdpReadinessSource>>;
 
 /// Busy-poll AF_XDP UDP socket.
-pub type BusyPollXdpUdpSocket = XdpUdpSocket<BusyPollDriver>;
+pub type BusyPollXdpUdpSocket<R = XdpQueueLocalUdpResolver> = XdpUdpSocket<R, BusyPollDriver>;
 
 /// Readiness-driven AF_XDP UDP socket.
-pub type ReadinessXdpUdpSocket = XdpUdpSocket<ReadinessDriver<XdpReadinessSource>>;
+pub type ReadinessXdpUdpSocket<R = XdpQueueLocalUdpResolver> =
+    XdpUdpSocket<R, ReadinessDriver<XdpReadinessSource>>;
 
 /// Readiness source backed by a borrowed AF_XDP fd clone.
 #[derive(Debug)]
@@ -98,13 +99,57 @@ pub struct XdpIpPacketSocket<D = BusyPollDriver> {
 /// enqueueing AF_XDP descriptors, and the receive path parses Ethernet, IPv4,
 /// and UDP in one backend pass before wrapping the UDP payload.
 #[derive(Debug)]
-pub struct XdpUdpSocket<D = BusyPollDriver> {
+pub struct XdpUdpSocket<R = XdpQueueLocalUdpResolver, D = BusyPollDriver> {
     ip: XdpIpPacketSocket<D>,
     local_addr: SocketAddrV4,
-    egress: XdpEgress,
-    l2_header: [u8; VLAN_HEADER_LEN],
-    l2_len: usize,
+    resolver: R,
     ttl: u8,
+}
+
+/// Resolves UDP destinations into AF_XDP transmit egress handles.
+///
+/// Implementors may use the wrapped IP socket's queue-local route snapshot, hold
+/// their own route and neighbor state, or delegate to another egress resolver.
+pub trait XdpUdpEgressResolver {
+    /// Resolves one IPv4 UDP destination for an AF_XDP queue.
+    fn resolve_udp_egress(
+        &self,
+        routes: &XdpLocalRoutes,
+        ifindex: IfIndex,
+        queue: QueueId,
+        dst: Ipv4Addr,
+    ) -> Option<XdpEgress>;
+}
+
+/// UDP egress resolver backed by the wrapped IP socket's queue-local routes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpQueueLocalUdpResolver;
+
+impl XdpUdpEgressResolver for XdpQueueLocalUdpResolver {
+    fn resolve_udp_egress(
+        &self,
+        routes: &XdpLocalRoutes,
+        ifindex: IfIndex,
+        queue: QueueId,
+        dst: Ipv4Addr,
+    ) -> Option<XdpEgress> {
+        routes.resolve_v4_for_interface(dst, ifindex, queue)
+    }
+}
+
+impl<T> XdpUdpEgressResolver for T
+where
+    T: EgressResolver<V4Only, XdpEgress>,
+{
+    fn resolve_udp_egress(
+        &self,
+        _routes: &XdpLocalRoutes,
+        _ifindex: IfIndex,
+        _queue: QueueId,
+        dst: Ipv4Addr,
+    ) -> Option<XdpEgress> {
+        EgressResolver::resolve_egress(self, dst)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +165,20 @@ struct PreparedLiveUdpTx {
     slot_index: usize,
     packet: XdpPacketBuf,
     context: XdpUdpTxContext,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UdpEgressContext {
+    ifindex: IfIndex,
+    queue_id: QueueId,
+    mtu: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedUdpEgress {
+    l2_header: [u8; VLAN_HEADER_LEN],
+    l2_len: usize,
+    ip_mtu: usize,
 }
 
 struct LiveXdpState {
@@ -361,9 +420,9 @@ impl<D> XdpIpPacketSocket<D> {
         Self {
             rx_pool: XdpRxPool::with_heap_capacity(config.buffers.rx, rx_capacity),
             tx_pool: XdpTxPool::with_heap_capacity(config.buffers.tx, tx_capacity),
-            config,
+            routes: XdpLocalRoutes::new(config.route_snapshot.clone()),
             driver,
-            routes: XdpLocalRoutes::default(),
+            config,
             live: None,
             pending_rx: VecDeque::with_capacity(rx_capacity),
             pending_tx_frames: VecDeque::with_capacity(tx_capacity),
@@ -770,18 +829,23 @@ impl<D> XdpIpPacketSocket<D> {
     }
 }
 
-impl<D> XdpUdpSocket<D> {
-    /// Creates an AF_XDP UDP socket from an IP packet socket, local IPv4
-    /// address, and resolved egress handle.
+impl<D> XdpUdpSocket<XdpQueueLocalUdpResolver, D> {
+    /// Creates an AF_XDP UDP socket using the wrapped IP socket's queue-local
+    /// route and neighbor cache for transmit egress resolution.
     #[must_use]
-    pub fn new(ip: XdpIpPacketSocket<D>, local_addr: SocketAddrV4, egress: XdpEgress) -> Self {
-        let (l2_header, l2_len) = cached_ethernet_header(egress);
+    pub fn new(ip: XdpIpPacketSocket<D>, local_addr: SocketAddrV4) -> Self {
+        Self::with_resolver(ip, local_addr, XdpQueueLocalUdpResolver)
+    }
+}
+
+impl<R, D> XdpUdpSocket<R, D> {
+    /// Creates an AF_XDP UDP socket with a custom egress resolver.
+    #[must_use]
+    pub fn with_resolver(ip: XdpIpPacketSocket<D>, local_addr: SocketAddrV4, resolver: R) -> Self {
         Self {
             ip,
             local_addr,
-            egress,
-            l2_header,
-            l2_len,
+            resolver,
             ttl: 64,
         }
     }
@@ -810,10 +874,16 @@ impl<D> XdpUdpSocket<D> {
         self.local_addr
     }
 
-    /// Returns the resolved AF_XDP egress handle.
+    /// Returns the UDP egress resolver.
     #[must_use]
-    pub const fn egress(&self) -> XdpEgress {
-        self.egress
+    pub const fn resolver(&self) -> &R {
+        &self.resolver
+    }
+
+    /// Returns the UDP egress resolver mutably.
+    #[must_use]
+    pub fn resolver_mut(&mut self) -> &mut R {
+        &mut self.resolver
     }
 
     /// Returns the IPv4 TTL used for transmitted UDP datagrams.
@@ -830,12 +900,48 @@ impl<D> XdpUdpSocket<D> {
     }
 
     fn ip_mtu(&self) -> usize {
-        self.ip.config.mtu.min(self.egress.mtu as usize)
+        self.ip.config.mtu
     }
 }
 
-impl<D> XdpUdpSocket<D>
+impl UdpEgressContext {
+    fn from_ip_socket<D>(socket: &XdpIpPacketSocket<D>) -> Self {
+        Self {
+            ifindex: socket.config.ifindex,
+            queue_id: socket.config.queue_id,
+            mtu: socket.config.mtu,
+        }
+    }
+
+    fn resolve<R>(
+        &self,
+        resolver: &R,
+        routes: &XdpLocalRoutes,
+        destination: SocketAddr,
+    ) -> Result<ResolvedUdpEgress, Error>
+    where
+        R: XdpUdpEgressResolver,
+    {
+        let SocketAddr::V4(destination) = destination else {
+            return Err(Error::InvalidPacket);
+        };
+        let egress = resolver
+            .resolve_udp_egress(routes, self.ifindex, self.queue_id, *destination.ip())
+            .ok_or(Error::NoEgressRoute)?;
+        let (l2_header, l2_len) = cached_ethernet_header(egress);
+
+        validate_xdp_udp_egress(self.ifindex, self.queue_id, egress)?;
+        Ok(ResolvedUdpEgress {
+            l2_header,
+            l2_len,
+            ip_mtu: self.mtu.min(egress.mtu as usize),
+        })
+    }
+}
+
+impl<R, D> XdpUdpSocket<R, D>
 where
+    R: XdpUdpEgressResolver,
     D: PollDriver,
 {
     fn send_heap_udp(
@@ -844,22 +950,18 @@ where
     ) -> Result<usize, SendError> {
         let mut accepted = 0;
         let local_addr = self.local_addr;
-        let egress = self.egress;
         let ttl = self.ttl;
-        let ip_mtu = self.ip_mtu();
-        let ifindex = self.ip.config.ifindex;
-        let queue_id = self.ip.config.queue_id;
-        let l2_len = self.l2_len;
-        let ethernet_header = self.l2_header;
+        let egress_context = UdpEgressContext::from_ip_socket(&self.ip);
 
         for slot in batch.iter_mut() {
-            if slot.as_ref().is_none() {
+            let Some(tx_ref) = slot.as_ref() else {
                 return Err(SendError {
                     accepted,
                     kind: Error::InvalidBatch,
                 });
-            }
-            validate_xdp_udp_egress(ifindex, queue_id, egress)
+            };
+            let resolved = egress_context
+                .resolve(&self.resolver, &self.ip.routes, tx_ref.destination)
                 .map_err(|kind| SendError { accepted, kind })?;
 
             let Some(tx) = slot.take() else {
@@ -868,18 +970,19 @@ where
                     kind: Error::InvalidBatch,
                 });
             };
-            let (packet, context) = match build_xdp_udp_transmit(local_addr, ttl, ip_mtu, tx) {
-                Ok(converted) => converted,
-                Err(error) => {
-                    *slot = TxSlot::Ready(*error.tx);
-                    return Err(SendError {
-                        accepted,
-                        kind: error.error,
-                    });
-                }
-            };
+            let (packet, context) =
+                match build_xdp_udp_transmit(local_addr, ttl, resolved.ip_mtu, tx) {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        *slot = TxSlot::Ready(*error.tx);
+                        return Err(SendError {
+                            accepted,
+                            kind: error.error,
+                        });
+                    }
+                };
 
-            if packet.headroom() < l2_len {
+            if packet.headroom() < resolved.l2_len {
                 *slot = TxSlot::Ready(
                     restore_xdp_udp_transmit(packet, context)
                         .map_err(|kind| SendError { accepted, kind })?,
@@ -892,7 +995,7 @@ where
 
             let packet_len = packet.len();
             let mut frame = packet.into_mut();
-            prepend_l2_header(&mut frame, &ethernet_header[..l2_len]);
+            prepend_l2_header(&mut frame, &resolved.l2_header[..resolved.l2_len]);
             self.ip.stats.tx_packets = self.ip.stats.tx_packets.saturating_add(1);
             self.ip.stats.tx_bytes = self.ip.stats.tx_bytes.saturating_add(packet_len as u64);
             self.ip.pending_tx_frames.push_back(frame.freeze());
@@ -907,13 +1010,8 @@ where
         batch: &mut [TxSlot<UdpTransmit<XdpPacketBuf>>],
     ) -> Result<usize, SendError> {
         let local_addr = self.local_addr;
-        let egress = self.egress;
         let ttl = self.ttl;
-        let ip_mtu = self.ip_mtu();
-        let ifindex = self.ip.config.ifindex;
-        let queue_id = self.ip.config.queue_id;
-        let l2_len = self.l2_len;
-        let ethernet_header = self.l2_header;
+        let egress_context = UdpEgressContext::from_ip_socket(&self.ip);
 
         if let Err(kind) = self.ip.drain_live_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
@@ -950,6 +1048,8 @@ where
         let mut wake_error = None;
 
         {
+            let resolver = &self.resolver;
+            let routes = &self.ip.routes;
             let live = self
                 .ip
                 .live
@@ -960,21 +1060,24 @@ where
 
             let limit = batch.len().min(tx_available);
             for (slot_index, slot) in batch.iter_mut().enumerate().take(limit) {
-                if slot.as_ref().is_none() {
+                let Some(tx_ref) = slot.as_ref() else {
                     deferred_error = Some(Error::InvalidBatch);
                     break;
-                }
-                if let Err(kind) = validate_xdp_udp_egress(ifindex, queue_id, egress) {
-                    deferred_error = Some(kind);
-                    break;
-                }
+                };
+                let resolved = match egress_context.resolve(resolver, routes, tx_ref.destination) {
+                    Ok(resolved) => resolved,
+                    Err(kind) => {
+                        deferred_error = Some(kind);
+                        break;
+                    }
+                };
 
                 let Some(tx) = slot.take() else {
                     deferred_error = Some(Error::InvalidBatch);
                     break;
                 };
                 let (mut packet, context) =
-                    match build_xdp_udp_transmit(local_addr, ttl, ip_mtu, tx) {
+                    match build_xdp_udp_transmit(local_addr, ttl, resolved.ip_mtu, tx) {
                         Ok(converted) => converted,
                         Err(error) => {
                             *slot = TxSlot::Ready(*error.tx);
@@ -983,7 +1086,7 @@ where
                         }
                     };
 
-                let Some(frame) = packet.prepare_l2(&ethernet_header[..l2_len]) else {
+                let Some(frame) = packet.prepare_l2(&resolved.l2_header[..resolved.l2_len]) else {
                     match restore_xdp_udp_transmit(packet, context) {
                         Ok(tx) => {
                             *slot = TxSlot::Ready(tx);
@@ -1192,8 +1295,9 @@ where
     }
 }
 
-impl<D> UdpSocket for XdpUdpSocket<D>
+impl<R, D> UdpSocket for XdpUdpSocket<R, D>
 where
+    R: XdpUdpEgressResolver,
     D: PollDriver,
 {
     type RxPool = XdpRxPool;
@@ -1479,7 +1583,7 @@ where
     }
 }
 
-impl<D> RawDevice for XdpUdpSocket<D>
+impl<R, D> RawDevice for XdpUdpSocket<R, D>
 where
     D: PollDriver,
 {
@@ -2103,6 +2207,7 @@ mod tests {
 
     use super::*;
     use crate::config::XdpIpPacketSocketBuilder;
+    use crate::route::{InterfaceInfo, Ipv4Route, RouteSnapshot};
 
     fn egress() -> XdpEgress {
         XdpEgress::ipv4(
@@ -2112,6 +2217,37 @@ mod tests {
             LinkAddr::new([6, 5, 4, 3, 2, 1]),
             1500,
         )
+    }
+
+    fn mac(value: u8) -> LinkAddr {
+        LinkAddr::new([value; 6])
+    }
+
+    fn route_snapshot_for_gateway(
+        ifindex: IfIndex,
+        queue: QueueId,
+        gateway: Ipv4Addr,
+        dst_mac: LinkAddr,
+        src_mac: LinkAddr,
+    ) -> RouteSnapshot {
+        let mut snapshot = RouteSnapshot::new();
+        snapshot.upsert_interface(InterfaceInfo {
+            ifindex,
+            master_ifindex: None,
+            mac: src_mac,
+            mtu: 1500,
+            queue,
+        });
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::UNSPECIFIED,
+            prefix_len: 0,
+            ifindex,
+            gateway: Some(gateway),
+            priority: 100,
+            mtu: 1500,
+        });
+        snapshot.upsert_neighbor_v4(ifindex, gateway, dst_mac);
+        snapshot
     }
 
     fn ipv4_packet() -> [u8; 20] {
@@ -2273,11 +2409,18 @@ mod tests {
 
     #[test]
     fn xdp_udp_socket_sends_ipv4_udp_ethernet_frame() {
-        let ip_socket =
-            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
-        let mut socket = XdpUdpSocket::new(ip_socket, local, egress());
+        let ip_socket = XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0))
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                Ipv4Addr::new(192, 0, 2, 1),
+                egress().dst_mac,
+                egress().src_mac,
+            ))
+            .open_busy_poll();
+        let mut socket = XdpUdpSocket::new(ip_socket, local);
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
@@ -2311,12 +2454,67 @@ mod tests {
     }
 
     #[test]
+    fn xdp_udp_socket_resolves_route_and_arp_from_local_cache_on_send() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let route_dst_mac = mac(0x2a);
+        let route_src_mac = mac(0x3b);
+        let ip_socket = XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0))
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                gateway,
+                route_dst_mac,
+                route_src_mac,
+            ))
+            .open_busy_poll();
+        let mut socket = XdpUdpSocket::new(ip_socket, local);
+        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        packet.extend_from_slice(b"hello").unwrap();
+        let mut batch = [TxSlot::Ready(UdpTransmit::new(
+            packet.freeze(),
+            remote.into(),
+        ))];
+
+        assert_eq!(socket.send(&mut batch).unwrap(), 1);
+
+        let frame = socket.ip_packet().pending_tx_frame(0).unwrap();
+        assert_eq!(&frame[..6], &route_dst_mac.octets());
+        assert_eq!(&frame[6..12], &route_src_mac.octets());
+        let ip = &frame[ETHERNET_HEADER_LEN..];
+        assert_eq!(&ip[16..20], &remote.ip().octets());
+    }
+
+    #[test]
+    fn routed_xdp_udp_socket_rejects_missing_route_without_consuming_slot() {
+        let ip_socket =
+            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::new(ip_socket, local);
+        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        packet.extend_from_slice(b"hello").unwrap();
+        let mut batch = [TxSlot::Ready(UdpTransmit::new(
+            packet.freeze(),
+            remote.into(),
+        ))];
+
+        let error = socket.send(&mut batch).expect_err("route cache is empty");
+
+        assert_eq!(error.accepted, 0);
+        assert!(matches!(error.kind, Error::NoEgressRoute));
+        assert!(batch[0].is_ready());
+        assert_eq!(socket.ip_packet().pending_tx_frame_count(), 0);
+    }
+
+    #[test]
     fn xdp_udp_socket_receives_udp_payload_from_ethernet_frame() {
         let ip_socket =
             XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
-        let mut socket = XdpUdpSocket::new(ip_socket, local, egress());
+        let mut socket = XdpUdpSocket::new(ip_socket, local);
         let ip = ipv4_udp_packet(
             *remote.ip(),
             *local.ip(),

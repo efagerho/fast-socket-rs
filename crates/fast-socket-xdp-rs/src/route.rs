@@ -275,6 +275,18 @@ impl XdpLocalRoutes {
     pub fn resolve_v4(&self, dst: Ipv4Addr) -> Option<XdpEgress> {
         self.snapshot.egress_v4(dst)
     }
+
+    /// Resolves IPv4 egress for one queue-local AF_XDP interface.
+    #[inline]
+    #[must_use]
+    pub fn resolve_v4_for_interface(
+        &self,
+        dst: Ipv4Addr,
+        ifindex: IfIndex,
+        queue: QueueId,
+    ) -> Option<XdpEgress> {
+        self.snapshot.egress_v4_for_interface(dst, ifindex, queue)
+    }
 }
 
 impl Default for XdpLocalRoutes {

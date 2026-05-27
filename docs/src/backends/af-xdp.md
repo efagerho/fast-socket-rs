@@ -90,8 +90,10 @@ link traffic keeps Linux route and neighbor state available to the userspace
 netlink resolver.
 
 Routing uses queue-local snapshots. `RouteSnapshot` is built from netlink route,
-neighbor, and link dumps. `XdpRouteMonitor` can publish refreshed snapshots to
-queue owners, and each queue adopts updates outside its packet path.
+neighbor, and link dumps. UDP sockets resolve each remote address through an
+`XdpUdpEgressResolver`; the default resolver reads the wrapped IP socket's
+queue-local snapshot. `XdpRouteMonitor` can publish refreshed snapshots to queue
+owners, and each queue adopts updates outside its packet path.
 
 For tests and unprivileged bring-up, an in-memory first-pass mode queues
 normalized packets and submitted Ethernet frames without opening a live AF_XDP

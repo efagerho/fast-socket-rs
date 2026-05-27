@@ -135,12 +135,13 @@ fn open_udp_socket(
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", dest.ip()))?;
     let mut builder = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
         .mtu(egress.mtu as usize)
+        .route_snapshot(routes.clone())
         .bind_udp_port(local.port());
     if let Some(program) = program {
         builder = builder.attached_program(program.clone());
     }
     let ip_socket = builder.open_busy_poll_live()?;
-    Ok(XdpUdpSocket::new(ip_socket, local, egress))
+    Ok(XdpUdpSocket::new(ip_socket, local))
 }
 
 fn blast<S>(

@@ -12,8 +12,8 @@ use clap::ValueEnum;
 use fast_socket_os_rs::{OsUdpSocket, OsUdpSocketConfig};
 use fast_socket_rs::{BufferLayout, IfIndex, QueueAffinity, QueueId};
 use fast_socket_xdp_rs::{
-    cpu_for_xdp_queue, xdp_queue_slots_for_interface, AttachMode, BusyPollXdpUdpSocket,
-    RouteSnapshot, XdpIpPacketSocketBuilder, XdpProgramHandle, XdpQueueSlot, XdpUdpSocket,
+    AttachMode, BusyPollXdpUdpSocket, RouteSnapshot, XdpIpPacketSocketBuilder, XdpProgramHandle,
+    XdpQueueSlot, XdpUdpSocket, cpu_for_xdp_queue, xdp_queue_slots_for_interface,
 };
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -132,10 +132,11 @@ pub fn open_xdp_udp_socket(
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", peer.ip()))?;
     let ip_socket = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
         .mtu(egress.mtu as usize)
+        .route_snapshot(routes)
         .bind_udp_port(local.port())
         .attached_program(program.clone())
         .open_busy_poll_live()?;
-    Ok(XdpUdpSocket::new(ip_socket, local, egress))
+    Ok(XdpUdpSocket::new(ip_socket, local))
 }
 
 pub fn open_os_udp_socket(

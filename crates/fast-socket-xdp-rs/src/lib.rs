@@ -59,7 +59,8 @@ pub use route_monitor::{XdpRouteMonitor, XdpRouteMonitorHandle};
 #[cfg(target_os = "linux")]
 pub use socket::{
     BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
-    ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpUdpSocket,
+    ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalUdpResolver,
+    XdpUdpEgressResolver, XdpUdpSocket,
 };
 #[cfg(target_os = "linux")]
 pub use umem::{AllocError, PageAlignedMemory, Umem};

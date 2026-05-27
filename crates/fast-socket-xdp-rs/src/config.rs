@@ -7,6 +7,7 @@ use fast_socket_rs::{BufferLayout, HugePageSize, IfIndex, NumaNode, QueueBufferC
 
 use crate::program::{AttachMode, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
+use crate::route::RouteSnapshot;
 use crate::socket::{BusyPollXdpIpPacketSocket, ReadinessXdpIpPacketSocket, XdpIpPacketSocket};
 
 /// Configuration for one AF_XDP queue socket.
@@ -38,6 +39,8 @@ pub struct XdpIpPacketSocketConfig {
     pub attached_program: Option<XdpProgramHandle>,
     /// Optional UDP destination port for UDP-filtered redirect programs.
     pub bind_udp_port: Option<u16>,
+    /// Initial queue-local route, neighbor, and link snapshot.
+    pub route_snapshot: RouteSnapshot,
 }
 
 impl Default for XdpIpPacketSocketConfig {
@@ -72,6 +75,7 @@ impl Default for XdpIpPacketSocketConfig {
             program_bytes: None,
             attached_program: None,
             bind_udp_port: None,
+            route_snapshot: RouteSnapshot::new(),
         }
     }
 }
@@ -171,6 +175,13 @@ impl XdpIpPacketSocketBuilder {
     #[must_use]
     pub const fn bind_udp_port(mut self, port: u16) -> Self {
         self.config.bind_udp_port = Some(port);
+        self
+    }
+
+    /// Seeds the queue-local route, neighbor, and link cache.
+    #[must_use]
+    pub fn route_snapshot(mut self, snapshot: RouteSnapshot) -> Self {
+        self.config.route_snapshot = snapshot;
         self
     }
 

@@ -21,6 +21,11 @@ MAC, source MAC, ethertype, optional VLAN id, and effective IP-layer MTU. That
 is enough to prepend the Ethernet header before placing a descriptor on the TX
 ring.
 
+`XdpUdpSocket` does not store a pre-resolved destination egress. It is generic
+over an `XdpUdpEgressResolver`, and the default `XdpQueueLocalUdpResolver`
+resolves each UDP destination through the wrapped IP socket's queue-local route
+snapshot.
+
 The XDP route implementation uses immutable snapshots. `RouteSnapshot` stores
 IPv4 routes, neighbors, and interface facts, resolves longest-prefix routes,
 and builds `XdpEgress`. `XdpLocalRoutes` keeps a queue-local snapshot and adopts
