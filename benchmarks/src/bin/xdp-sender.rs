@@ -20,7 +20,7 @@ use fast_socket_xdp_rs::{
     xdp_queue_slots_for_interface,
 };
 
-const BLAST_BATCH_SIZE: usize = 64;
+const BLAST_BATCH_SIZE: usize = 128;
 const BLAST_COUNTER_FLUSH_PACKETS: u64 = BLAST_BATCH_SIZE as u64;
 const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
