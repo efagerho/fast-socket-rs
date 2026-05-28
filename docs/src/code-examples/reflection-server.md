@@ -57,6 +57,33 @@ where
 }
 ```
 
+`send_all` is the per-batch retry helper used by the loop. It calls
+`socket.send` until every slot is accepted, draining completions and spinning
+when the TX ring is momentarily full.
+
+```rust,ignore
+fn send_all<S>(
+    socket: &mut S,
+    batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<S>>>],
+) -> Result<usize, BoxError>
+where
+    S: UdpSocket,
+{
+    let mut accepted = 0;
+    while accepted < batch.len() {
+        match socket.send(&mut batch[accepted..]) {
+            Ok(0) => {
+                socket.drain_tx_completions()?;
+                std::hint::spin_loop();
+            }
+            Ok(n) => accepted += n,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(accepted)
+}
+```
+
 The bound on `UdpRxBuffer<S>` says that a received mutable payload buffer can
 freeze into the transmit buffer type for the same socket. That makes reflection
 zero-copy for backends whose receive buffers can be transmitted directly.

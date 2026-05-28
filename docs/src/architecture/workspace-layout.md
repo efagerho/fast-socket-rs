@@ -32,11 +32,15 @@ still receives and transmits Ethernet frames at the NIC.
 
 `crates/fast-socket-xdp-ebpf`
 
-This crate contains the `no_std` XDP program. The program redirects untagged or
-single-VLAN IPv4 and IPv6 Ethernet frames to the AF_XDP socket registered for
-the receive queue while no UDP ports are bound. When UDP ports are bound, it
-redirects only matching non-fragmented IPv4 UDP packets and leaves unrelated
-traffic on the kernel path.
+This crate contains the `no_std` XDP program. The program is closed by
+default: with no UDP ports bound it returns `XDP_PASS` for every frame so
+attaching it does not divert unrelated kernel traffic. Once userspace binds
+one or more UDP destination ports, the program redirects only matching
+non-fragmented IPv4 UDP packets to the AF_XDP socket registered for the
+receive queue and leaves everything else on the kernel path. The L2 parser
+handles untagged frames, single 802.1Q tags, and 802.1ad QinQ (`0x88a8`
+outer with a `0x8100` inner). XSKMAP redirect failures bump per-reason
+counters in `DROP_COUNTERS`.
 
 `benchmarks`
 

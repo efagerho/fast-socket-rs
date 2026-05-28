@@ -108,7 +108,7 @@ let router = CustomRouter {
 let mut socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
     .mtu(mtu as usize)
     .router(router)
-    .open_busy_poll_live()?;
+    .open_busy_poll()?;
 ```
 
 ## Main Loop

@@ -81,13 +81,22 @@ can read interface facts, queue affinity, queue NUMA placement, MTU, and
 packet-path counters from either socket shape. Live sockets report the resolved
 UMEM NUMA node; first-pass sockets report the configured hint when provided.
 
-The embedded eBPF program redirects untagged or single-VLAN IPv4 and IPv6 frames
-to `XSKMAP[rx_queue_index]` while no UDP ports are bound. When userspace binds
-UDP ports, `BOUND_PORTS` and `BOUND_PORT_COUNT` redirect only matching
-non-fragmented IPv4 UDP packets. Unrelated IP traffic, IPv6 traffic, malformed
-packets, and non-IP link traffic stay on the kernel path. Passing ARP and other
-link traffic keeps Linux route and neighbor state available to the userspace
-netlink resolver.
+The embedded eBPF program is closed by default: with no UDP ports bound it
+returns `XDP_PASS` for every frame so attaching the program alone does not
+hijack TCP, ICMP, ND, or other kernel-path traffic. Userspace opts a
+destination port into AF_XDP redirection by calling `bind_port(port)`, which
+populates `BOUND_PORTS` and `BOUND_PORT_COUNT`. Once at least one port is
+bound, the program redirects only matching non-fragmented IPv4 UDP packets to
+`XSKMAP[rx_queue_index]`; IPv6, non-UDP IPv4, malformed packets, and non-IP
+link traffic continue to take the kernel path so Linux route, neighbor, and
+ARP state stay available to the userspace netlink resolver. The L2 parser
+accepts untagged frames, single 802.1Q tags (`0x8100`), and 802.1ad QinQ
+(`0x88a8` outer with a `0x8100` inner). When a packet passes the bound-port
+filter but `XSKMAP::redirect` fails (no socket registered for the queue, or
+the kernel rejected the redirect), the program returns `XDP_DROP` and
+increments `DROP_COUNTERS[DROP_REASON_XSKMAP_MISS]` or
+`DROP_COUNTERS[DROP_REASON_REDIRECT_ERROR]` so operators can observe
+misconfigurations instead of silently leaking packets to the stack.
 
 Routing uses queue-local snapshots. `RouteSnapshot` is built from netlink route,
 neighbor, and link dumps. UDP sockets resolve each remote address through an
