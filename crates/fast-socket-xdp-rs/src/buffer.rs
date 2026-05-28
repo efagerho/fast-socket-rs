@@ -372,11 +372,22 @@ impl XdpTxPool {
         }
     }
 
+    /// Test-only single-frame reclaim. The hot completion-drain path goes
+    /// through [`Self::live_reclaim`] and pushes directly into the
+    /// underlying [`FrameReclaim`], skipping the per-frame `Option` check.
+    #[cfg(test)]
     pub(crate) fn reclaim_completed_frame(&mut self, frame_addr: u64) {
         if let Some(live) = &self.live {
             debug_assert!(live.umem.contains_frame_addr(frame_addr));
             live.reclaim.push_local(frame_addr);
         }
+    }
+
+    /// Lends the shared reclaim queue for the live UMEM-backed half of this
+    /// pool, if any. Bulk completion-drain code grabs this once and pushes
+    /// per frame.
+    pub(crate) fn live_reclaim(&self) -> Option<&FrameReclaim> {
+        self.live.as_ref().map(|live| live.reclaim.as_ref())
     }
 
     pub(crate) fn allocate_many(&mut self, out: &mut Vec<XdpPacketBufMut>, max: usize) -> usize {

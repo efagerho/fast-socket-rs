@@ -553,16 +553,29 @@ impl<D> XdpIpPacketSocket<D> {
         let frame_size = u64::from(live.umem.frame_size());
         let frame_mask = frame_size - 1;
         let umem_len = u64::from(live.umem.frame_count()) * frame_size;
-        let rx_reclaim = Rc::clone(&live.rx_reclaim);
-        let tx_pool = &mut self.tx_pool;
-        let completed = live.raw.drain_completion_for_each(
+        // Resolve the two reclaim queues once outside the loop. The TX pool's
+        // live half is guaranteed to be `Some` whenever the socket itself is
+        // live; both were constructed together in `LiveXdpState::open`.
+        let rx_reclaim: &FrameReclaim = live.rx_reclaim.as_ref();
+        let tx_reclaim: &FrameReclaim = self
+            .tx_pool
+            .live_reclaim()
+            .expect("tx pool live state must mirror socket live state");
+
+        let completed = live.raw.drain_completion_slices(
             self.config.rings.completion as usize,
-            |addr| -> Result<(), Error> {
-                let frame_addr = addr & !frame_mask;
-                if frame_addr >= umem_len {
-                    return Err(ring_corrupt_error());
+            |first, second| -> Result<(), Error> {
+                for &addr in first.iter().chain(second.iter()) {
+                    let frame_addr = addr & !frame_mask;
+                    if frame_addr >= umem_len {
+                        return Err(ring_corrupt_error());
+                    }
+                    if frame_addr < first_tx_frame_addr {
+                        rx_reclaim.push_local(frame_addr);
+                    } else {
+                        tx_reclaim.push_local(frame_addr);
+                    }
                 }
-                reclaim_completed_xdp_frame(frame_addr, first_tx_frame_addr, &rx_reclaim, tx_pool);
                 Ok(())
             },
         )?;
@@ -2036,6 +2049,7 @@ fn tx_from_xdp_udp_context(
     }
 }
 
+#[cfg(test)]
 fn reclaim_completed_xdp_frame(
     frame_addr: u64,
     first_tx_frame_addr: u64,

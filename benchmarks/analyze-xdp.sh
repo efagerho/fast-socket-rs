@@ -24,15 +24,15 @@ Defaults match profile-xdp.sh. Override with env vars:
   PERF_FREQ, CALL_GRAPH, PERF_DELAY_MS, OUT_BASE.
 
 --symbols selects functions for per-mode `perf annotate --stdio` output.
-  Default: build_xdp_udp_transmit, allocate_many, drain_live_tx_completions,
-  drain_completion_for_each, allocate_tx_batch, run_blast_worker.
+  Default: build_xdp_udp_transmit, allocate_many, drain_tx_completions_inner,
+  drain_completion_slices, allocate_tx_batch_inner, run_blast_worker.
 
 --skip omits one or more recording modes by name (comma-separated).
 EOF
 }
 
 MODE=blast
-ANNOTATE_SYMBOLS="build_xdp_udp_transmit,allocate_many,drain_live_tx_completions,drain_completion_for_each,allocate_tx_batch,run_blast_worker"
+ANNOTATE_SYMBOLS="build_xdp_udp_transmit,allocate_many,drain_tx_completions_inner,drain_completion_slices,allocate_tx_batch_inner,run_blast_worker"
 SKIP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in

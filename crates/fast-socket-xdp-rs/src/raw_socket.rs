@@ -365,11 +365,18 @@ impl RawXdpSocket {
         completed
     }
 
-    pub(crate) fn drain_completion_for_each<E>(
-        &mut self,
-        max: usize,
-        mut f: impl FnMut(u64) -> Result<(), E>,
-    ) -> Result<usize, E> {
+    /// Drains up to `max` completion entries and hands them to `f` as the
+    /// two contiguous slices that back the reserved range (the second slice
+    /// is empty unless the range wraps the ring buffer).
+    ///
+    /// The closure runs once per drain (not per entry), so the caller pays
+    /// no per-frame closure-dispatch overhead. The consumer cursor is
+    /// released after the closure returns, regardless of whether it
+    /// produced an error.
+    pub(crate) fn drain_completion_slices<F, E>(&mut self, max: usize, f: F) -> Result<usize, E>
+    where
+        F: FnOnce(&[u64], &[u64]) -> Result<(), E>,
+    {
         self.comp_cons.sync();
         let wanted = max.min(u32::MAX as usize) as u32;
         let range = self.comp_cons.consume_many(wanted);
@@ -379,22 +386,23 @@ impl RawXdpSocket {
         }
 
         let mask = self.sizes.completion - 1;
-        let mut error = None;
-        for offset in 0..range.count {
-            let index = range.start.wrapping_add(offset);
-            // SAFETY: the range was reserved from the COMPLETION consumer cursor.
-            let addr = unsafe { self.comp_mmap.desc.add((index & mask) as usize).read() };
-            if error.is_none() {
-                if let Err(err) = f(addr) {
-                    error = Some(err);
-                }
-            }
-        }
-        self.comp_cons.release();
+        let cap = self.sizes.completion as usize;
+        let start = (range.start & mask) as usize;
+        let first_len = (cap - start).min(completed);
+        // SAFETY: the range was reserved from the COMPLETION consumer cursor;
+        // the slice covers indices already published by the kernel.
+        let first = unsafe { std::slice::from_raw_parts(self.comp_mmap.desc.add(start), first_len) };
+        let second_len = completed - first_len;
+        let second = if second_len > 0 {
+            // SAFETY: the wrap-around tail starts at index 0 of the ring.
+            unsafe { std::slice::from_raw_parts(self.comp_mmap.desc, second_len) }
+        } else {
+            &[]
+        };
 
-        if let Some(error) = error {
-            return Err(error);
-        }
+        let result = f(first, second);
+        self.comp_cons.release();
+        result?;
         Ok(completed)
     }
 
