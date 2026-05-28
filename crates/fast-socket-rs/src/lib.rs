@@ -27,16 +27,16 @@ pub use device::{Capabilities, RawDevice, RawDeviceStats};
 pub use error::{DeviceError, DeviceErrorKind, Error};
 pub use ip_packet::{
     BusyPollIpPacketSocket, ChecksumStatus, CoreEgress, IpPacketEgress, IpPacketReceive,
-    IpPacketRecvMeta, IpPacketRxBuffer, IpPacketSocket, IpPacketTransmit, IpPacketTxBuffer,
-    IpVersion, ReadinessIpPacketSocket, TxOffload,
+    IpPacketRecvMeta, IpPacketRxBuffer, IpPacketRxItem, IpPacketSocket, IpPacketTransmit,
+    IpPacketTxBuffer, IpPacketTxItem, IpVersion, ReadinessIpPacketSocket, TxOffload,
 };
 pub use policy::{
     BusyPollDriver, BusyPollDriverMode, IpFamily, Mixed, PollDriver, PollMode, ReadinessDriver,
     ReadinessDriverMode, ReadinessSource, V4Only, V6Only, WaitOutcome, WakeHandle,
 };
 pub use route::{
-    EgressResolver, LinkAddr, NeighborId, NeighborTable, RouteHop, RouteId, RouteTable, TunnelId,
-    TunnelTable, TunnelTarget,
+    EgressResolver, LinkAddr, LinkAddrParseError, NeighborId, NeighborTable, RouteHop, RouteId,
+    RouteTable, TunnelId, TunnelTable, TunnelTarget,
 };
 pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId};
 pub use udp::{

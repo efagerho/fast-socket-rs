@@ -90,6 +90,56 @@ impl fmt::Debug for LinkAddr {
     }
 }
 
+impl fmt::Display for LinkAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+/// Error returned when parsing a `LinkAddr` from a `de:ad:be:ef:00:01`-style
+/// MAC address string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LinkAddrParseError {
+    /// String did not have six `:`-separated octets.
+    WrongOctetCount,
+    /// One of the octets was not exactly two hex digits.
+    InvalidOctet,
+}
+
+impl fmt::Display for LinkAddrParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongOctetCount => {
+                f.write_str("MAC address must have six colon-separated octets")
+            }
+            Self::InvalidOctet => f.write_str("MAC address octet is not two hex digits"),
+        }
+    }
+}
+
+impl std::error::Error for LinkAddrParseError {}
+
+impl core::str::FromStr for LinkAddr {
+    type Err = LinkAddrParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut octets = [0u8; 6];
+        let mut parts = value.split(':');
+        for octet in octets.iter_mut() {
+            let part = parts.next().ok_or(LinkAddrParseError::WrongOctetCount)?;
+            if part.len() != 2 {
+                return Err(LinkAddrParseError::InvalidOctet);
+            }
+            *octet = u8::from_str_radix(part, 16).map_err(|_| LinkAddrParseError::InvalidOctet)?;
+        }
+        if parts.next().is_some() {
+            return Err(LinkAddrParseError::WrongOctetCount);
+        }
+        Ok(Self(octets))
+    }
+}
+
 /// Result of routing an IP destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteHop<A> {

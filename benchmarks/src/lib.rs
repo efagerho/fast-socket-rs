@@ -1,102 +1,29 @@
 use std::net::Ipv4Addr;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use clap::Args as ClapArgs;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-#[derive(Debug)]
-pub struct Args {
-    values: Vec<String>,
-}
-
-impl Args {
-    pub fn new() -> Self {
-        Self {
-            values: std::env::args().skip(1).collect(),
-        }
-    }
-
-    pub fn mode(&mut self, usage: &str) -> Result<String, BoxError> {
-        if self.values.is_empty() || self.values[0] == "--help" || self.values[0] == "-h" {
-            return Err(usage.to_owned().into());
-        }
-        Ok(self.values.remove(0))
-    }
-
-    pub fn take(&mut self, name: &str) -> Option<String> {
-        let position = self.values.iter().position(|value| value == name)?;
-        self.values.remove(position);
-        if position >= self.values.len() {
-            return None;
-        }
-        Some(self.values.remove(position))
-    }
-
-    pub fn flag(&mut self, name: &str) -> bool {
-        let Some(position) = self.values.iter().position(|value| value == name) else {
-            return false;
-        };
-        self.values.remove(position);
-        true
-    }
-
-    pub fn required<T>(&mut self, name: &str) -> Result<T, BoxError>
-    where
-        T: FromStr,
-        T::Err: std::error::Error + Send + Sync + 'static,
-    {
-        let value = self
-            .take(name)
-            .ok_or_else(|| format!("missing required argument {name}"))?;
-        Ok(value.parse()?)
-    }
-
-    pub fn optional<T>(&mut self, name: &str, default: T) -> Result<T, BoxError>
-    where
-        T: FromStr,
-        T::Err: std::error::Error + Send + Sync + 'static,
-    {
-        match self.take(name) {
-            Some(value) => Ok(value.parse()?),
-            None => Ok(default),
-        }
-    }
-
-    pub fn finish(self) -> Result<(), BoxError> {
-        if self.values.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("unexpected arguments: {}", self.values.join(" ")).into())
-        }
-    }
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+// Common `--count` / `--duration-ms` stopping criteria for benchmark loops.
+// Flatten this with `#[command(flatten)]` to share the contract across
+// binaries. `keep_running` returns `true` while both limits (if set) are still
+// satisfied; if neither is set, the loop runs until the caller stops it.
+//
+// Plain `//` comments here so clap doesn't inherit them into the parent
+// command's `--help` when this struct is flattened.
+#[derive(Clone, Copy, Debug, Default, ClapArgs)]
 pub struct RunLimit {
+    /// Stop after this many packets.
+    #[arg(long)]
     pub count: Option<u64>,
+    /// Stop after this many milliseconds of wall clock.
+    #[arg(long = "duration-ms", value_parser = parse_duration_ms)]
     pub duration: Option<Duration>,
 }
 
 impl RunLimit {
-    pub fn from_args(args: &mut Args) -> Result<Self, BoxError> {
-        let count = args
-            .take("--count")
-            .map(|value| value.parse())
-            .transpose()?;
-        let duration = args
-            .take("--duration-ms")
-            .map(|value| value.parse::<u64>().map(Duration::from_millis))
-            .transpose()?;
-        Ok(Self { count, duration })
-    }
-
     pub fn keep_running(self, completed: u64, started: Instant) -> bool {
         if self.count.is_some_and(|count| completed >= count) {
             return false;
@@ -110,6 +37,11 @@ impl RunLimit {
         true
     }
 }
+
+fn parse_duration_ms(value: &str) -> Result<Duration, std::num::ParseIntError> {
+    Ok(Duration::from_millis(value.parse()?))
+}
+
 
 #[derive(Debug)]
 pub struct Progress {
@@ -131,13 +63,18 @@ impl Progress {
     }
 
     pub fn tick(&mut self, count: u64) {
-        if self.last.elapsed() < Duration::from_secs(1) {
+        // Sample `now` once per tick so the rate window matches the interval
+        // between successive `self.last` values. The previous code called
+        // `Instant::now()` twice and stored a later instant than the one used
+        // to compute the rate, leaving a small unaccounted gap between ticks.
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        if elapsed < Duration::from_secs(1) {
             return;
         }
-        let elapsed = self.last.elapsed().as_secs_f64();
-        let rate = (count - self.last_count) as f64 / elapsed;
+        let rate = (count - self.last_count) as f64 / elapsed.as_secs_f64();
         eprintln!("{}: {count} packets ({rate:.0} packets/s)", self.name);
-        self.last = Instant::now();
+        self.last = now;
         self.last_count = count;
     }
 
@@ -163,10 +100,14 @@ pub fn payload(len: usize) -> Vec<u8> {
     payload
 }
 
-/// Reads `--timeout-ms`, returning `default_ms` when absent.
-pub fn timeout_from_args(args: &mut Args, default_ms: u64) -> Result<Duration, BoxError> {
-    let timeout_ms = args.optional("--timeout-ms", default_ms)?;
-    Ok(Duration::from_millis(timeout_ms))
+const FIRST_DYNAMIC_PORT: u16 = 49152;
+
+/// Returns a UDP source port derived from the current process ID, suitable for
+/// example/benchmark binaries that need a non-conflicting ephemeral port. Not
+/// collision-free across processes whose PIDs hash to the same slot.
+pub fn dynamic_source_port() -> u16 {
+    let range = u32::from(u16::MAX) - u32::from(FIRST_DYNAMIC_PORT) + 1;
+    FIRST_DYNAMIC_PORT + (std::process::id() % range) as u16
 }
 
 pub fn write_sequence(payload: &mut [u8], sequence: u64) {
@@ -203,8 +144,21 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN_SIGNALS.load(Ordering::Relaxed) > 0
 }
 
+/// Number of signal presses after which `handle_shutdown_signal` calls
+/// `libc::_exit`. The first `FORCE_EXIT_PRESSES - 1` presses only set the
+/// `SHUTDOWN_SIGNALS` flag so `shutdown_requested()` returns true and worker
+/// loops can finish in-flight work and run their destructors. After that many
+/// presses the handler force-exits unconditionally.
+///
+/// `libc::_exit` is the only async-signal-safe terminator available here — it
+/// skips Rust stack destructors (so `XdpProgramHandle::drop` does not run),
+/// but Linux automatically detaches unpinned XDP programs when the loading
+/// process dies, so the kernel still cleans up after a forced exit.
+const FORCE_EXIT_PRESSES: usize = 3;
+
 extern "C" fn handle_shutdown_signal(signal: libc::c_int) {
-    if SHUTDOWN_SIGNALS.fetch_add(1, Ordering::SeqCst) > 0 {
+    if SHUTDOWN_SIGNALS.fetch_add(1, Ordering::SeqCst) + 1 >= FORCE_EXIT_PRESSES {
+        // SAFETY: `_exit` is async-signal-safe and takes only a single int.
         unsafe { libc::_exit(128 + signal) };
     }
 }

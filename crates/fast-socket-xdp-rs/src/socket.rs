@@ -224,6 +224,10 @@ struct LiveXdpState {
     udp_tx_scratch: Vec<PreparedLiveUdpTx>,
     tx_in_flight: usize,
     tx_since_completion_drain: usize,
+    /// Set when a `wake_tx` doorbell failed after a successful commit; the
+    /// next send (or completion drain) reissues the doorbell so the parked TX
+    /// descriptors get a chance to land on the wire.
+    tx_wake_pending: bool,
 }
 
 struct OpenedLiveXdp {
@@ -243,14 +247,31 @@ impl fmt::Debug for LiveXdpState {
 
 impl Drop for LiveXdpState {
     fn drop(&mut self) {
+        let queue_id = self.raw.queue_id();
         let Some(program) = self.program.take() else {
             return;
         };
-        if let Ok(mut guard) = program.lock() {
-            if let Some(port) = self.bound_port {
-                let _ = guard.unbind_port(port);
+        let mut guard = match program.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                eprintln!(
+                    "fast-socket-xdp: XDP program mutex poisoned during LiveXdpState drop for queue {queue_id}; \
+                     skipping unbind/unregister"
+                );
+                return;
             }
-            let _ = guard.unregister_socket(self.raw.queue_id());
+        };
+        if let Some(port) = self.bound_port {
+            if let Err(error) = guard.unbind_port(port) {
+                eprintln!(
+                    "fast-socket-xdp: failed to unbind UDP port {port} for queue {queue_id} during drop: {error}"
+                );
+            }
+        }
+        if let Err(error) = guard.unregister_socket(queue_id) {
+            eprintln!(
+                "fast-socket-xdp: failed to unregister AF_XDP queue {queue_id} from XSKMAP during drop: {error}"
+            );
         }
     }
 }
@@ -279,17 +300,20 @@ impl LiveXdpState {
             )?,
         };
 
-        let frame_size = live_frame_size(config)?;
-        let frame_count = config
-            .frame_count
-            .max(2)
-            .checked_next_power_of_two()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "XDP frame count overflows power-of-two rounding",
-                )
-            })?;
+        let frame_size = umem_frame_size(config)?;
+        // AF_XDP requires a power-of-two `frame_count`. Reject mis-sized
+        // configs explicitly so callers see the surprise at construction
+        // rather than learning later that their "3000-frame UMEM" is
+        // actually 4096 frames and their capacity math is off.
+        let frame_count = config.frame_count;
+        if frame_count < 2 || !frame_count.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "XDP frame_count must be a power of two >= 2 (got {frame_count})"
+                ),
+            ));
+        }
         let rx_frames = frame_count / 2;
         let mut umem =
             Umem::new_on_numa_node(frame_size, frame_count, config.huge_page_size, numa_node)?;
@@ -320,7 +344,13 @@ impl LiveXdpState {
             guard.register_socket(config.queue_id.get(), raw.as_fd())?;
             if let Some(port) = config.bind_udp_port {
                 if let Err(error) = guard.bind_port(port) {
-                    let _ = guard.unregister_socket(config.queue_id.get());
+                    if let Err(rollback) = guard.unregister_socket(config.queue_id.get()) {
+                        eprintln!(
+                            "fast-socket-xdp: failed to roll back AF_XDP queue {} after \
+                             bind_port({port}) failed: {rollback}",
+                            config.queue_id.get(),
+                        );
+                    }
                     return Err(error);
                 }
                 bound_port = Some(port);
@@ -353,29 +383,37 @@ impl LiveXdpState {
                 udp_tx_scratch: Vec::with_capacity(config.rings.tx as usize),
                 tx_in_flight: 0,
                 tx_since_completion_drain: 0,
+                tx_wake_pending: false,
             },
         })
     }
 
     fn replenish_fill(&mut self) -> std::io::Result<()> {
-        if self.rx_reclaim.is_empty() {
-            return Ok(());
-        }
-
-        self.pending_fill_scratch.clear();
-        self.rx_reclaim.drain_into(&mut self.pending_fill_scratch);
-        if self.pending_fill_scratch.is_empty() {
-            return Ok(());
-        }
-        let written = self.raw.replenish_fill_batch(&self.pending_fill_scratch);
-        if written < self.pending_fill_scratch.len() {
-            for addr in self.pending_fill_scratch[written..].iter().copied() {
-                self.rx_reclaim.push(addr);
+        // Drain whatever is ready to be returned to the FILL ring (may be zero
+        // if no recv has consumed a frame since the last call).
+        let written = if !self.rx_reclaim.is_empty() {
+            self.pending_fill_scratch.clear();
+            self.rx_reclaim.drain_into(&mut self.pending_fill_scratch);
+            let written = self.raw.replenish_fill_batch(&self.pending_fill_scratch);
+            if written < self.pending_fill_scratch.len() {
+                for addr in self.pending_fill_scratch[written..].iter().copied() {
+                    self.rx_reclaim.push(addr);
+                }
             }
-        }
-        if written > 0 && self.raw.fill_needs_wakeup() {
+            written
+        } else {
+            0
+        };
+
+        // Honor `NEED_WAKEUP` regardless of whether we just wrote new frames.
+        // The kernel can assert the flag asynchronously when it stalls waiting
+        // for FILL entries; gating wakeup on `written > 0` would silently
+        // ignore that signal whenever the local reclaim list is empty and
+        // leave RX permanently parked.
+        if self.raw.fill_needs_wakeup() {
             self.raw.wake_rx()?;
         }
+        let _ = written;
         Ok(())
     }
 }
@@ -413,25 +451,29 @@ fn resolve_umem_numa_node(config: &XdpIpPacketSocketConfig) -> std::io::Result<N
 }
 
 impl XdpIpPacketSocket<BusyPollDriver> {
-    /// Creates a first-pass busy-poll XDP IP packet socket from config.
+    /// Creates a test-only first-pass busy-poll XDP IP packet socket from
+    /// config. Heap-backed pools, no AF_XDP bind — useful for unit tests on
+    /// platforms without `CAP_BPF` / `CAP_NET_ADMIN`. Production callers
+    /// must use [`Self::new_busy_poll`] (which binds AF_XDP).
+    #[cfg(test)]
     #[must_use]
-    pub fn new_busy_poll(config: XdpIpPacketSocketConfig) -> Self {
-        Self::with_driver(config, BusyPollDriver::new())
+    pub fn new_busy_poll_test(config: XdpIpPacketSocketConfig) -> Self {
+        Self::with_driver_test(config, BusyPollDriver::new())
     }
 
-    /// Creates a live busy-poll AF_XDP IP packet socket from config.
-    pub fn new_busy_poll_live(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
-        Self::with_driver_live(config, BusyPollDriver::new())
+    /// Creates a busy-poll AF_XDP IP packet socket from config.
+    pub fn new_busy_poll(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
+        Self::with_driver(config, BusyPollDriver::new())
     }
 }
 
 impl XdpIpPacketSocket<ReadinessDriver<XdpReadinessSource>> {
-    /// Creates a live readiness-driven AF_XDP IP packet socket from config.
-    pub fn new_readiness_live(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
+    /// Creates a readiness-driven AF_XDP IP packet socket from config.
+    pub fn new_readiness(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
         let opened = LiveXdpState::open(&config)?;
         let fd = opened.state.raw.try_clone_fd()?;
         let driver = ReadinessDriver::new(XdpReadinessSource::new(fd));
-        let mut socket = Self::with_driver(config, driver);
+        let mut socket = construct_state(config, driver);
         socket.rx_pool = opened.rx_pool;
         socket.tx_pool = opened.tx_pool;
         socket.live = Some(opened.state);
@@ -439,29 +481,62 @@ impl XdpIpPacketSocket<ReadinessDriver<XdpReadinessSource>> {
     }
 }
 
+/// Shape of every TX allocator loop in this crate:
+///
+/// 1. Try to allocate from the TX pool. If anything came back, continue.
+/// 2. Otherwise, if we've already drained once this call, stop — the kernel
+///    has nothing more for us right now and the caller should retry later.
+/// 3. Otherwise drain TX completions. If the drain yielded nothing, stop too;
+///    a non-zero drain means new frames will be available next iteration.
+///
+/// Both [`XdpIpPacketSocket::allocate_tx_batch_inner`] and
+/// [`XdpIpPacketSocket::allocate_tx_batch_test`] implement this pattern;
+/// the UDP wrapper delegates rather than duplicating it.
+#[doc(hidden)]
+const _DRAIN_RETRY_ALLOC_DOC: () = ();
+
+/// Hard cap on the test-only `pending_tx_frames` deque. The non-live path
+/// is `cfg(test)`-only and lives in `XdpIpPacketSocket` as scaffolding, but
+/// in case a future change re-exposes it, this cap stops a stuck or never-
+/// draining test from exhausting host memory.
+#[cfg(test)]
+const MAX_PENDING_TX_FRAMES: usize = 4096;
+
+/// Builds the per-socket state with heap-backed pools and no AF_XDP bind.
+/// Both the real constructor [`XdpIpPacketSocket::with_driver`] and the
+/// test-only [`XdpIpPacketSocket::with_driver_test`] go through here; the
+/// former immediately replaces the heap pools with AF_XDP-backed ones, the
+/// latter returns the heap state unmodified.
+fn construct_state<D>(config: XdpIpPacketSocketConfig, driver: D) -> XdpIpPacketSocket<D> {
+    let rx_capacity = config.rings.rx as usize;
+    let tx_capacity = config.rings.tx as usize;
+    XdpIpPacketSocket {
+        rx_pool: XdpRxPool::with_heap_capacity(config.buffers.rx, rx_capacity),
+        tx_pool: XdpTxPool::with_heap_capacity(config.buffers.tx, tx_capacity),
+        routes: XdpLocalRoutes::new(config.route_snapshot.clone()),
+        driver,
+        config,
+        live: None,
+        pending_rx: VecDeque::with_capacity(rx_capacity),
+        pending_tx_frames: VecDeque::with_capacity(tx_capacity),
+        stats: RawDeviceStats::default(),
+        _not_send: PhantomData,
+    }
+}
+
 impl<D> XdpIpPacketSocket<D> {
-    /// Creates an XDP IP packet socket state with a concrete driver.
+    /// Creates a test-only XDP IP packet socket state with a concrete driver.
+    /// Heap-backed pools, no AF_XDP bind. Available only under `cfg(test)`.
+    /// Production callers use [`Self::with_driver`].
+    #[cfg(test)]
     #[must_use]
-    pub fn with_driver(config: XdpIpPacketSocketConfig, driver: D) -> Self {
-        let rx_capacity = config.rings.rx as usize;
-        let tx_capacity = config.rings.tx as usize;
-        Self {
-            rx_pool: XdpRxPool::with_heap_capacity(config.buffers.rx, rx_capacity),
-            tx_pool: XdpTxPool::with_heap_capacity(config.buffers.tx, tx_capacity),
-            routes: XdpLocalRoutes::new(config.route_snapshot.clone()),
-            driver,
-            config,
-            live: None,
-            pending_rx: VecDeque::with_capacity(rx_capacity),
-            pending_tx_frames: VecDeque::with_capacity(tx_capacity),
-            stats: RawDeviceStats::default(),
-            _not_send: PhantomData,
-        }
+    pub(crate) fn with_driver_test(config: XdpIpPacketSocketConfig, driver: D) -> Self {
+        construct_state(config, driver)
     }
 
-    /// Creates a live AF_XDP socket state with a concrete driver.
-    pub fn with_driver_live(config: XdpIpPacketSocketConfig, driver: D) -> std::io::Result<Self> {
-        let mut socket = Self::with_driver(config, driver);
+    /// Creates an AF_XDP-bound socket state with a concrete driver.
+    pub fn with_driver(config: XdpIpPacketSocketConfig, driver: D) -> std::io::Result<Self> {
+        let mut socket = construct_state(config, driver);
         let opened = LiveXdpState::open(&socket.config)?;
         socket.rx_pool = opened.rx_pool;
         socket.tx_pool = opened.tx_pool;
@@ -469,7 +544,7 @@ impl<D> XdpIpPacketSocket<D> {
         Ok(socket)
     }
 
-    fn drain_live_tx_completions(&mut self) -> Result<usize, Error> {
+    fn drain_tx_completions_inner(&mut self) -> Result<usize, Error> {
         let Some(live) = self.live.as_mut() else {
             return Ok(0);
         };
@@ -491,24 +566,25 @@ impl<D> XdpIpPacketSocket<D> {
                 Ok(())
             },
         )?;
+        // `tx_in_flight` is only mutated on the owner thread (the live socket
+        // is `!Send`), so the increment in `send`/`enqueue_tx_batch` and the
+        // decrement here serialize naturally. `saturating_sub` is defensive
+        // against an unexpected over-completion that should never happen.
         live.tx_in_flight = live.tx_in_flight.saturating_sub(completed);
         live.tx_since_completion_drain = 0;
         Ok(completed)
     }
 
-    fn live_tx_frame_count(&self) -> usize {
-        let frame_count = self
-            .config
-            .frame_count
-            .max(2)
-            .checked_next_power_of_two()
-            .unwrap_or(self.config.frame_count);
-        (frame_count / 2) as usize
+    fn tx_frame_count(&self) -> usize {
+        // `config.frame_count` is validated to be a power-of-two >= 2 at
+        // socket construction; the AF_XDP UMEM splits it evenly between RX
+        // and TX, so half of it is the TX frame count.
+        (self.config.frame_count / 2) as usize
     }
 
     fn tx_completion_drain_threshold(&self) -> usize {
         let completion_threshold = ((self.config.rings.completion as usize) / 2).max(1);
-        let frame_threshold = (self.live_tx_frame_count() / 2).max(1);
+        let frame_threshold = (self.tx_frame_count() / 2).max(1);
         completion_threshold.min(frame_threshold)
     }
 
@@ -516,21 +592,21 @@ impl<D> XdpIpPacketSocket<D> {
         (self.tx_completion_drain_threshold() / 2).max(1)
     }
 
-    fn should_drain_live_tx_completions(&self) -> bool {
+    fn should_drain_tx_completions(&self) -> bool {
         self.live.as_ref().is_some_and(|live| {
             live.tx_in_flight >= self.tx_completion_drain_threshold()
                 && live.tx_since_completion_drain >= self.tx_completion_drain_interval()
         })
     }
 
-    fn drain_live_completions_if_tx_pressure(&mut self) -> Result<(), Error> {
-        if self.should_drain_live_tx_completions() {
-            let _ = self.drain_live_tx_completions()?;
+    fn drain_completions_if_tx_pressure(&mut self) -> Result<(), Error> {
+        if self.should_drain_tx_completions() {
+            let _ = self.drain_tx_completions_inner()?;
         }
         Ok(())
     }
 
-    fn allocate_live_tx_batch(
+    fn allocate_tx_batch_inner(
         &mut self,
         out: &mut Vec<XdpPacketBufMut>,
         max: usize,
@@ -539,8 +615,10 @@ impl<D> XdpIpPacketSocket<D> {
             return Ok(0);
         }
 
-        self.drain_live_completions_if_tx_pressure()?;
+        self.drain_completions_if_tx_pressure()?;
 
+        // See `drain_retry_alloc_doc` for the loop shape used by every TX
+        // allocator in this crate (live and non-live, UDP and IP-packet).
         let start_len = out.len();
         let mut drained_after_empty = false;
         while out.len() - start_len < max {
@@ -555,12 +633,156 @@ impl<D> XdpIpPacketSocket<D> {
                 break;
             }
 
-            if self.drain_live_tx_completions()? == 0 {
+            if self.drain_tx_completions_inner()? == 0 {
                 break;
             }
             drained_after_empty = true;
         }
         Ok(out.len() - start_len)
+    }
+
+    /// Test-only equivalent of [`Self::allocate_tx_batch_inner`]: pulls buffers
+    /// from the heap-backed `tx_pool`, draining stale completions exactly once
+    /// when the pool is exhausted. Centralizes the drain-retry pattern so the
+    /// UDP wrapper does not re-implement it; see `_DRAIN_RETRY_ALLOC_DOC` for
+    /// the shared invariant.
+    #[cfg(test)]
+    fn allocate_tx_batch_test(
+        &mut self,
+        out: &mut Vec<XdpPacketBufMut>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        let start_len = out.len();
+        let mut drained_after_empty = false;
+        while out.len() - start_len < max {
+            if let Some(buffer) = self.tx_pool.allocate() {
+                out.push(buffer);
+                drained_after_empty = false;
+                continue;
+            }
+
+            if drained_after_empty {
+                break;
+            }
+
+            // Inline the non-live drain rather than going through the trait
+            // method, which would require an unwanted `D: PollDriver` bound
+            // on this inherent impl. Non-live mode just clears the pending
+            // queue and reports how many entries it dropped.
+            let completed = self.pending_tx_frames.len();
+            self.pending_tx_frames.clear();
+            if completed == 0 {
+                break;
+            }
+            drained_after_empty = true;
+        }
+        Ok(out.len() - start_len)
+    }
+
+    /// Test-only counterpart of the live AF_XDP send path. Validates each
+    /// packet against the queue's egress and MTU, prepends the ethernet
+    /// header, and pushes the resulting frame into [`Self::pending_tx_frames`]
+    /// so tests can observe the bytes that would have been transmitted.
+    #[cfg(test)]
+    fn send_test(
+        &mut self,
+        batch: &mut [TxSlot<IpPacketTransmit<XdpPacketBuf, XdpEgress, V4Only>>],
+    ) -> Result<usize, SendError> {
+        let mut accepted = 0;
+        for slot in batch.iter_mut() {
+            let Some(tx) = slot.as_ref() else {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidBatch,
+                });
+            };
+
+            if tx.egress.ifindex != self.config.ifindex || tx.egress.queue != self.config.queue_id {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::NoEgressRoute,
+                });
+            }
+
+            if tx.packet.len() > self.config.mtu || tx.packet.len() > tx.egress.mtu as usize {
+                self.stats.dropped_oversize = self.stats.dropped_oversize.saturating_add(1);
+                return Err(SendError {
+                    accepted,
+                    kind: Error::OversizeForMtu,
+                });
+            }
+
+            if !valid_tx_datagram(tx.packet.as_slice(), tx.egress.ethertype) {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidPacket,
+                });
+            }
+
+            if tx.packet.headroom() < ethernet_header_len(tx.egress) {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::Device(DeviceError::new(DeviceErrorKind::Backend)),
+                });
+            }
+
+            let Some(tx) = slot.take() else {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidBatch,
+                });
+            };
+            if self.pending_tx_frames.len() >= MAX_PENDING_TX_FRAMES {
+                // See MAX_PENDING_TX_FRAMES — test-only cap so a never-
+                // draining test or adapter doesn't exhaust host memory.
+                return Ok(accepted);
+            }
+            let mut frame = tx.packet.into_mut();
+            prepend_ethernet_header(&mut frame, tx.egress);
+            self.stats.tx_packets = self.stats.tx_packets.saturating_add(1);
+            self.stats.tx_bytes = self
+                .stats
+                .tx_bytes
+                .saturating_add(frame.len().saturating_sub(ethernet_header_len(tx.egress)) as u64);
+            self.pending_tx_frames.push_back(frame.freeze());
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
+    /// Test-only counterpart of the live AF_XDP recv path. Drains the
+    /// in-memory [`Self::pending_rx`] queue populated by
+    /// [`Self::push_received_ip_packet`] / [`Self::push_received_ethernet_packet`].
+    #[cfg(test)]
+    fn recv_test(
+        &mut self,
+        out: &mut RecvBatch<IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>>,
+    ) -> Result<usize, Error> {
+        let mut delivered = 0;
+        while out.remaining() > 0 {
+            let Some(packet) = self.pending_rx.pop_front() else {
+                break;
+            };
+            self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
+            self.stats.rx_bytes = self
+                .stats
+                .rx_bytes
+                .saturating_add(packet.packet.len() as u64);
+            out.push(packet).map_err(|_| Error::BatchFull)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Test-only counterpart of the live AF_XDP completion drain. There is
+    /// no real TX ring to drain in this mode, so every accepted packet is
+    /// treated as immediately completed: report the pending queue length
+    /// and clear it.
+    #[cfg(test)]
+    fn drain_tx_completions_test(&mut self) -> Result<usize, Error> {
+        let completed = self.pending_tx_frames.len();
+        self.pending_tx_frames.clear();
+        Ok(completed)
     }
 
     /// Returns queue-local route state.
@@ -665,7 +887,7 @@ impl<D> XdpIpPacketSocket<D> {
             .map(XdpPacketBuf::as_slice)
     }
 
-    fn send_live(
+    fn send_inner(
         &mut self,
         batch: &mut [TxSlot<IpPacketTransmit<XdpPacketBuf, XdpEgress, V4Only>>],
     ) -> Result<usize, SendError> {
@@ -676,25 +898,25 @@ impl<D> XdpIpPacketSocket<D> {
         let mut prepared = 0usize;
         let accepted;
 
-        if let Err(kind) = self.drain_live_completions_if_tx_pressure() {
+        if let Err(kind) = self.drain_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
         }
 
         let mut tx_available = self
             .live
             .as_mut()
-            .expect("send_live called only for live socket")
+            .expect("send_inner called only for live socket")
             .raw
             .tx_available() as usize;
         if tx_available == 0 {
             self.stats.ring_full = self.stats.ring_full.saturating_add(1);
-            if let Err(kind) = self.drain_live_tx_completions() {
+            if let Err(kind) = self.drain_tx_completions_inner() {
                 return Err(SendError { accepted: 0, kind });
             }
             tx_available = self
                 .live
                 .as_mut()
-                .expect("send_live called only for live socket")
+                .expect("send_inner called only for live socket")
                 .raw
                 .tx_available() as usize;
             if tx_available == 0 {
@@ -706,7 +928,7 @@ impl<D> XdpIpPacketSocket<D> {
             let live = self
                 .live
                 .as_mut()
-                .expect("send_live called only for live socket");
+                .expect("send_inner called only for live socket");
             let limit = batch.len().min(tx_available);
             live.tx_descs.clear();
             for slot in batch.iter_mut().take(limit) {
@@ -748,7 +970,14 @@ impl<D> XdpIpPacketSocket<D> {
             }
 
             accepted = live.raw.enqueue_tx_batch(&live.tx_descs[..prepared]);
-            debug_assert_eq!(accepted, prepared);
+            // `prepared` is bounded by the available TX ring space reserved
+            // above, so enqueue must accept the whole prepared slice. A short
+            // accept would silently drop committed descriptors and leak their
+            // frames; surface that as a hard invariant violation.
+            assert_eq!(
+                accepted, prepared,
+                "AF_XDP TX ring accepted fewer descriptors than reserved",
+            );
             if accepted > 0 {
                 live.raw.commit_tx();
                 live.tx_in_flight = live.tx_in_flight.saturating_add(accepted);
@@ -770,20 +999,32 @@ impl<D> XdpIpPacketSocket<D> {
             self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(packet_len as u64);
         }
 
-        if accepted > 0 {
-            let live = self
+        // Always poke when we just committed descriptors AND clear any
+        // pending wake left over from a prior failure. Both paths use the
+        // same `tx_wake_pending` latch so the doorbell is never lost.
+        let needs_wake = accepted > 0
+            || self
                 .live
                 .as_ref()
-                .expect("send_live called only for live socket");
-            if let Err(error) = live.raw.wake_tx() {
-                return Err(SendError {
-                    accepted,
-                    kind: device_error(error),
-                });
+                .is_some_and(|live| live.tx_wake_pending);
+        if needs_wake {
+            let live = self
+                .live
+                .as_mut()
+                .expect("send_inner called only for live socket");
+            match live.raw.wake_tx() {
+                Ok(()) => live.tx_wake_pending = false,
+                Err(error) => {
+                    live.tx_wake_pending = true;
+                    return Err(SendError {
+                        accepted,
+                        kind: device_error(error),
+                    });
+                }
             }
         }
 
-        // See send_live_udp: post-send drain is redundant with the pre-drain
+        // See send_udp_inner: post-send drain is redundant with the pre-drain
         // in the next allocate/send iteration.
 
         if accepted == prepared {
@@ -795,14 +1036,14 @@ impl<D> XdpIpPacketSocket<D> {
         Ok(accepted)
     }
 
-    fn recv_live(
+    fn recv_inner(
         &mut self,
         out: &mut RecvBatch<IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>>,
     ) -> Result<usize, Error> {
         let live = self
             .live
             .as_mut()
-            .expect("recv_live called only for live socket");
+            .expect("recv_inner called only for live socket");
         live.replenish_fill().map_err(device_error)?;
 
         live.rx_descs.clear();
@@ -813,10 +1054,19 @@ impl<D> XdpIpPacketSocket<D> {
 
         let mut delivered = 0;
         let rx_reclaim = Rc::clone(&live.rx_reclaim);
-        for desc in live.rx_descs.drain(..) {
+        let mut idx = 0;
+        while idx < live.rx_descs.len() {
+            let desc = live.rx_descs[idx];
+            idx += 1;
             let Some((frame_addr, frame)) =
                 live.umem.descriptor_slice(desc.addr, desc.len as usize)
             else {
+                // Cross-frame or out-of-bounds descriptor. Recover what we can:
+                // return the offending frame and every still-pending frame to
+                // the FILL pool so a corrupt descriptor does not permanently
+                // strip the UMEM rotation.
+                reclaim_rx_descs(&rx_reclaim, &live.umem, desc, &live.rx_descs[idx..]);
+                live.rx_descs.clear();
                 return Err(ring_corrupt_error());
             };
             let Some(parsed) = parse_ethernet_frame(frame) else {
@@ -846,11 +1096,12 @@ impl<D> XdpIpPacketSocket<D> {
                     checksum: ChecksumStatus::NotChecked,
                 },
             ))
-            .map_err(|_| Error::WouldBlock)?;
+            .expect("RecvBatch had remaining capacity reserved before drain_rx");
             self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
             self.stats.rx_bytes = self.stats.rx_bytes.saturating_add(parsed.ip.len as u64);
             delivered += 1;
         }
+        live.rx_descs.clear();
 
         live.replenish_fill().map_err(device_error)?;
         Ok(delivered)
@@ -964,7 +1215,7 @@ impl UdpEgressContext {
                 },
             )
             .ok_or(Error::NoEgressRoute)?;
-        let (l2_header, l2_len) = cached_ethernet_header(egress);
+        let (l2_header, l2_len) = build_ethernet_header(egress);
 
         validate_xdp_udp_egress(self.ifindex, self.queue_id, egress)?;
         Ok(ResolvedUdpEgress {
@@ -980,7 +1231,8 @@ where
     D: PollDriver,
     R: XdpUdpRouter,
 {
-    fn send_heap_udp(
+    #[cfg(test)]
+    fn send_udp_test(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<XdpPacketBuf>>],
     ) -> Result<usize, SendError> {
@@ -1029,6 +1281,12 @@ where
                 });
             }
 
+            if self.ip.pending_tx_frames.len() >= MAX_PENDING_TX_FRAMES {
+                // Non-live (heap) mode caps its pending queue so a test that
+                // never drains can't exhaust host memory. Stop here and let
+                // the caller drain before sending more.
+                return Ok(accepted);
+            }
             let packet_len = packet.len();
             let mut frame = packet.into_mut();
             prepend_l2_header(&mut frame, &resolved.l2_header[..resolved.l2_len]);
@@ -1041,7 +1299,7 @@ where
         Ok(accepted)
     }
 
-    fn send_live_udp(
+    fn send_udp_inner(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<XdpPacketBuf>>],
     ) -> Result<usize, SendError> {
@@ -1049,7 +1307,7 @@ where
         let ttl = self.ttl;
         let egress_context = UdpEgressContext::from_ip_socket(&self.ip);
 
-        if let Err(kind) = self.ip.drain_live_completions_if_tx_pressure() {
+        if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
         }
 
@@ -1057,19 +1315,19 @@ where
             .ip
             .live
             .as_mut()
-            .expect("send_live_udp called only for live socket")
+            .expect("send_udp_inner called only for live socket")
             .raw
             .tx_available() as usize;
         if tx_available == 0 {
             self.ip.stats.ring_full = self.ip.stats.ring_full.saturating_add(1);
-            if let Err(kind) = self.ip.drain_live_tx_completions() {
+            if let Err(kind) = self.ip.drain_tx_completions_inner() {
                 return Err(SendError { accepted: 0, kind });
             }
             tx_available = self
                 .ip
                 .live
                 .as_mut()
-                .expect("send_live_udp called only for live socket")
+                .expect("send_udp_inner called only for live socket")
                 .raw
                 .tx_available() as usize;
             if tx_available == 0 {
@@ -1089,7 +1347,7 @@ where
                 .ip
                 .live
                 .as_mut()
-                .expect("send_live_udp called only for live socket");
+                .expect("send_udp_inner called only for live socket");
             live.tx_descs.clear();
             live.udp_tx_scratch.clear();
 
@@ -1179,9 +1437,19 @@ where
                 }
             }
 
-            if accepted > 0 {
-                if let Err(error) = live.raw.wake_tx() {
-                    wake_error = Some(error);
+            // Drain any wake we owe from a prior call before deciding whether
+            // we need to issue a fresh one. Either way, after a successful
+            // commit we always poke; the kernel may have flushed the
+            // descriptors already, but skipping the doorbell would risk
+            // parking them forever.
+            let needs_wake = accepted > 0 || live.tx_wake_pending;
+            if needs_wake {
+                match live.raw.wake_tx() {
+                    Ok(()) => live.tx_wake_pending = false,
+                    Err(error) => {
+                        live.tx_wake_pending = true;
+                        wake_error = Some(error);
+                    }
                 }
             }
         }
@@ -1199,8 +1467,8 @@ where
         }
 
         // Completions accumulated by this send are reclaimed at the top of the
-        // next `allocate_live_tx_batch` (and again at the top of the next
-        // `send_live_udp`); draining here would re-run the same threshold check
+        // next `allocate_tx_batch_inner` (and again at the top of the next
+        // `send_udp_inner`); draining here would re-run the same threshold check
         // a few cycles earlier without changing which iteration actually drains.
 
         if accepted == prepared {
@@ -1220,14 +1488,15 @@ where
             return Ok(0);
         }
 
-        if self.ip.live.is_some() {
-            return self.recv_live_udp(out);
+        #[cfg(test)]
+        if self.ip.live.is_none() {
+            return self.recv_udp_test(out);
         }
-
-        self.recv_heap_udp(out)
+        self.recv_udp_inner(out)
     }
 
-    fn recv_heap_udp(
+    #[cfg(test)]
+    fn recv_udp_test(
         &mut self,
         out: &mut RecvBatch<UdpReceive<XdpPacketBufMut, UdpRecvMeta>>,
     ) -> Result<usize, Error> {
@@ -1245,14 +1514,14 @@ where
             let Some(udp) = parse_xdp_udp_receive(self.local_addr, ip_receive)? else {
                 continue;
             };
-            out.push(udp).map_err(|_| Error::WouldBlock)?;
+            out.push(udp).map_err(|_| Error::BatchFull)?;
             delivered += 1;
         }
 
         Ok(delivered)
     }
 
-    fn recv_live_udp(
+    fn recv_udp_inner(
         &mut self,
         out: &mut RecvBatch<UdpReceive<XdpPacketBufMut, UdpRecvMeta>>,
     ) -> Result<usize, Error> {
@@ -1260,7 +1529,7 @@ where
             .ip
             .live
             .as_mut()
-            .expect("recv_live_udp called only for live socket");
+            .expect("recv_udp_inner called only for live socket");
         live.replenish_fill().map_err(device_error)?;
 
         live.rx_descs.clear();
@@ -1272,10 +1541,15 @@ where
         let local_addr = self.local_addr;
         let mut delivered = 0;
         let rx_reclaim = Rc::clone(&live.rx_reclaim);
-        for desc in live.rx_descs.drain(..) {
+        let mut idx = 0;
+        while idx < live.rx_descs.len() {
+            let desc = live.rx_descs[idx];
+            idx += 1;
             let Some((frame_addr, frame)) =
                 live.umem.descriptor_slice(desc.addr, desc.len as usize)
             else {
+                reclaim_rx_descs(&rx_reclaim, &live.umem, desc, &live.rx_descs[idx..]);
+                live.rx_descs.clear();
                 return Err(ring_corrupt_error());
             };
             let parsed = match parse_ethernet_ipv4_udp(frame) {
@@ -1292,9 +1566,16 @@ where
                 }
             };
 
-            if parsed.destination != *local_addr.ip()
-                || parsed.destination_port != local_addr.port()
-            {
+            // Accept the packet when the destination port matches AND either
+            // the local address is unspecified (`0.0.0.0`, the "any interface
+            // address" wildcard) or it equals the parsed destination IP.
+            // Without the wildcard branch a socket bound on 0.0.0.0 would
+            // reject every packet because the kernel always fills in the
+            // real interface address as the L3 destination.
+            let local_ip = *local_addr.ip();
+            let dest_matches =
+                local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
+            if !dest_matches || parsed.destination_port != local_addr.port() {
                 rx_reclaim.push(frame_addr);
                 continue;
             }
@@ -1318,12 +1599,13 @@ where
                     gro_stride: None,
                 },
             ))
-            .map_err(|_| Error::WouldBlock)?;
+            .expect("RecvBatch had remaining capacity reserved before drain_rx");
 
             self.ip.stats.rx_packets = self.ip.stats.rx_packets.saturating_add(1);
             self.ip.stats.rx_bytes = self.ip.stats.rx_bytes.saturating_add(parsed.ip_len as u64);
             delivered += 1;
         }
+        live.rx_descs.clear();
 
         live.replenish_fill().map_err(device_error)?;
         Ok(delivered)
@@ -1374,29 +1656,11 @@ where
         out: &mut Vec<fast_socket_rs::UdpTxBufferMut<Self>>,
         max: usize,
     ) -> Result<usize, Error> {
-        if self.ip.live.is_some() {
-            return self.ip.allocate_live_tx_batch(out, max);
+        #[cfg(test)]
+        if self.ip.live.is_none() {
+            return self.ip.allocate_tx_batch_test(out, max);
         }
-
-        let start_len = out.len();
-        let mut drained_after_empty = false;
-        while out.len() - start_len < max {
-            if let Some(buffer) = self.ip.tx_pool.allocate() {
-                out.push(buffer);
-                drained_after_empty = false;
-                continue;
-            }
-
-            if drained_after_empty {
-                break;
-            }
-
-            if self.ip.drain_tx_completions()? == 0 {
-                break;
-            }
-            drained_after_empty = true;
-        }
-        Ok(out.len() - start_len)
+        self.ip.allocate_tx_batch_inner(out, max)
     }
 
     fn driver(&self) -> &Self::Driver {
@@ -1411,11 +1675,11 @@ where
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<fast_socket_rs::UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError> {
-        if self.ip.live.is_some() {
-            self.send_live_udp(batch)
-        } else {
-            self.send_heap_udp(batch)
+        #[cfg(test)]
+        if self.ip.live.is_none() {
+            return self.send_udp_test(batch);
         }
+        self.send_udp_inner(batch)
     }
 
     fn recv(
@@ -1481,104 +1745,41 @@ where
         &mut self,
         batch: &mut [TxSlot<IpPacketTransmit<XdpPacketBuf, Self::Egress, Self::Family>>],
     ) -> Result<usize, SendError> {
-        if self.live.is_some() {
-            return self.send_live(batch);
+        #[cfg(test)]
+        if self.live.is_none() {
+            return self.send_test(batch);
         }
-
-        let mut accepted = 0;
-        for slot in batch.iter_mut() {
-            let Some(tx) = slot.as_ref() else {
-                return Err(SendError {
-                    accepted,
-                    kind: Error::InvalidBatch,
-                });
-            };
-
-            if tx.egress.ifindex != self.config.ifindex || tx.egress.queue != self.config.queue_id {
-                return Err(SendError {
-                    accepted,
-                    kind: Error::NoEgressRoute,
-                });
-            }
-
-            if tx.packet.len() > self.config.mtu || tx.packet.len() > tx.egress.mtu as usize {
-                self.stats.dropped_oversize = self.stats.dropped_oversize.saturating_add(1);
-                return Err(SendError {
-                    accepted,
-                    kind: Error::OversizeForMtu,
-                });
-            }
-
-            if !valid_tx_datagram(tx.packet.as_slice(), tx.egress.ethertype) {
-                return Err(SendError {
-                    accepted,
-                    kind: Error::InvalidPacket,
-                });
-            }
-
-            if tx.packet.headroom() < ethernet_header_len(tx.egress) {
-                return Err(SendError {
-                    accepted,
-                    kind: Error::Device(DeviceError::new(DeviceErrorKind::Backend)),
-                });
-            }
-
-            let Some(tx) = slot.take() else {
-                return Err(SendError {
-                    accepted,
-                    kind: Error::InvalidBatch,
-                });
-            };
-            let mut frame = tx.packet.into_mut();
-            prepend_ethernet_header(&mut frame, tx.egress);
-            self.stats.tx_packets = self.stats.tx_packets.saturating_add(1);
-            self.stats.tx_bytes = self
-                .stats
-                .tx_bytes
-                .saturating_add(frame.len().saturating_sub(ethernet_header_len(tx.egress)) as u64);
-            self.pending_tx_frames.push_back(frame.freeze());
-            accepted += 1;
-        }
-        Ok(accepted)
+        self.send_inner(batch)
     }
 
     fn recv(
         &mut self,
         out: &mut RecvBatch<IpPacketReceive<XdpPacketBufMut, Self::RecvMeta>>,
     ) -> Result<usize, Error> {
-        if self.live.is_some() {
-            return self.recv_live(out);
+        #[cfg(test)]
+        if self.live.is_none() {
+            return self.recv_test(out);
         }
-
-        let mut delivered = 0;
-        while out.remaining() > 0 {
-            let Some(packet) = self.pending_rx.pop_front() else {
-                break;
-            };
-            self.stats.rx_packets = self.stats.rx_packets.saturating_add(1);
-            self.stats.rx_bytes = self
-                .stats
-                .rx_bytes
-                .saturating_add(packet.packet.len() as u64);
-            out.push(packet).map_err(|_| Error::WouldBlock)?;
-            delivered += 1;
-        }
-        Ok(delivered)
+        self.recv_inner(out)
     }
 
     fn drain_tx_completions(&mut self) -> Result<usize, Error> {
-        if self.live.is_some() {
-            return self.drain_live_tx_completions();
+        #[cfg(test)]
+        if self.live.is_none() {
+            return self.drain_tx_completions_test();
         }
-
-        let completed = self.pending_tx_frames.len();
-        self.pending_tx_frames.clear();
-        Ok(completed)
+        self.drain_tx_completions_inner()
     }
 
     fn notify_tx(&mut self) -> Result<(), Error> {
-        if let Some(live) = self.live.as_ref() {
-            live.raw.wake_tx().map_err(device_error)?;
+        if let Some(live) = self.live.as_mut() {
+            match live.raw.wake_tx() {
+                Ok(()) => live.tx_wake_pending = false,
+                Err(error) => {
+                    live.tx_wake_pending = true;
+                    return Err(device_error(error));
+                }
+            }
         }
         Ok(())
     }
@@ -1760,7 +1961,15 @@ fn build_xdp_udp_transmit(
     };
 
     let payload_len = tx.packet.len();
-    if payload_len > ip_mtu.saturating_sub(IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) {
+    // The MTU must accommodate the IPv4 and UDP headers we are about to
+    // prepend. A misconfigured MTU smaller than just the header overhead is
+    // a programmer error, not a runtime back-pressure condition; surface it
+    // as a hard `Error::InvalidPacket` (via the build-error path) instead of
+    // silently treating every payload as oversize.
+    let Some(max_payload) = ip_mtu.checked_sub(IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) else {
+        return Err(build_xdp_udp_error(tx, Error::InvalidPacket));
+    };
+    if payload_len > max_payload {
         return Err(build_xdp_udp_error(tx, Error::OversizeForMtu));
     }
 
@@ -1840,6 +2049,7 @@ fn reclaim_completed_xdp_frame(
     }
 }
 
+#[cfg(test)]
 fn parse_xdp_udp_receive(
     local_addr: SocketAddrV4,
     mut ip: IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>,
@@ -1848,7 +2058,11 @@ fn parse_xdp_udp_receive(
         return Ok(None);
     };
 
-    if parsed.destination != *local_addr.ip() || parsed.destination_port != local_addr.port() {
+    // See the live-path filter: accept either an exact destination-IP match
+    // or any IP when the socket is bound on 0.0.0.0.
+    let local_ip = *local_addr.ip();
+    let dest_matches = local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
+    if !dest_matches || parsed.destination_port != local_addr.port() {
         return Ok(None);
     }
 
@@ -1875,6 +2089,7 @@ fn parse_xdp_udp_receive(
     )))
 }
 
+#[cfg(test)]
 fn parse_ipv4_udp(packet: &[u8]) -> Option<ParsedIpv4Udp> {
     match parse_ipv4_udp_datagram(packet) {
         UdpParse::Udp(parsed) => Some(parsed),
@@ -1984,6 +2199,9 @@ fn write_ipv4_udp_headers(
 }
 
 fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    // IPv4 headers are always a multiple of 4 bytes (IHL is in 32-bit words),
+    // so `chunks_exact(2)` consumes the full header with no trailing odd byte.
+    debug_assert!(header.len().is_multiple_of(2));
     let mut sum = 0u32;
     for chunk in header.chunks_exact(2) {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
@@ -2148,19 +2366,27 @@ fn ethernet_header_len(egress: XdpEgress) -> usize {
     }
 }
 
-fn cached_ethernet_header(egress: XdpEgress) -> ([u8; VLAN_HEADER_LEN], usize) {
+/// Materializes the L2 header bytes for a resolved egress into a small
+/// stack buffer and returns the populated length. Despite the call site name
+/// this helper does **not** cache anything between calls; each invocation
+/// rebuilds the bytes from `egress`. Pre-existing call sites used the older
+/// name `cached_ethernet_header`, which falsely implied state — kept here as
+/// a free function so the build pays only register-spill cost.
+fn build_ethernet_header(egress: XdpEgress) -> ([u8; VLAN_HEADER_LEN], usize) {
     let l2_len = ethernet_header_len(egress);
     let mut header = [0u8; VLAN_HEADER_LEN];
     write_ethernet_header(&mut header[..l2_len], egress);
     (header, l2_len)
 }
 
+#[cfg(test)]
 fn prepend_ethernet_header(buffer: &mut XdpPacketBufMut, egress: XdpEgress) {
     let mut header = [0u8; VLAN_HEADER_LEN];
     write_ethernet_header(&mut header[..ethernet_header_len(egress)], egress);
     prepend_l2_header(buffer, &header[..ethernet_header_len(egress)]);
 }
 
+#[cfg(test)]
 fn prepend_l2_header(buffer: &mut XdpPacketBufMut, header: &[u8]) {
     buffer
         .prepend(header)
@@ -2182,7 +2408,9 @@ fn write_ethernet_header(header: &mut [u8], egress: XdpEgress) {
     }
 }
 
-fn live_frame_size(config: &XdpIpPacketSocketConfig) -> std::io::Result<u32> {
+/// Derives the AF_XDP UMEM frame size from the configured RX/TX buffer
+/// layouts, rounded up to the next power of two as the kernel requires.
+fn umem_frame_size(config: &XdpIpPacketSocketConfig) -> std::io::Result<u32> {
     let frame_size = config
         .buffers
         .rx
@@ -2205,6 +2433,27 @@ fn device_error(error: impl std::error::Error + Send + Sync + 'static) -> Error 
 
 fn ring_corrupt_error() -> Error {
     Error::Device(DeviceError::new(DeviceErrorKind::RingCorrupt))
+}
+
+/// Best-effort reclaim of one offending descriptor plus every still-pending
+/// descriptor when an RX iteration is aborting. Frames whose address is not
+/// recoverable (e.g. wholly out of bounds) are leaked, but every recoverable
+/// frame returns to the FILL pool so corrupt descriptors do not permanently
+/// drain the UMEM rotation.
+fn reclaim_rx_descs(
+    rx_reclaim: &FrameReclaim,
+    umem: &Umem,
+    failing: XdpDesc,
+    remaining: &[XdpDesc],
+) {
+    if let Some(addr) = umem.frame_addr_for_desc(failing.addr) {
+        rx_reclaim.push(addr);
+    }
+    for desc in remaining {
+        if let Some(addr) = umem.frame_addr_for_desc(desc.addr) {
+            rx_reclaim.push(addr);
+        }
+    }
 }
 
 fn wait_for_readable(fd: BorrowedFd<'_>, timeout: Option<Duration>) -> Result<WaitOutcome, Error> {
@@ -2388,7 +2637,7 @@ mod tests {
     #[test]
     fn xdp_ip_packet_socket_accepts_static_egress_send() {
         let mut socket =
-            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
+            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
         let ip = ipv4_packet();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(&ip).unwrap();
@@ -2414,7 +2663,7 @@ mod tests {
     #[test]
     fn xdp_ip_packet_socket_normalizes_ethernet_rx_to_ip_packet() {
         let mut socket =
-            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
+            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
         let ip = ipv4_packet();
         assert!(socket.push_received_ethernet_frame(&ethernet_frame(&ip)));
 
@@ -2427,7 +2676,7 @@ mod tests {
     #[test]
     fn xdp_ip_packet_socket_drops_ipv4_fragments() {
         let mut socket =
-            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
+            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
         let mut ip = ipv4_packet();
         ip[6] = 0x20;
 
@@ -2441,7 +2690,7 @@ mod tests {
     #[test]
     fn xdp_ip_packet_socket_rejects_trailing_tx_bytes() {
         let mut socket =
-            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll();
+            XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(&ipv4_packet()).unwrap();
         packet.extend_from_slice(b"extra").unwrap();
@@ -2470,7 +2719,7 @@ mod tests {
                 egress().dst_mac,
                 egress().src_mac,
             ))
-            .open_busy_poll();
+            .open_busy_poll_test();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
@@ -2518,7 +2767,7 @@ mod tests {
                 route_dst_mac,
                 route_src_mac,
             ))
-            .open_busy_poll();
+            .open_busy_poll_test();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
@@ -2541,7 +2790,7 @@ mod tests {
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
         let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
             .router(StaticUdpRouter { egress: egress() })
-            .open_busy_poll();
+            .open_busy_poll_test();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
@@ -2561,7 +2810,7 @@ mod tests {
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
         let mut socket =
-            XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local).open_busy_poll();
+            XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local).open_busy_poll_test();
         let mut packet = socket.tx_pool_mut().allocate().unwrap();
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
@@ -2582,7 +2831,7 @@ mod tests {
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
         let mut socket =
-            XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local).open_busy_poll();
+            XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local).open_busy_poll_test();
         let ip = ipv4_udp_packet(
             *remote.ip(),
             *local.ip(),

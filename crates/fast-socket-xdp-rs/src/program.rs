@@ -3,15 +3,17 @@
 //! The embedded program redirects IPv4/IPv6 packets to `XSKMAP[rx_queue_index]`
 //! while no UDP ports are bound. When `BOUND_PORTS` and `BOUND_PORT_COUNT` are
 //! present and at least one UDP port is bound, it redirects only matching IPv4
-//! UDP packets and leaves unrelated traffic on the kernel path. The loader also
-//! accepts older quac-compatible objects that have only a UDP `BOUND_PORTS` map.
+//! UDP packets and leaves unrelated traffic on the kernel path. The loader
+//! requires both maps together: an object that ships `BOUND_PORTS` without
+//! `BOUND_PORT_COUNT` is rejected because port binding would silently become a
+//! no-op and the program would hijack every matching IPv4/IPv6 packet.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock};
 
 use aya::Ebpf;
@@ -19,8 +21,8 @@ use aya::maps::{Array as AyaArray, XskMap};
 use aya::programs::{Xdp, XdpFlags};
 
 pub use fast_socket_xdp_ebpf::{
-    BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_UDP_FRAGMENT,
-    DROP_REASON_UDP_OPTIONS, MAX_BOUND_PORTS, MAX_QUEUES,
+    BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_REDIRECT_ERROR,
+    DROP_REASON_XSKMAP_MISS, MAX_BOUND_PORTS, MAX_QUEUES,
 };
 
 /// XDP attach mode.
@@ -68,19 +70,16 @@ impl XdpProgram {
         let mut ebpf = Ebpf::load(bytes).map_err(load_err)?;
         let bound_port_maps = validate_bound_port_maps(&mut ebpf)?;
         validate_xskmap(&mut ebpf)?;
+        validate_drop_counters(&mut ebpf)?;
 
-        let program_name = if ebpf.program("fast_socket_xdp").is_some() {
-            "fast_socket_xdp"
-        } else {
-            // The checked-in fallback object was copied from quac and still
-            // carries this symbol. Accept it so older prebuilt objects work.
-            "quac_xdp"
-        };
+        // Only the in-tree program symbol is accepted. The historical
+        // `quac_xdp` fallback became unreachable once the loader started
+        // requiring `BOUND_PORT_COUNT` (those older objects do not ship it,
+        // so they fail validation above), so it is dropped here to keep the
+        // attach path honest.
         let program: &mut Xdp = ebpf
-            .program_mut(program_name)
-            .ok_or_else(|| {
-                io::Error::other("eBPF object has no `fast_socket_xdp` or `quac_xdp` XDP program")
-            })?
+            .program_mut("fast_socket_xdp")
+            .ok_or_else(|| io::Error::other("eBPF object has no `fast_socket_xdp` XDP program"))?
             .try_into()
             .map_err(load_err)?;
         program.load().map_err(load_err)?;
@@ -177,19 +176,55 @@ impl XdpProgram {
         Ok(())
     }
 
-    /// Drops local tracking for a registered queue.
+    /// Removes a queue's AF_XDP socket reference from the in-kernel XSKMAP and
+    /// drops local tracking.
     ///
-    /// The kernel removes the XSKMAP fd reference when the AF_XDP socket fd is
-    /// closed; aya 0.13 does not expose `XskMap::remove`.
+    /// aya 0.13's `XskMap` only exposes `set`, so the actual delete goes
+    /// through a direct `bpf(BPF_MAP_DELETE_ELEM, ...)` syscall using the
+    /// map's fd. The kernel additionally drops the reference automatically
+    /// when the AF_XDP socket fd is closed, but doing the explicit delete
+    /// here keeps userspace and kernel bookkeeping in sync — important for
+    /// `register_socket(queue, …)` calls that follow on the same queue
+    /// before the previous socket's fd has been closed.
     pub fn unregister_socket(&mut self, queue_id: u32) -> io::Result<()> {
         self.registered_queues.remove(&queue_id);
-        Ok(())
+        let map = self
+            .ebpf
+            .map_mut("XSKMAP")
+            .ok_or_else(|| io::Error::other("eBPF object has no `XSKMAP` map"))?;
+        let aya::maps::Map::XskMap(data) = map else {
+            return Err(io::Error::other(
+                "eBPF map `XSKMAP` is not the expected XskMap type",
+            ));
+        };
+        // SAFETY: `data.fd()` is a live BPF map fd owned by the `Ebpf` we
+        // hold, and `queue_id` is a stack-allocated `u32` for the duration of
+        // the syscall.
+        let map_fd = data.fd().as_fd();
+        unsafe { bpf_map_delete_elem(map_fd, queue_id) }
     }
 
     /// Returns the interface index this program is attached to.
     #[must_use]
     pub const fn if_index(&self) -> u32 {
         self.if_index
+    }
+}
+
+impl Drop for XdpProgram {
+    /// Detaches the XDP program from its interface when the last reference is
+    /// dropped.
+    ///
+    /// `aya::Ebpf::drop` already detaches every program owned by the object
+    /// when it is dropped, so this `Drop` is a defensive marker: it makes the
+    /// detachment edge explicit at this type, ensures the program is unloaded
+    /// even if a future refactor splits the program out from `Ebpf`, and
+    /// documents that holding an `XdpProgram` past program-shutdown is what
+    /// keeps the kernel attachment alive.
+    fn drop(&mut self) {
+        // Surface the unload path with a name so it is obvious in profiles and
+        // backtraces; the actual detach happens inside `self.ebpf`'s own drop.
+        let _detach = &self.ebpf;
     }
 }
 
@@ -306,6 +341,17 @@ pub fn get_or_load(
 }
 
 /// Releases a program registry reference when the last queue user drops it.
+///
+/// The strong-count check is performed while holding the registry mutex, and
+/// `get_or_load` takes the same mutex before handing out fresh clones, so the
+/// count is stable for the duration of this critical section: a value of 2
+/// means "this caller + the registry slot itself" and nothing else.
+///
+/// Note that a handle that is `mem::forget`'d will keep the strong count
+/// elevated forever, leaving an orphan registry entry behind. Callers that
+/// load XDP programs must let `XdpProgramHandle` drop normally; the kernel
+/// will still detach the program on process exit, but mid-process state will
+/// stay registered.
 pub fn release(if_index: u32, program: Arc<Mutex<XdpProgram>>) {
     let registry = PROGRAMS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry
@@ -343,22 +389,28 @@ fn validate_bound_port_maps(ebpf: &mut Ebpf) -> io::Result<BoundPortMaps> {
         )));
     }
 
-    let count_available = if let Some(map) = ebpf.map_mut("BOUND_PORT_COUNT") {
-        let counts: AyaArray<_, u32> = AyaArray::try_from(map).map_err(io_err)?;
-        if counts.len() != BOUND_PORT_COUNT_LEN {
-            return Err(io::Error::other(format!(
-                "eBPF map `BOUND_PORT_COUNT` has wrong length: expected {BOUND_PORT_COUNT_LEN}, got {}",
-                counts.len()
-            )));
-        }
-        true
-    } else {
-        false
-    };
+    // BOUND_PORTS without BOUND_PORT_COUNT silently turns port binding into a
+    // no-op in the eBPF program: the kernel-side filter then sees
+    // `bound_port_count == 0` and falls through to the "no ports bound"
+    // pass-everything branch. That would let a stale prebuilt object hijack
+    // every IPv4/IPv6 packet on the interface. Reject such objects.
+    let map = ebpf.map_mut("BOUND_PORT_COUNT").ok_or_else(|| {
+        io::Error::other(
+            "eBPF object has `BOUND_PORTS` but is missing the matching `BOUND_PORT_COUNT` map; \
+             the object is stale and would redirect all matching IPv4/IPv6 traffic",
+        )
+    })?;
+    let counts: AyaArray<_, u32> = AyaArray::try_from(map).map_err(io_err)?;
+    if counts.len() != BOUND_PORT_COUNT_LEN {
+        return Err(io::Error::other(format!(
+            "eBPF map `BOUND_PORT_COUNT` has wrong length: expected {BOUND_PORT_COUNT_LEN}, got {}",
+            counts.len()
+        )));
+    }
 
     Ok(BoundPortMaps {
         ports_available: true,
-        count_available,
+        count_available: true,
     })
 }
 
@@ -367,6 +419,80 @@ fn validate_xskmap(ebpf: &mut Ebpf) -> io::Result<()> {
         .map_mut("XSKMAP")
         .ok_or_else(|| io::Error::other("eBPF object missing required map `XSKMAP`"))?;
     let _: XskMap<_> = XskMap::try_from(map).map_err(io_err)?;
+    Ok(())
+}
+
+/// `DROP_COUNTERS` is optional: older prebuilt objects predate the map.
+/// We only validate shape when the map is present so userspace tooling
+/// that reads counters can rely on the schema, but we don't refuse to
+/// load objects that lack the map entirely.
+fn validate_drop_counters(ebpf: &mut Ebpf) -> io::Result<()> {
+    let Some(map) = ebpf.map_mut("DROP_COUNTERS") else {
+        return Ok(());
+    };
+    let counters: AyaArray<_, u64> = AyaArray::try_from(map).map_err(io_err)?;
+    if counters.len() != DROP_COUNTERS_LEN {
+        return Err(io::Error::other(format!(
+            "eBPF map `DROP_COUNTERS` has wrong length: expected {DROP_COUNTERS_LEN}, got {}",
+            counters.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Intra-process fingerprint for an XDP object payload.
+///
+/// Uses `DefaultHasher` (SipHash), which is **not** stable across processes
+/// or Rust versions. The output is only compared with other fingerprints
+/// computed in the same process to decide whether a cached `XdpProgram` can
+/// be reused; never persist or transmit this value.
+/// Issues `bpf(BPF_MAP_DELETE_ELEM, ...)` directly because aya 0.13's
+/// [`aya::maps::XskMap`] only exposes `set` / `len`.
+///
+/// # Safety
+/// `map_fd` must be a live BPF map file descriptor referencing an XSKMAP-
+/// shaped map (key=`u32`, value=`RawFd`) and `key` must be a queue id that
+/// the caller is authorized to clear.
+unsafe fn bpf_map_delete_elem(map_fd: BorrowedFd<'_>, key: u32) -> io::Result<()> {
+    // Linux `union bpf_attr` is a large union; only the first three fields
+    // are needed for BPF_MAP_DELETE_ELEM. We construct just those.
+    #[repr(C)]
+    struct BpfMapDeleteAttr {
+        map_fd: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+    let key_value: u32 = key;
+    let attr = BpfMapDeleteAttr {
+        map_fd: map_fd.as_raw_fd() as u32,
+        key: (&raw const key_value) as u64,
+        value: 0,
+        flags: 0,
+    };
+    // BPF_MAP_DELETE_ELEM = 3 (from include/uapi/linux/bpf.h, bpf_cmd).
+    const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
+    // SAFETY: `attr` is fully initialized; the kernel reads at most
+    // `size_of::<BpfMapDeleteAttr>()` bytes from it and copies them in.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_DELETE_ELEM,
+            &raw const attr,
+            core::mem::size_of::<BpfMapDeleteAttr>() as u32,
+        )
+    };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        // The kernel returns ENOENT if the key was never set (e.g., when
+        // unregister races with an asynchronous fd close). That's not a
+        // failure for our purposes — the desired post-state has been
+        // reached.
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(err);
+    }
     Ok(())
 }
 

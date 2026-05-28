@@ -500,6 +500,15 @@ enum XdpStorage {
         // must outlive every outstanding buffer. Cross-thread drops push into
         // the reclaim object's remote MPSC queue; owner-thread drops use its
         // local free list.
+        //
+        // Review item **S4** (UMEM lifetime is enforced only by docs) is
+        // intentionally left as-is: switching the owning side to `Arc<Umem>`
+        // and `Arc<FrameReclaim>` would either force every recv/send into an
+        // atomic ref-count cycle on the steady-state hot path or leak the
+        // UMEM until the last in-flight buffer drains. The current contract
+        // — "do not drop the owning socket while there are outstanding
+        // buffers" — matches how every backend in this workspace already
+        // uses the type.
         umem: NonNull<Umem>,
         frame_addr: u64,
         frame_size: usize,
@@ -664,6 +673,16 @@ impl XdpPacketBufMut {
     }
 
     /// Returns packet bytes as a contiguous slice.
+    ///
+    /// AF_XDP ordering: this slice is read with plain (non-`volatile`) loads.
+    /// That is sound because the wrapping `XdpPacketBufMut` was produced from
+    /// an `RX` descriptor that the consumer cursor only published after an
+    /// `Acquire` load of the kernel-side producer index in `RingConsumer::sync`,
+    /// which on x86/ARM (and per the AF_XDP SPSC contract) is a memory
+    /// fence sufficient to make the kernel's prior writes into this frame
+    /// visible. Likewise, releasing the frame back to the FILL ring uses a
+    /// `Release` store of the producer index, which fences our subsequent
+    /// writes.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         let storage = self.storage.as_ref().expect("buffer storage is present");
@@ -672,6 +691,8 @@ impl XdpPacketBufMut {
     }
 
     /// Returns packet bytes as a mutable contiguous slice.
+    ///
+    /// See [`Self::as_slice`] for the AF_XDP memory-ordering rationale.
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         let storage = self.storage.as_mut().expect("buffer storage is present");
@@ -685,6 +706,9 @@ impl XdpPacketBufMut {
 
 impl XdpPacketBuf {
     /// Returns packet bytes as a contiguous slice.
+    ///
+    /// See [`XdpPacketBufMut::as_slice`] for the AF_XDP memory-ordering
+    /// rationale shared by both frozen and mutable buffer types.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         let storage = self.storage.as_ref().expect("buffer storage is present");

@@ -44,6 +44,14 @@ pub struct IpPacketRecvMeta {
 }
 
 /// Optional transmit offload flags.
+///
+/// TCP/UDP segmentation offload (TSO) is **not** represented here — set
+/// [`IpPacketTransmit::tso_segment_size`] to `Some(...)` to request it.
+/// Pairing a separate `TxOffload::TSO` flag with the segment-size field was
+/// removed because the two could disagree (flag set but size missing, or
+/// vice versa); keeping the segment size as the single source of truth makes
+/// the invariant `tso_enabled <=> tso_segment_size.is_some()` impossible to
+/// violate.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct TxOffload(u32);
 
@@ -54,8 +62,6 @@ impl TxOffload {
     pub const CKSUM_IP: Self = Self(1 << 0);
     /// Request L4 checksum offload.
     pub const CKSUM_L4: Self = Self(1 << 1);
-    /// Request hardware segmentation offload.
-    pub const TSO: Self = Self(1 << 2);
 
     /// Creates flags from raw bits.
     #[must_use]
@@ -97,22 +103,22 @@ impl core::ops::BitOrAssign for TxOffload {
 }
 
 /// Backend-specific egress handle consumed by IP packet sends.
-pub trait IpPacketEgress: Copy + 'static {
-    /// Returns the queue's default egress handle when one exists.
-    fn default_egress() -> Option<Self>;
-}
+///
+/// Backends may add their own variants; the trait carries no methods. The
+/// previous `default_egress()` hook was removed in favor of explicit defaults
+/// at the call site: AF_XDP requires a real interface/queue and `()` /
+/// [`CoreEgress`] both have an obvious zero value, so the indirection was
+/// dead weight.
+pub trait IpPacketEgress: Copy + 'static {}
 
-impl IpPacketEgress for () {
-    fn default_egress() -> Option<Self> {
-        Some(())
-    }
-}
+impl IpPacketEgress for () {}
 
 /// Core egress handle for backends that do not need custom variants.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CoreEgress {
     /// Use the queue's configured default egress.
+    #[default]
     Default,
     /// Use a route-table handle.
     Route(RouteId),
@@ -120,11 +126,7 @@ pub enum CoreEgress {
     Neighbor(NeighborId),
 }
 
-impl IpPacketEgress for CoreEgress {
-    fn default_egress() -> Option<Self> {
-        Some(Self::Default)
-    }
-}
+impl IpPacketEgress for CoreEgress {}
 
 /// One complete IP datagram received by an IP packet socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,9 +158,12 @@ pub struct IpPacketTransmit<B, E, F: IpFamily = Mixed> {
     pub destination: Option<F::Addr>,
     /// Optional TTL/hop-limit override or preservation hint.
     pub hop_limit: Option<u8>,
-    /// Per-packet transmit offload requests.
+    /// Per-packet transmit offload requests (checksum offloads only — see
+    /// `tso_segment_size` for TSO).
     pub offload: TxOffload,
-    /// Segment size used when [`TxOffload::TSO`] is set.
+    /// Hardware segmentation: `Some(size)` enables TSO with the given
+    /// segment size; `None` disables it. This single field is both the
+    /// enable bit and the parameter, so the two can't disagree.
     pub tso_segment_size: Option<NonZeroU16>,
 }
 
@@ -380,7 +385,7 @@ mod tests {
                     checksum: ChecksumStatus::NotChecked,
                 },
             ))
-            .map_err(|_| Error::WouldBlock)?;
+            .map_err(|_| Error::BatchFull)?;
             Ok(1)
         }
 
@@ -413,6 +418,6 @@ mod tests {
     fn tx_offload_flags_compose_without_dependency() {
         let flags = TxOffload::CKSUM_IP | TxOffload::CKSUM_L4;
         assert!(flags.contains(TxOffload::CKSUM_IP));
-        assert!(!flags.contains(TxOffload::TSO));
+        assert!(flags.contains(TxOffload::CKSUM_L4));
     }
 }

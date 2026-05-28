@@ -6,7 +6,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fast_socket_benchmarks::{Args, BoxError, Progress, RunLimit, pin_current_thread_to_cpu};
+use clap::{Parser, ValueEnum};
+use fast_socket_benchmarks::{
+    BoxError, Progress, RunLimit, install_shutdown_signal_handlers, pin_current_thread_to_cpu,
+    shutdown_requested,
+};
 use fast_socket_os_rs::{OsPacketBuf, OsPacketBufMut, OsUdpSocket, OsUdpSocketBuilder};
 use fast_socket_rs::{
     BufferLayout, IfIndex, PacketBufferMut, QueueAffinity, QueueId, RecvBatch, TxSlot, UdpReceive,
@@ -14,51 +18,57 @@ use fast_socket_rs::{
 };
 use fast_socket_xdp_rs::{cpu_for_xdp_queue, if_index_to_name, xdp_queue_slots_for_interface};
 
-const USAGE: &str = "usage: os-listener <count|pong> --bind IP:PORT [--cpu N | --incoming-cpu IFACE|IFINDEX] [--reuse-port] [--count N] [--duration-ms N]";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
     Count,
     Pong,
 }
 
+#[derive(Debug, Parser)]
+#[command(about = "OS UDP listener: count or reflect received UDP datagrams")]
+struct Cli {
+    /// Listener mode.
+    #[arg(value_enum)]
+    mode: Mode,
+
+    /// IPv4 bind endpoint.
+    #[arg(long, default_value_t = SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9000)))]
+    bind: SocketAddr,
+
+    /// Pin the worker thread to this CPU (mutually exclusive with --incoming-cpu).
+    #[arg(long, conflicts_with = "incoming_cpu")]
+    cpu: Option<u32>,
+
+    /// Spawn one SO_REUSEPORT worker per RX queue on this interface (name or
+    /// numeric ifindex); mutually exclusive with --cpu.
+    #[arg(long, conflicts_with = "cpu")]
+    incoming_cpu: Option<String>,
+
+    /// Enable SO_REUSEPORT on the bound socket.
+    #[arg(long)]
+    reuse_port: bool,
+
+    #[command(flatten)]
+    limit: RunLimit,
+}
+
 fn main() -> Result<(), BoxError> {
-    let mut args = Args::new();
-    let mode = match args.mode(USAGE)?.as_str() {
-        "count" => Mode::Count,
-        "pong" => Mode::Pong,
-        other => return Err(format!("unknown mode {other}\n{USAGE}").into()),
-    };
-    let bind: SocketAddr = args.optional(
-        "--bind",
-        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9000).into(),
-    )?;
-    let cpu = args
-        .take("--cpu")
-        .map(|value| value.parse::<u32>())
-        .transpose()?;
-    let incoming_cpu = args.take("--incoming-cpu");
-    let reuse_port = args.flag("--reuse-port");
-    let limit = RunLimit::from_args(&mut args)?;
-    args.finish()?;
+    install_shutdown_signal_handlers()?;
+    let cli = Cli::parse();
 
-    if cpu.is_some() && incoming_cpu.is_some() {
-        return Err("use only one of --cpu or --incoming-cpu".into());
-    }
-
-    if let Some(incoming_cpu) = incoming_cpu {
+    if let Some(incoming_cpu) = cli.incoming_cpu {
         let cpus = incoming_cpus_from_arg(&incoming_cpu)?;
-        return run_incoming_cpu(mode, bind, cpus, limit);
+        return run_incoming_cpu(cli.mode, cli.bind, cpus, cli.limit);
     }
 
-    if let Some(cpu) = cpu {
+    if let Some(cpu) = cli.cpu {
         pin_current_thread_to_cpu(cpu)?;
     }
 
-    let mut socket = open_socket(bind, reuse_port, cpu, QueueId::new(0))?;
-    match mode {
-        Mode::Count => count(&mut socket, limit),
-        Mode::Pong => pong(&mut socket, limit),
+    let mut socket = open_socket(cli.bind, cli.reuse_port, cli.cpu, QueueId::new(0))?;
+    match cli.mode {
+        Mode::Count => count(&mut socket, cli.limit),
+        Mode::Pong => pong(&mut socket, cli.limit),
     }
 }
 
@@ -142,7 +152,7 @@ fn run_incoming_cpu(
 
     loop {
         let packets = total.load(Relaxed);
-        if !limit.keep_running(packets, started) {
+        if !limit.keep_running(packets, started) || shutdown_requested() {
             break;
         }
         if let Ok(error) = error_rx.try_recv() {
@@ -185,7 +195,7 @@ fn count(socket: &mut OsUdpSocket, limit: RunLimit) -> Result<(), BoxError> {
     let started = Instant::now();
     let mut packets = 0;
     let mut rx: RecvBatch<UdpReceive<OsPacketBufMut, UdpRecvMeta>> = RecvBatch::with_capacity(64);
-    while limit.keep_running(packets, started) {
+    while limit.keep_running(packets, started) && !shutdown_requested() {
         rx.clear();
         let received = socket.recv(&mut rx)? as u64;
         if received == 0 {
@@ -205,7 +215,7 @@ fn pong(socket: &mut OsUdpSocket, limit: RunLimit) -> Result<(), BoxError> {
     let mut packets = 0;
     let mut rx: RecvBatch<UdpReceive<OsPacketBufMut, UdpRecvMeta>> = RecvBatch::with_capacity(64);
     let mut tx_batch: Vec<TxSlot<UdpTransmit<OsPacketBuf>>> = Vec::with_capacity(64);
-    while limit.keep_running(packets, started) {
+    while limit.keep_running(packets, started) && !shutdown_requested() {
         rx.clear();
         if socket.recv(&mut rx)? == 0 {
             std::thread::sleep(Duration::from_micros(50));

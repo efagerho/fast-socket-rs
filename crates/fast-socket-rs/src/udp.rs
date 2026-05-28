@@ -186,6 +186,44 @@ pub trait UdpSocket {
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError>;
 
+    /// Sends `batch` to completion, draining TX completions on partial
+    /// acceptance so the next `send` has free ring slots.
+    ///
+    /// The default implementation loops `send` + `drain_tx_completions` until
+    /// every slot is taken or a non-back-pressure error fires. Backends that
+    /// can do better (e.g., notify-on-drain without re-running `send`) may
+    /// override this.
+    fn send_all(
+        &mut self,
+        batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized,
+    {
+        let mut total = 0usize;
+        while total < batch.len() {
+            match self.send(&mut batch[total..]) {
+                Ok(0) => {
+                    if let Err(error) = self.drain_tx_completions() {
+                        return Err(SendError {
+                            accepted: total,
+                            kind: error,
+                        });
+                    }
+                    core::hint::spin_loop();
+                }
+                Ok(n) => total += n,
+                Err(SendError { accepted, kind }) => {
+                    return Err(SendError {
+                        accepted: total + accepted,
+                        kind,
+                    });
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Receives a batch of UDP packets into `out`.
     fn recv(
         &mut self,
@@ -326,7 +364,7 @@ mod tests {
             };
             let packet = self.rx_pool.allocate().ok_or(Error::WouldBlock)?;
             out.push(UdpReceive::new(packet, meta))
-                .map_err(|_| Error::WouldBlock)?;
+                .map_err(|_| Error::BatchFull)?;
             Ok(1)
         }
 

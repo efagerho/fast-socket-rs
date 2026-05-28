@@ -115,7 +115,7 @@ impl IpPacketSocket for BenchIpPacketSocket {
             let Some(packet) = self.recv.pop_front() else {
                 break;
             };
-            out.push(packet).map_err(|_| Error::WouldBlock)?;
+            out.push(packet).map_err(|_| Error::BatchFull)?;
             delivered += 1;
         }
         Ok(delivered)
@@ -210,7 +210,7 @@ fn run(name: &str, iterations: usize, mut f: impl FnMut()) -> Duration {
         f();
     }
     let elapsed = started.elapsed();
-    let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
+    let ns_per_iter = elapsed.as_secs_f64() * 1e9 / iterations as f64;
     println!("{name}: {iterations} iterations, {elapsed:?}, {ns_per_iter:.2} ns/iter");
     elapsed
 }

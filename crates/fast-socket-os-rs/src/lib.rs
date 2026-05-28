@@ -11,7 +11,7 @@ mod buffer;
 use std::io;
 use std::marker::PhantomData;
 use std::net::{
-    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket,
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket,
 };
 use std::rc::Rc;
 use std::time::Duration;
@@ -29,7 +29,20 @@ use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::raw::{c_int, c_short};
 
-const MAX_BATCH: usize = 64;
+/// Default per-socket batch size. Picked to amortize the typical
+/// `recvmmsg` / `sendmmsg` syscall overhead (~1 µs) while keeping per-socket
+/// memory under ~24 KiB. Configurable per socket via
+/// [`OsUdpSocketConfig::max_batch`].
+pub const DEFAULT_MAX_BATCH: usize = 64;
+
+/// Upper bound on [`OsUdpSocketConfig::max_batch`]. Caps per-socket memory at
+/// roughly 4096 × 384 B ≈ 1.5 MiB even for a misconfigured callsite.
+pub const MAX_BATCH_HARD_CAP: usize = 4096;
+/// Size of the per-message control buffer used to receive IP_PKTINFO /
+/// IPV6_PKTINFO ancillary data on Linux. 128 bytes is generous: a single
+/// `cmsghdr` + `in6_pktinfo` plus alignment fits in well under 64.
+#[cfg(target_os = "linux")]
+const RECV_CMSG_LEN: usize = 128;
 
 #[cfg(all(
     unix,
@@ -72,6 +85,7 @@ pub struct OsUdpSocketBuilder {
     tx_buffer_layout: BufferLayout,
     mtu: usize,
     reuse_port: bool,
+    max_batch: usize,
 }
 
 impl OsUdpSocketBuilder {
@@ -87,6 +101,7 @@ impl OsUdpSocketBuilder {
             tx_buffer_layout: BufferLayout::new(2048),
             mtu: 1472,
             reuse_port: false,
+            max_batch: DEFAULT_MAX_BATCH,
         }
     }
 
@@ -161,6 +176,23 @@ impl OsUdpSocketBuilder {
         self
     }
 
+    /// Sets the per-syscall batch size used by `recvmmsg` / `sendmmsg` and
+    /// the pre-allocated state arrays.
+    ///
+    /// Each socket holds roughly `384 × max_batch` bytes of resident state
+    /// (sockaddr_storage + mmsghdr + iovec + cmsg buffer per slot). The
+    /// default of [`DEFAULT_MAX_BATCH`] (64) keeps a socket under ~24 KiB
+    /// and is a good balance for typical NIC-line-rate UDP workloads.
+    /// Larger values amortize syscall cost across bigger bursts; smaller
+    /// values reduce per-socket memory for many-connection workloads.
+    ///
+    /// Capped at [`MAX_BATCH_HARD_CAP`]; zero is rejected at bind time.
+    #[must_use]
+    pub const fn max_batch(mut self, max_batch: usize) -> Self {
+        self.max_batch = max_batch;
+        self
+    }
+
     /// Binds and opens the live OS-backed UDP socket.
     pub fn bind(self) -> io::Result<OsUdpSocket> {
         let socket = bind_udp_socket(self.bind_addr, self.reuse_port)?;
@@ -173,6 +205,7 @@ impl OsUdpSocketBuilder {
                 rx_buffer_layout: self.rx_buffer_layout,
                 tx_buffer_layout: self.tx_buffer_layout,
                 mtu: self.mtu,
+                max_batch: self.max_batch,
             },
         )
     }
@@ -193,6 +226,10 @@ pub struct OsUdpSocketConfig {
     pub tx_buffer_layout: BufferLayout,
     /// Effective UDP payload MTU reported by the socket.
     pub mtu: usize,
+    /// Per-syscall batch size for `recvmmsg` / `sendmmsg`. Bounded by
+    /// [`MAX_BATCH_HARD_CAP`]; zero is rejected at bind time. See
+    /// [`OsUdpSocketBuilder::max_batch`] for sizing guidance.
+    pub max_batch: usize,
 }
 
 impl Default for OsUdpSocketConfig {
@@ -204,11 +241,17 @@ impl Default for OsUdpSocketConfig {
             rx_buffer_layout: BufferLayout::new(2048),
             tx_buffer_layout: BufferLayout::new(2048),
             mtu: 1472,
+            max_batch: DEFAULT_MAX_BATCH,
         }
     }
 }
 
 /// Direct OS-backed UDP socket implementation.
+///
+/// Drop order: `socket` first, then the pools and their cloned `Rc` references.
+/// Frozen and mutable packets handed out to callers each hold an `Rc` to the
+/// pool's interior, so the pool stays alive until every outstanding buffer is
+/// dropped even if the socket is dropped earlier.
 #[derive(Debug)]
 pub struct OsUdpSocket {
     socket: StdUdpSocket,
@@ -219,7 +262,10 @@ pub struct OsUdpSocket {
     queue_id: QueueId,
     queue_affinity: QueueAffinity,
     mtu: usize,
-    recv_buffers: Vec<Option<OsPacketBufMut>>,
+    /// Per-syscall cap; same value chunks both `recvmmsg` and `sendmmsg` and
+    /// sizes every per-message scratch array below.
+    max_batch: usize,
+    recv_buffers: Box<[Option<OsPacketBufMut>]>,
     #[cfg(target_os = "linux")]
     raw_fd: std::os::fd::RawFd,
     #[cfg(target_os = "linux")]
@@ -228,10 +274,20 @@ pub struct OsUdpSocket {
     recv_iovs: Box<[libc::iovec]>,
     #[cfg(target_os = "linux")]
     recv_hdrs: Box<[libc::mmsghdr]>,
+    /// Per-message control buffers; sized for one `IP_PKTINFO` or
+    /// `IPV6_PKTINFO` ancillary message so the receive path can decode the
+    /// arrival destination IP/ifindex. Accessed indirectly through the
+    /// `msg_control` raw pointer stored in `recv_hdrs[i].msg_hdr`; this
+    /// field owns the backing storage.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    recv_cmsgs: Box<[[u8; RECV_CMSG_LEN]]>,
     #[cfg(target_os = "linux")]
     tx_addrs: Box<[libc::sockaddr_storage]>,
     #[cfg(target_os = "linux")]
     tx_iovs: Vec<libc::iovec>,
+    /// Per-message `(iov_start, iov_count)` slices into `tx_iovs` for the current
+    /// `sendmmsg` chunk.
     #[cfg(target_os = "linux")]
     tx_iov_ranges: Box<[(usize, usize)]>,
     #[cfg(target_os = "linux")]
@@ -245,15 +301,26 @@ impl OsUdpSocket {
     /// The socket is put into nonblocking mode. The resulting live socket is
     /// intentionally `!Send`; construct it on the worker thread that will own it.
     pub fn from_std(socket: StdUdpSocket, config: OsUdpSocketConfig) -> io::Result<Self> {
+        if config.max_batch == 0 || config.max_batch > MAX_BATCH_HARD_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "OsUdpSocketConfig::max_batch must be in 1..={MAX_BATCH_HARD_CAP}, got {}",
+                    config.max_batch
+                ),
+            ));
+        }
         configure_queue_affinity(&socket, config.queue_affinity)?;
+        #[cfg(target_os = "linux")]
+        enable_pktinfo(&socket)?;
         socket.set_nonblocking(true)?;
         let readiness_socket = socket.try_clone()?;
         #[cfg(target_os = "linux")]
         let raw_fd = socket.as_raw_fd();
         #[cfg(target_os = "linux")]
-        let recv_state = build_recv_state(MAX_BATCH);
+        let recv_state = build_recv_state(config.max_batch);
         #[cfg(target_os = "linux")]
-        let send_state = build_send_state(MAX_BATCH);
+        let send_state = build_send_state(config.max_batch);
 
         Ok(Self {
             socket,
@@ -264,7 +331,8 @@ impl OsUdpSocket {
             queue_id: config.queue_id,
             queue_affinity: config.queue_affinity,
             mtu: config.mtu,
-            recv_buffers: (0..MAX_BATCH).map(|_| None).collect(),
+            max_batch: config.max_batch,
+            recv_buffers: (0..config.max_batch).map(|_| None).collect::<Vec<_>>().into(),
             #[cfg(target_os = "linux")]
             raw_fd,
             #[cfg(target_os = "linux")]
@@ -274,9 +342,11 @@ impl OsUdpSocket {
             #[cfg(target_os = "linux")]
             recv_hdrs: recv_state.hdrs,
             #[cfg(target_os = "linux")]
+            recv_cmsgs: recv_state.cmsgs,
+            #[cfg(target_os = "linux")]
             tx_addrs: send_state.addrs,
             #[cfg(target_os = "linux")]
-            tx_iovs: Vec::with_capacity(MAX_BATCH),
+            tx_iovs: Vec::with_capacity(config.max_batch),
             #[cfg(target_os = "linux")]
             tx_iov_ranges: send_state.iov_ranges,
             #[cfg(target_os = "linux")]
@@ -377,7 +447,12 @@ impl OsUdpSocket {
         let mut accepted = 0;
 
         while accepted < batch.len() {
-            let max_chunk_len = (batch.len() - accepted).min(MAX_BATCH);
+            // Build the longest valid prefix of the remaining batch that we can
+            // hand to one `sendmmsg`. A bad slot at the very start of a new
+            // chunk surfaces as `SendError` immediately; a bad slot in the
+            // middle ends the current chunk so the good prefix still flushes,
+            // and the bad slot is re-evaluated as the head of the next chunk.
+            let max_chunk_len = (batch.len() - accepted).min(self.max_batch);
             let mut chunk_len = 0;
             while chunk_len < max_chunk_len {
                 let slot = &batch[accepted + chunk_len];
@@ -430,16 +505,65 @@ impl OsUdpSocket {
                 msg.msg_controllen = 0;
             }
 
-            let sent = unsafe {
-                libc::sendmmsg(
-                    self.raw_fd,
-                    self.tx_hdrs.as_mut_ptr(),
-                    chunk_len as libc::c_uint,
-                    libc::MSG_DONTWAIT,
-                )
+            // Retry on EINTR before reporting back-pressure: EINTR with
+            // `MSG_DONTWAIT` means no packets were dispatched, so a syscall
+            // restart is safe and avoids spurious zero-progress returns.
+            let sent = loop {
+                // SAFETY: `tx_hdrs` and `tx_addrs`/`tx_iovs` are valid for
+                // `chunk_len` entries (built immediately above) and the kernel
+                // does not retain any of these pointers after sendmmsg returns.
+                let result = unsafe {
+                    libc::sendmmsg(
+                        self.raw_fd,
+                        self.tx_hdrs.as_mut_ptr(),
+                        chunk_len as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if is_transient(&error) {
+                        return Ok(accepted);
+                    }
+                    return Err(SendError {
+                        accepted,
+                        kind: io_error_to_core(error),
+                    });
+                }
+                break result;
             };
 
-            if sent < 0 {
+            let sent = sent as usize;
+            for slot in chunk.iter_mut().take(sent) {
+                let _ = slot.take();
+            }
+            accepted += sent;
+            if sent < chunk_len {
+                // A short `sendmmsg` return means the (sent+1)-th packet was
+                // rejected by the kernel; `sendmmsg` succeeds-then-stops and
+                // does not surface the per-packet errno. Issue `sendmsg` on
+                // just that slot to recover the real error, retrying on EINTR.
+                let result = loop {
+                    let r = unsafe {
+                        libc::sendmsg(
+                            self.raw_fd,
+                            &self.tx_hdrs[sent].msg_hdr,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break r;
+                };
+                if result >= 0 {
+                    let _ = chunk[sent].take();
+                    accepted += 1;
+                    continue;
+                }
                 let error = io::Error::last_os_error();
                 if is_transient(&error) {
                     return Ok(accepted);
@@ -448,15 +572,6 @@ impl OsUdpSocket {
                     accepted,
                     kind: io_error_to_core(error),
                 });
-            }
-
-            let sent = sent as usize;
-            for slot in chunk.iter_mut().take(sent) {
-                let _ = slot.take();
-            }
-            accepted += sent;
-            if sent < chunk_len {
-                return Ok(accepted);
             }
         }
 
@@ -515,7 +630,7 @@ impl OsUdpSocket {
         &mut self,
         out: &mut RecvBatch<UdpReceive<OsPacketBufMut, UdpRecvMeta>>,
     ) -> Result<usize, Error> {
-        let mut count = out.remaining().min(MAX_BATCH);
+        let mut count = out.remaining().min(self.max_batch);
         if count == 0 {
             return Ok(0);
         }
@@ -548,45 +663,64 @@ impl OsUdpSocket {
         for hdr in &mut self.recv_hdrs[..count] {
             hdr.msg_hdr.msg_namelen =
                 std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            hdr.msg_hdr.msg_controllen = 0;
+            // The buffer is pinned in `self.recv_cmsgs[index]`; reset the
+            // capacity so the kernel can write a fresh IP_PKTINFO /
+            // IPV6_PKTINFO control message each call.
+            hdr.msg_hdr.msg_controllen = RECV_CMSG_LEN;
             hdr.msg_hdr.msg_flags = 0;
         }
 
-        let received = unsafe {
-            libc::recvmmsg(
-                self.raw_fd,
-                self.recv_hdrs.as_mut_ptr(),
-                count as libc::c_uint,
-                libc::MSG_DONTWAIT,
-                std::ptr::null_mut(),
-            )
-        };
-
-        if received < 0 {
-            let error = io::Error::last_os_error();
-            return if is_transient(&error) {
-                Ok(0)
-            } else {
-                Err(io_error_to_core(error))
+        // Loop on EINTR before reporting back-pressure: a signal arriving
+        // between `recvmmsg` entering the kernel and any datagram being
+        // delivered would otherwise make us return `Ok(0)` and force the
+        // caller into a polling cycle for no reason.
+        let received = loop {
+            let result = unsafe {
+                libc::recvmmsg(
+                    self.raw_fd,
+                    self.recv_hdrs.as_mut_ptr(),
+                    count as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(),
+                )
             };
-        }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if is_transient(&error) {
+                    return Ok(0);
+                }
+                return Err(io_error_to_core(error));
+            }
+            break result;
+        };
 
         let received = received as usize;
         let mut delivered = 0;
+        let mut had_truncation = false;
         for index in 0..received {
             let hdr = &self.recv_hdrs[index];
             if hdr.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                had_truncation = true;
                 continue;
             }
 
-            let Some(source) = (unsafe {
+            // The kernel always fills `msg_name` with a properly-sized
+            // AF_INET / AF_INET6 sockaddr for an AF_INET / AF_INET6 UDP
+            // socket, so `socketaddr_from_raw` can only return `None` if
+            // the kernel violated this invariant. Surface that as a hard
+            // failure instead of silently dropping the packet.
+            let source = unsafe {
                 socketaddr_from_raw(
                     (&raw const self.recv_addrs[index]).cast(),
                     hdr.msg_hdr.msg_namelen,
                 )
-            }) else {
-                continue;
-            };
+            }
+            .expect("kernel filled recvmmsg sockaddr with an unexpected family");
+
+            let destination = unsafe { parse_pktinfo_destination(&hdr.msg_hdr) };
 
             let len = hdr.msg_len as usize;
             let mut packet = self.recv_buffers[index]
@@ -595,16 +729,19 @@ impl OsUdpSocket {
             packet.set_received_len(len).map_err(|_| Error::Truncated)?;
             let meta = UdpRecvMeta {
                 source,
-                destination: None,
+                destination,
                 ecn: None,
                 len,
                 gro_stride: None,
             };
-            if out.push(UdpReceive::new(packet, meta)).is_ok() {
-                delivered += 1;
-            }
+            out.push(UdpReceive::new(packet, meta))
+                .expect("RecvBatch had remaining capacity reserved before recvmmsg");
+            delivered += 1;
         }
 
+        if delivered == 0 && had_truncation {
+            return Err(Error::Truncated);
+        }
         Ok(delivered)
     }
 
@@ -632,7 +769,7 @@ impl OsUdpSocket {
                         gro_stride: None,
                     };
                     out.push(UdpReceive::new(packet, meta))
-                        .map_err(|_| Error::WouldBlock)?;
+                        .map_err(|_| Error::BatchFull)?;
                     delivered += 1;
                 }
                 Err(error) if is_transient(&error) => return Ok(delivered),
@@ -687,6 +824,7 @@ fn bind_udp_socket(addr: SocketAddr, reuse_port: bool) -> io::Result<StdUdpSocke
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     set_close_on_exec(fd.as_raw_fd())?;
+    set_reuse_addr(fd.as_raw_fd())?;
     set_reuse_port(fd.as_raw_fd())?;
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -722,6 +860,25 @@ fn bind_udp_socket(addr: SocketAddr, reuse_port: bool) -> io::Result<StdUdpSocke
         ));
     }
     StdUdpSocket::bind(addr)
+}
+
+#[cfg(unix)]
+fn set_reuse_addr(fd: std::os::fd::RawFd) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&raw const enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(any(
@@ -792,6 +949,7 @@ struct RecvSyscallState {
     addrs: Box<[libc::sockaddr_storage]>,
     iovs: Box<[libc::iovec]>,
     hdrs: Box<[libc::mmsghdr]>,
+    cmsgs: Box<[[u8; RECV_CMSG_LEN]]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -806,21 +964,25 @@ fn build_recv_state(batch: usize) -> RecvSyscallState {
         .collect();
     let mut recv_hdrs: Box<[libc::mmsghdr]> =
         (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut recv_cmsgs: Box<[[u8; RECV_CMSG_LEN]]> =
+        (0..batch).map(|_| [0u8; RECV_CMSG_LEN]).collect();
 
     for index in 0..batch {
+        let cmsg_ptr = (&raw mut recv_cmsgs[index]).cast();
         let hdr = &mut recv_hdrs[index].msg_hdr;
         hdr.msg_name = (&raw mut recv_addrs[index]).cast();
         hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_iov = &raw mut recv_iovs[index];
         hdr.msg_iovlen = 1;
-        hdr.msg_control = std::ptr::null_mut();
-        hdr.msg_controllen = 0;
+        hdr.msg_control = cmsg_ptr;
+        hdr.msg_controllen = RECV_CMSG_LEN;
     }
 
     RecvSyscallState {
         addrs: recv_addrs,
         iovs: recv_iovs,
         hdrs: recv_hdrs,
+        cmsgs: recv_cmsgs,
     }
 }
 
@@ -829,6 +991,76 @@ struct SendSyscallState {
     addrs: Box<[libc::sockaddr_storage]>,
     iov_ranges: Box<[(usize, usize)]>,
     hdrs: Box<[libc::mmsghdr]>,
+}
+
+/// Enables `IP_PKTINFO` (and `IPV6_RECVPKTINFO`) so `recvmmsg` includes an
+/// ancillary message naming the destination IP / arrival ifindex for each
+/// datagram. Failures are non-fatal: a kernel/socket that does not support
+/// PKTINFO simply leaves `UdpRecvMeta.destination = None`.
+#[cfg(target_os = "linux")]
+fn enable_pktinfo(socket: &StdUdpSocket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+    let ptr = (&raw const enabled).cast();
+    // SAFETY: enabled is a stack int; setsockopt does not retain it.
+    let v4 = unsafe {
+        libc::setsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_PKTINFO, ptr, len)
+    };
+    let v6 = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVPKTINFO,
+            ptr,
+            len,
+        )
+    };
+    // Tolerate ENOPROTOOPT / EINVAL (single-family socket); only surface
+    // other errors.
+    for rc in [v4, v6] {
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENOPROTOOPT) | Some(libc::EINVAL) => continue,
+                _ => return Err(err),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parses `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data out of a finished
+/// `recvmmsg` `msghdr` and returns the local IP that the datagram landed on.
+/// Returns `None` if no PKTINFO control message was attached.
+///
+/// # Safety
+/// `hdr.msg_control` must point to `hdr.msg_controllen` initialized bytes
+/// produced by the kernel for this message.
+#[cfg(target_os = "linux")]
+unsafe fn parse_pktinfo_destination(hdr: &libc::msghdr) -> Option<IpAddr> {
+    if hdr.msg_control.is_null() || hdr.msg_controllen == 0 {
+        return None;
+    }
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(hdr) };
+    while !cmsg.is_null() {
+        let level = unsafe { (*cmsg).cmsg_level };
+        let ty = unsafe { (*cmsg).cmsg_type };
+        let data = unsafe { libc::CMSG_DATA(cmsg) };
+        if level == libc::IPPROTO_IP && ty == libc::IP_PKTINFO {
+            let info: libc::in_pktinfo =
+                unsafe { std::ptr::read_unaligned(data.cast::<libc::in_pktinfo>()) };
+            return Some(IpAddr::V4(Ipv4Addr::from(
+                info.ipi_addr.s_addr.to_ne_bytes(),
+            )));
+        }
+        if level == libc::IPPROTO_IPV6 && ty == libc::IPV6_PKTINFO {
+            let info: libc::in6_pktinfo =
+                unsafe { std::ptr::read_unaligned(data.cast::<libc::in6_pktinfo>()) };
+            return Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(hdr, cmsg) };
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -925,7 +1157,7 @@ fn configure_queue_affinity(
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_INCOMING_CPU,
-            (&cpu as *const libc::c_int).cast(),
+            (&raw const cpu).cast(),
             std::mem::size_of_val(&cpu) as libc::socklen_t,
         )
     };
@@ -991,7 +1223,14 @@ fn wait_for_readable(
     match result {
         value if value > 0 => Ok(WaitOutcome::Ready),
         0 => Ok(WaitOutcome::Timeout),
-        _ => Err(io_error_to_core(io::Error::last_os_error())),
+        _ => {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                Ok(WaitOutcome::Spurious)
+            } else {
+                Err(io_error_to_core(error))
+            }
+        }
     }
 }
 
@@ -1072,7 +1311,14 @@ mod tests {
         let received = &rx.as_slice()[0];
         assert_eq!(received.packet.as_slice(), b"hello from os");
         assert_eq!(received.meta.source, sender_addr);
-        assert_eq!(received.meta.destination, None);
+        // The destination should be the local address the kernel routed the
+        // packet to. On Linux + IP_PKTINFO that is the bound 127.0.0.1; on
+        // platforms without PKTINFO support the field remains None.
+        match received.meta.destination {
+            Some(IpAddr::V4(addr)) => assert_eq!(addr, Ipv4Addr::LOCALHOST),
+            Some(other) => panic!("unexpected destination family: {other:?}"),
+            None => {}
+        }
         assert_eq!(received.meta.len, b"hello from os".len());
     }
 

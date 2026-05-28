@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use fast_socket_rs::{
     LinkAddr, NeighborTable, PacketBufferMut, QueueId, RouteHop, RouteTable, TxSlot,
-    UdpSocket as FastUdpSocket, UdpTransmit, V4Only,
+    UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut, V4Only,
 };
 use fast_socket_xdp_rs::{
     resolve_xdp_queue_slot, XdpEgress, XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
@@ -34,7 +34,7 @@ struct Args {
     target: SocketAddrV4,
 
     /// Destination MAC address used for every routed IP.
-    #[arg(long, value_parser = parse_mac)]
+    #[arg(long)]
     mac: LinkAddr,
 }
 
@@ -106,7 +106,7 @@ fn main() -> Result<(), BoxError> {
     let mut socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
         .mtu(mtu as usize)
         .router(router)
-        .open_busy_poll_live()?;
+        .open_busy_poll()?;
     let payload = payload();
     let mut sent = 0u64;
 
@@ -115,8 +115,13 @@ fn main() -> Result<(), BoxError> {
         args.target, args.mac
     );
 
+    // Reuse the same scratch Vec across iterations so the 1 Hz sender does
+    // not allocate per call. send_one only needs space for one packet.
+    let mut tx_buffers: Vec<UdpTxBufferMut<XdpUdpSocket>> = Vec::with_capacity(1);
+    let mut batch: Vec<TxSlot<UdpTransmit<UdpTxBuffer<XdpUdpSocket>>>> = Vec::with_capacity(1);
+
     while !shutdown_requested() {
-        send_one(&mut socket, target, &payload)?;
+        send_one(&mut socket, target, &payload, &mut tx_buffers, &mut batch)?;
         sent = sent.saturating_add(1);
         eprintln!("custom-router: sent {sent} packets");
         thread::sleep(SEND_INTERVAL);
@@ -130,34 +135,42 @@ fn send_one<S>(
     socket: &mut S,
     target: SocketAddr,
     payload: &[u8; PAYLOAD_LEN],
+    tx_buffers: &mut Vec<UdpTxBufferMut<S>>,
+    batch: &mut Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>,
 ) -> Result<(), BoxError>
 where
     S: FastUdpSocket,
 {
-    let mut tx_buffers = Vec::with_capacity(1);
-    loop {
+    // 1 Hz sender, so back-pressure is essentially never hit. When it is, a
+    // tiny sleep yields the core; spin_loop would burn the CPU between the
+    // 1 s send intervals for no benefit.
+    const BACKPRESSURE_SLEEP: Duration = Duration::from_micros(100);
+
+    while !shutdown_requested() {
         tx_buffers.clear();
-        if socket.allocate_tx_batch(&mut tx_buffers, 1)? == 0 {
+        if socket.allocate_tx_batch(tx_buffers, 1)? == 0 {
             socket.drain_tx_completions()?;
-            std::hint::spin_loop();
+            thread::sleep(BACKPRESSURE_SLEEP);
             continue;
         }
 
         let mut packet = tx_buffers.pop().expect("one TX buffer was allocated");
         packet.extend_from_slice(payload)?;
-        let mut batch = [TxSlot::Ready(UdpTransmit::new(packet.freeze(), target))];
-        match socket.send(&mut batch)? {
+        batch.clear();
+        batch.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), target)));
+        match socket.send(batch.as_mut_slice())? {
             1 => {
                 socket.drain_tx_completions()?;
                 return Ok(());
             }
             0 => {
                 socket.drain_tx_completions()?;
-                std::hint::spin_loop();
+                thread::sleep(BACKPRESSURE_SLEEP);
             }
             _ => unreachable!("single-packet batch cannot accept more than one packet"),
         }
     }
+    Ok(())
 }
 
 fn payload() -> [u8; PAYLOAD_LEN] {
@@ -170,29 +183,10 @@ fn payload() -> [u8; PAYLOAD_LEN] {
 
 fn interface_mac(iface: &str) -> Result<LinkAddr, BoxError> {
     let raw = fs::read_to_string(format!("/sys/class/net/{iface}/address"))?;
-    parse_mac(raw.trim()).map_err(Into::into)
+    raw.trim().parse().map_err(|error| format!("{error}").into())
 }
 
 fn interface_mtu(iface: &str) -> Result<u32, BoxError> {
     let raw = fs::read_to_string(format!("/sys/class/net/{iface}/mtu"))?;
     raw.trim().parse().map_err(Into::into)
-}
-
-fn parse_mac(raw: &str) -> Result<LinkAddr, String> {
-    let mut octets = [0u8; 6];
-    let mut parts = raw.split(':');
-    for octet in &mut octets {
-        let Some(part) = parts.next() else {
-            return Err(format!("MAC address {raw:?} has too few octets"));
-        };
-        if part.len() != 2 {
-            return Err(format!("MAC address octet {part:?} is not two hex digits"));
-        }
-        *octet = u8::from_str_radix(part, 16)
-            .map_err(|error| format!("invalid MAC address octet {part:?}: {error}"))?;
-    }
-    if parts.next().is_some() {
-        return Err(format!("MAC address {raw:?} has too many octets"));
-    }
-    Ok(LinkAddr::new(octets))
 }

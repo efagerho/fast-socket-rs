@@ -3,12 +3,11 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: benchmarks/profile-xdp.sh [--mode blast|ping]
+usage: benchmarks/profile-xdp.sh
 
-Profiles the XDP UDP sender under perf.
+Profiles the XDP UDP sender (blast mode) under perf.
 
 Defaults:
-  --mode blast           sender mode to profile
   PROFILE_SECONDS=10     derived sender duration when DURATION_MS is unset
   DURATION_MS=           sender duration in milliseconds
   PAYLOAD_LEN=64         UDP payload size
@@ -17,7 +16,6 @@ Defaults:
   QUEUE=0                queue used when QUEUE_MODE=one
   LOCAL=213.239.141.12:52000
   TARGET=213.239.141.11:41000
-  RATE=1000              ping mode rate
   STATS_IFACES=$IFACE    interfaces captured with ethtool -S before/after
   ETHTOOL=ethtool        command used for NIC stats snapshots
   OUT_DIR=bench-results/profiles/<timestamp>-xdp-<mode>
@@ -38,14 +36,6 @@ EOF
 MODE=blast
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode)
-      if [[ $# -lt 2 ]]; then
-        echo "--mode requires a value: blast or ping" >&2
-        exit 2
-      fi
-      MODE="${2:-}"
-      shift 2
-      ;;
     --help|-h)
       usage
       exit 0
@@ -58,14 +48,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$MODE" in
-  blast|ping) ;;
-  *)
-    echo "--mode must be one of: blast, ping" >&2
-    exit 2
-    ;;
-esac
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE_SECONDS="${PROFILE_SECONDS:-10}"
 DURATION_MS="${DURATION_MS:-$((PROFILE_SECONDS * 1000))}"
@@ -75,7 +57,6 @@ QUEUE_MODE="${QUEUE_MODE:-all}"
 QUEUE="${QUEUE:-0}"
 LOCAL="${LOCAL:-213.239.141.12:52000}"
 TARGET="${TARGET:-213.239.141.11:41000}"
-RATE="${RATE:-1000}"
 STATS_IFACES="${STATS_IFACES:-$IFACE}"
 ETHTOOL="${ETHTOOL:-ethtool}"
 OUT_DIR="${OUT_DIR:-"$ROOT/bench-results/profiles/$(date -u +%Y%m%dT%H%M%SZ)-xdp-$MODE"}"
@@ -147,9 +128,6 @@ write_run_env() {
     echo "queue_mode=$QUEUE_MODE"
     if [[ "$QUEUE_MODE" == "one" ]]; then
       echo "queue=$QUEUE"
-    fi
-    if [[ "$MODE" == "ping" ]]; then
-      echo "rate=$RATE"
     fi
     echo "perf_freq=$PERF_FREQ"
     echo "call_graph=$CALL_GRAPH"
@@ -272,14 +250,10 @@ sender_args=(
   --duration-ms "$DURATION_MS"
 )
 
-if [[ "$MODE" == "blast" ]]; then
-  if [[ "$QUEUE_MODE" == "all" ]]; then
-    sender_args+=(--all-queues)
-  else
-    sender_args+=(--queue "$QUEUE")
-  fi
+if [[ "$QUEUE_MODE" == "all" ]]; then
+  sender_args+=(--all-queues)
 else
-  sender_args+=(--rate "$RATE")
+  sender_args+=(--queue "$QUEUE")
 fi
 
 write_run_env

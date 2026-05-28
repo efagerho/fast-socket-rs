@@ -109,7 +109,7 @@ impl IpPacketSocket for CaptureIpPacketSocket {
             let Some(packet) = self.recv.pop_front() else {
                 break;
             };
-            out.push(packet).map_err(|_| Error::WouldBlock)?;
+            out.push(packet).map_err(|_| Error::BatchFull)?;
             delivered += 1;
         }
         Ok(delivered)

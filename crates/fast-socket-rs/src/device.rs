@@ -81,7 +81,14 @@ pub struct RawDeviceStats {
     /// Dropped fragmented packets when the backend filters them.
     pub dropped_fragments: u64,
     /// Transmit attempts that exceeded MTU.
+    ///
+    /// TX-side counter only; RX-side oversize drops (a packet larger than the
+    /// configured RX buffer / UMEM frame size) are reported separately in
+    /// [`Self::dropped_rx_oversize`].
     pub dropped_oversize: u64,
+    /// Receive packets dropped because they did not fit in the configured RX
+    /// buffer / UMEM frame size.
+    pub dropped_rx_oversize: u64,
     /// Ring-full events or retries.
     pub ring_full: u64,
 }

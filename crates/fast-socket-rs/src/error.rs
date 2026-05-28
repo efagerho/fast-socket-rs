@@ -1,16 +1,27 @@
 //! Shared error vocabulary for the core socket traits.
 
 use core::fmt;
+use std::sync::Arc;
 
 /// Result alias for operations that use the core [`Error`] type.
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Common error type shared by UDP and IP packet socket APIs.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// Transient: the underlying ring or socket buffer is full.
+    ///
+    /// Returned by socket-side paths. Caller-side batch-full conditions use
+    /// [`Error::BatchFull`] instead so callers can disambiguate the two.
     WouldBlock,
+    /// Receive path: the caller's [`crate::RecvBatch`] has no remaining capacity.
+    ///
+    /// Distinct from [`Error::WouldBlock`], which indicates back-pressure
+    /// inside the socket or NIC ring. `BatchFull` means the **caller-supplied**
+    /// container is full and at least one delivered packet was discarded for
+    /// that reason.
+    BatchFull,
     /// Receive path: an incoming packet did not fit in the caller-provided space.
     Truncated,
     /// Receive or transmit path: packet bytes or metadata were malformed.
@@ -18,6 +29,11 @@ pub enum Error {
     /// Caller submitted a malformed batch.
     InvalidBatch,
     /// Transmit path: packet exceeds the socket MTU.
+    ///
+    /// Distinct from [`crate::BufferAccessError::InsufficientTailroom`], which
+    /// describes a buffer-layout limit hit while *constructing* the packet on
+    /// the caller side. `OversizeForMtu` is raised by the socket when the
+    /// finished packet is too large for the configured wire MTU.
     OversizeForMtu,
     /// Transmit path: the resolved egress handle no longer maps to a destination.
     NoEgressRoute,
@@ -29,6 +45,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WouldBlock => f.write_str("operation would block"),
+            Self::BatchFull => f.write_str("receive batch is full"),
             Self::Truncated => f.write_str("packet was truncated"),
             Self::InvalidPacket => f.write_str("packet was invalid"),
             Self::InvalidBatch => f.write_str("batch was invalid"),
@@ -74,10 +91,15 @@ impl fmt::Display for DeviceErrorKind {
 }
 
 /// Core-owned, cold-path device error container.
-#[derive(Debug)]
+///
+/// The optional backend-specific source is held behind an [`Arc`] so the whole
+/// `DeviceError` (and the enclosing [`Error`]) can be cheaply cloned for
+/// metrics, retry queues, and async-stream forwarding without losing the
+/// source chain.
+#[derive(Clone, Debug)]
 pub struct DeviceError {
     kind: DeviceErrorKind,
-    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl DeviceError {
@@ -95,7 +117,7 @@ impl DeviceError {
     {
         Self {
             kind,
-            source: Some(Box::new(source)),
+            source: Some(Arc::new(source)),
         }
     }
 

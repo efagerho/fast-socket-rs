@@ -1,25 +1,29 @@
-#![allow(dead_code)]
+// `common.rs` is included by each binary via `#[path = ...] mod common;` so a
+// helper used by only one binary appears unused in the others. Silence both
+// `dead_code` and the per-binary `unused_imports` warnings from re-exports.
+#![allow(dead_code, unused_imports)]
 
-use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use fast_socket_os_rs::{OsUdpSocket, OsUdpSocketConfig};
-use fast_socket_rs::{BufferLayout, IfIndex, QueueAffinity, QueueId};
+use fast_socket_rs::{BufferLayout, QueueAffinity, QueueId};
 use fast_socket_xdp_rs::{
-    AttachMode, BusyPollXdpUdpSocket, RouteSnapshot, XdpProgramHandle, XdpQueueSlot, XdpUdpSocket,
+    BusyPollXdpUdpSocket, RouteSnapshot, XdpProgramHandle, XdpQueueSlot, XdpUdpSocket,
     cpu_for_xdp_queue, xdp_queue_slots_for_interface,
 };
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
-pub type XdpProgramMap = BTreeMap<IfIndex, XdpProgramHandle>;
-
-const FIRST_DYNAMIC_PORT: u16 = 49152;
+// Re-export shared helpers so existing examples can keep referring to them via
+// `common::*` without each file having to depend on `fast_socket_benchmarks`
+// directly.
+pub use fast_socket_benchmarks::{
+    BoxError, Progress, XdpProgramMap, attach_xdp_programs_for_slots, dynamic_source_port,
+    install_shutdown_signal_handlers, payload, pin_current_thread_to_cpu, shutdown_requested,
+    write_sequence, xdp_program_for_slot,
+};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Mode {
@@ -33,50 +37,6 @@ pub struct QueuePlan {
     pub cpu: u32,
 }
 
-#[derive(Debug)]
-pub struct Progress {
-    name: &'static str,
-    started: Instant,
-    last: Instant,
-    last_count: u64,
-}
-
-impl Progress {
-    pub fn new(name: &'static str) -> Self {
-        let now = Instant::now();
-        Self {
-            name,
-            started: now,
-            last: now,
-            last_count: 0,
-        }
-    }
-
-    pub fn tick(&mut self, count: u64) {
-        if self.last.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        let elapsed = self.last.elapsed().as_secs_f64();
-        let rate = (count - self.last_count) as f64 / elapsed;
-        eprintln!("{}: {count} packets ({rate:.0} packets/s)", self.name);
-        self.last = Instant::now();
-        self.last_count = count;
-    }
-
-    pub fn finish(&self, count: u64) {
-        let elapsed = self.started.elapsed();
-        let rate = if elapsed.is_zero() {
-            0.0
-        } else {
-            count as f64 / elapsed.as_secs_f64()
-        };
-        println!(
-            "{}: {count} packets in {elapsed:?} ({rate:.0} packets/s)",
-            self.name
-        );
-    }
-}
-
 pub fn queue_plan(device: &str) -> Result<Vec<QueuePlan>, BoxError> {
     xdp_queue_slots_for_interface(device)?
         .into_iter()
@@ -87,37 +47,9 @@ pub fn queue_plan(device: &str) -> Result<Vec<QueuePlan>, BoxError> {
         .collect()
 }
 
-pub fn attach_xdp_programs(slots: &[QueuePlan]) -> Result<XdpProgramMap, BoxError> {
-    let mut programs = XdpProgramMap::new();
-    for plan in slots {
-        if programs.contains_key(&plan.slot.ifindex) {
-            continue;
-        }
-        let program = XdpProgramHandle::load(plan.slot.ifindex.get(), AttachMode::Default, None)
-            .map_err(|error| {
-                format!(
-                    "attach XDP program to {} (if_index {}): {error}",
-                    plan.slot.iface,
-                    plan.slot.ifindex.get()
-                )
-            })?;
-        programs.insert(plan.slot.ifindex, program);
-    }
-    Ok(programs)
-}
-
-pub fn xdp_program_for_slot<'a>(
-    programs: &'a XdpProgramMap,
-    slot: &XdpQueueSlot,
-) -> Result<&'a XdpProgramHandle, BoxError> {
-    programs.get(&slot.ifindex).ok_or_else(|| {
-        format!(
-            "no pre-attached XDP program for {} (if_index {})",
-            slot.iface,
-            slot.ifindex.get()
-        )
-        .into()
-    })
+pub fn attach_xdp_programs(plans: &[QueuePlan]) -> Result<XdpProgramMap, BoxError> {
+    let slots: Vec<XdpQueueSlot> = plans.iter().map(|plan| plan.slot.clone()).collect();
+    attach_xdp_programs_for_slots(&slots)
 }
 
 pub fn open_xdp_udp_socket(
@@ -126,7 +58,7 @@ pub fn open_xdp_udp_socket(
     peer: SocketAddrV4,
     program: &XdpProgramHandle,
 ) -> Result<BusyPollXdpUdpSocket, BoxError> {
-    let routes = RouteSnapshot::from_netlink(slot.queue)?;
+    let routes = RouteSnapshot::from_netlink()?;
     let egress = routes
         .egress_v4_for_interface(*peer.ip(), slot.ifindex, slot.queue)
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", peer.ip()))?;
@@ -135,7 +67,7 @@ pub fn open_xdp_udp_socket(
         .route_snapshot(routes)
         .bind_udp_port(local.port())
         .attached_program(program.clone())
-        .open_busy_poll_live()?)
+        .open_busy_poll()?)
 }
 
 pub fn open_os_udp_socket(
@@ -156,6 +88,7 @@ pub fn open_os_udp_socket(
             rx_buffer_layout: layout,
             tx_buffer_layout: layout,
             mtu: 1472,
+            ..Default::default()
         },
     )?)
 }
@@ -188,47 +121,8 @@ pub fn interface_ipv4_addr(device: &str) -> Result<Ipv4Addr, BoxError> {
     Err(format!("no IPv4 address found on device {device}").into())
 }
 
-pub fn dynamic_source_port() -> u16 {
-    let range = u32::from(u16::MAX) - u32::from(FIRST_DYNAMIC_PORT) + 1;
-    FIRST_DYNAMIC_PORT + (std::process::id() % range) as u16
-}
-
-pub fn pin_current_thread_to_cpu(cpu: u32) -> Result<(), BoxError> {
-    let cpu = usize::try_from(cpu)?;
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        let result = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
-        );
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error().into())
-        }
-    }
-}
-
-pub fn install_shutdown_signal_handlers() -> Result<(), BoxError> {
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handle_shutdown_signal as *const () as usize;
-        action.sa_flags = 0;
-        libc::sigemptyset(&mut action.sa_mask);
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn shutdown_requested() -> bool {
-    SHUTDOWN_SIGNALS.load(Ordering::Relaxed) > 0
+pub fn bind_udp_socket_to_device(socket: &StdUdpSocket, device: &str) -> Result<(), BoxError> {
+    set_bind_to_device(socket.as_raw_fd(), device)
 }
 
 fn bind_reuseport_socket_to_device(
@@ -262,7 +156,7 @@ fn set_bool_socket_option(
             fd,
             level,
             name,
-            (&value as *const libc::c_int).cast(),
+            (&raw const value).cast(),
             std::mem::size_of_val(&value) as libc::socklen_t,
         )
     };
@@ -299,7 +193,7 @@ fn set_incoming_cpu(fd: libc::c_int, cpu: u32) -> Result<(), BoxError> {
             fd,
             libc::SOL_SOCKET,
             libc::SO_INCOMING_CPU,
-            (&cpu as *const libc::c_int).cast(),
+            (&raw const cpu).cast(),
             std::mem::size_of_val(&cpu) as libc::socklen_t,
         )
     };
@@ -322,7 +216,7 @@ fn bind_socket_addr(fd: libc::c_int, bind: SocketAddrV4) -> Result<(), BoxError>
     let result = unsafe {
         libc::bind(
             fd,
-            (&sockaddr as *const libc::sockaddr_in).cast(),
+            (&raw const sockaddr).cast(),
             std::mem::size_of_val(&sockaddr) as libc::socklen_t,
         )
     };
@@ -340,13 +234,5 @@ impl Drop for IfAddrs {
         if !self.0.is_null() {
             unsafe { libc::freeifaddrs(self.0) };
         }
-    }
-}
-
-static SHUTDOWN_SIGNALS: AtomicUsize = AtomicUsize::new(0);
-
-extern "C" fn handle_shutdown_signal(signal: libc::c_int) {
-    if SHUTDOWN_SIGNALS.fetch_add(1, Ordering::SeqCst) > 0 {
-        unsafe { libc::_exit(128 + signal) };
     }
 }

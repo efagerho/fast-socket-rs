@@ -60,9 +60,13 @@ impl<T> From<T> for TxSlot<T> {
 }
 
 /// Error returned by a batch send after accepting a prefix of the submitted batch.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SendError {
     /// Number of leading slots accepted and consumed before the error.
+    ///
+    /// Backends must have set slots `[0..accepted)` to [`TxSlot::Taken`] before
+    /// returning this error. Slots at index `>= accepted` are left in their
+    /// caller-provided state and may still hold [`TxSlot::Ready`] items.
     pub accepted: usize,
     /// Error that caused the next slot to be rejected.
     pub kind: Error,
@@ -93,8 +97,18 @@ pub struct RecvBatch<T> {
 
 impl<T> RecvBatch<T> {
     /// Creates an empty receive batch with room for at most `capacity` items.
+    ///
+    /// Panics if `capacity == 0`. A zero-capacity batch can never accept a
+    /// packet, so every `recv` call would either return `Ok(0)` immediately
+    /// (without actually polling the socket) or surface [`Error::BatchFull`]
+    /// (`crate::Error::BatchFull`) — neither matches what a caller usually
+    /// intends.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "RecvBatch::with_capacity requires capacity >= 1",
+        );
         Self {
             items: Vec::with_capacity(capacity),
             capacity,
@@ -134,7 +148,7 @@ impl<T> RecvBatch<T> {
     ///
     /// Returns the item back to the caller when the batch is full.
     pub fn push(&mut self, item: T) -> core::result::Result<(), T> {
-        if self.items.len() == self.capacity {
+        if self.items.len() >= self.capacity {
             Err(item)
         } else {
             self.items.push(item);

@@ -2,6 +2,7 @@
 
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
@@ -11,16 +12,33 @@ use fast_socket_rs::{
 };
 
 const SLAB_SIZE: usize = 64;
+/// Upper bound on total backing buffers a single pool will hold across all
+/// slab grows. 64 KiB × 2 KiB ≈ 128 MiB of resident memory per pool, which
+/// dwarfs any reasonable socket workload while still being large enough that
+/// well-behaved callers never see allocation failures.
+const MAX_POOL_BUFFERS: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct OsPoolInner {
     free: UnsafeCell<Vec<Vec<u8>>>,
+    /// Total number of backing buffers issued by this pool (free + in-flight).
+    /// Used to cap growth so a misbehaving caller cannot exhaust system
+    /// memory by holding allocations forever.
+    allocated: UnsafeCell<usize>,
+    /// Carry an explicit `!Send + !Sync` marker so that any future refactor
+    /// that swaps `Rc<OsPoolInner>` for `Arc<OsPoolInner>` (or removes the
+    /// `Rc` entirely) still surfaces the thread-locality invariant at the
+    /// type level. The `UnsafeCell` here is only safe under the
+    /// "single-thread owns the pool" rule documented on [`OsBufferPool`].
+    _not_sync: PhantomData<*const ()>,
 }
 
 impl OsPoolInner {
     fn new() -> Self {
         Self {
             free: UnsafeCell::new(Vec::new()),
+            allocated: UnsafeCell::new(0),
+            _not_sync: PhantomData,
         }
     }
 
@@ -34,13 +52,26 @@ impl OsPoolInner {
         unsafe { &mut *self.free.get() }.push(storage);
     }
 
-    fn grow(&self, layout: BufferLayout) {
+    /// Allocates another slab of backing buffers, capped at
+    /// [`MAX_POOL_BUFFERS`] total. Returns the number of buffers added so
+    /// callers can detect exhaustion.
+    fn grow(&self, layout: BufferLayout) -> usize {
+        // SAFETY: owner-thread only; see the `!Sync` marker.
+        let allocated = unsafe { &mut *self.allocated.get() };
+        let remaining = MAX_POOL_BUFFERS.saturating_sub(*allocated);
+        if remaining == 0 {
+            return 0;
+        }
+        let chunk = SLAB_SIZE.min(remaining);
         let allocation_len = layout.allocation_len();
+        // SAFETY: owner-thread only; see the `!Sync` marker.
         let free = unsafe { &mut *self.free.get() };
-        free.reserve(SLAB_SIZE);
-        for _ in 0..SLAB_SIZE {
+        free.reserve(chunk);
+        for _ in 0..chunk {
             free.push(vec![0; allocation_len]);
         }
+        *allocated += chunk;
+        chunk
     }
 }
 
@@ -86,7 +117,12 @@ impl BufferPool for OsBufferPool {
         let mut storage = match self.inner.pop() {
             Some(storage) => storage,
             None => {
-                self.inner.grow(self.layout);
+                if self.inner.grow(self.layout) == 0 {
+                    // Pool is at its hard cap and every buffer is currently
+                    // in flight. Surface as `None` so callers see allocation
+                    // back-pressure instead of OOMing the host.
+                    return None;
+                }
                 self.inner.pop()?
             }
         };

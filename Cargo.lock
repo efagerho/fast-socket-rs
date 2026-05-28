@@ -65,6 +65,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "assert_matches"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,6 +303,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "fast-socket-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fast-socket-os-rs",
  "fast-socket-rs",
  "fast-socket-xdp-rs",
@@ -305,6 +315,7 @@ name = "fast-socket-examples"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fast-socket-benchmarks",
  "fast-socket-os-rs",
  "fast-socket-rs",
  "fast-socket-xdp-rs",
@@ -334,6 +345,7 @@ dependencies = [
 name = "fast-socket-xdp-rs"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "aya",
  "crossbeam-queue",
  "fast-socket-rs",

@@ -141,9 +141,18 @@ impl NetlinkSocket {
         Ok(())
     }
 
-    /// Receives a full netlink dump response.
-    pub fn recv(&self) -> io::Result<Vec<NetlinkMessage>> {
-        let mut buf = [0u8; 8192];
+    /// Receives a full netlink dump response, requiring that every accepted
+    /// message belong to dump `expected_seq` and that the kernel terminate
+    /// the dump with `NLMSG_DONE`. Messages with a different sequence number
+    /// (e.g., unsolicited multicast events delivered on a shared socket) are
+    /// silently dropped; an `EOF`-style early termination is reported as an
+    /// `Other` error so the caller can distinguish it from a successful dump
+    /// that happens to be empty.
+    pub fn recv(&self, expected_seq: u32) -> io::Result<Vec<NetlinkMessage>> {
+        // 32 KiB matches the kernel's default netlink message size; smaller
+        // buffers would force callers with many routes/neighbors to handle
+        // truncation explicitly.
+        let mut buf = [0u8; 32768];
         let mut messages = Vec::new();
 
         loop {
@@ -160,7 +169,9 @@ impl NetlinkSocket {
                 return Err(io::Error::last_os_error());
             }
             if len == 0 {
-                return Ok(messages);
+                return Err(io::Error::other(
+                    "netlink dump closed before NLMSG_DONE was received",
+                ));
             }
             let len = len as usize;
             if len > buf.len() {
@@ -172,6 +183,13 @@ impl NetlinkSocket {
                 let message = NetlinkMessage::read(&buf[offset..len])?;
                 let aligned_len = align_to(message.header.nlmsg_len as usize, NLMSG_ALIGNTO);
                 offset = offset.saturating_add(aligned_len);
+
+                if message.header.nlmsg_seq != expected_seq {
+                    // Multicast events or stale dump replies share this
+                    // socket; ignore them so they don't contaminate the
+                    // current dump's response set.
+                    continue;
+                }
 
                 match message.header.nlmsg_type as i32 {
                     libc::NLMSG_DONE => return Ok(messages),
@@ -303,7 +321,7 @@ pub fn netlink_get_links(family: u8) -> io::Result<Vec<LinkEntry>> {
     socket.send(&bytes_of(&request)[..len])?;
 
     let mut links = Vec::new();
-    for message in socket.recv()? {
+    for message in socket.recv(1)? {
         if message.header.nlmsg_type == libc::RTM_NEWLINK
             && let Some(link) = parse_link(&message)
         {
@@ -334,7 +352,7 @@ pub fn netlink_get_neighbors(
     socket.send(&bytes_of(&request)[..len])?;
 
     let mut neighbors = Vec::new();
-    for message in socket.recv()? {
+    for message in socket.recv(1)? {
         if message.header.nlmsg_type == libc::RTM_NEWNEIGH
             && let Some(neighbor) = parse_neighbor(&message, ifindex)
         {
@@ -364,16 +382,37 @@ pub fn netlink_get_routes(family: u8, table: u32) -> io::Result<Vec<RouteEntry>>
     refresh_nlmsg_len(&mut buffer)?;
     socket.send(&buffer)?;
 
+    // When the caller requests a table > 255, only honor RTA_TABLE matches;
+    // `rtm_table` truncates and `parse_route`'s fallback would otherwise
+    // misclassify those entries as belonging to a different table.
+    let require_rta_table = table > u32::from(u8::MAX);
+
     let mut routes = Vec::new();
-    for message in socket.recv()? {
-        if message.header.nlmsg_type == libc::RTM_NEWROUTE
-            && let Some(route) = parse_route(&message)
-            && route.table == Some(table)
-        {
+    for message in socket.recv(1)? {
+        if message.header.nlmsg_type != libc::RTM_NEWROUTE {
+            continue;
+        }
+        let Some(route) = parse_route(&message) else {
+            continue;
+        };
+        if require_rta_table && !route_table_from_attr(&message) {
+            continue;
+        }
+        if route.table == Some(table) {
             routes.push(route);
         }
     }
     Ok(routes)
+}
+
+fn route_table_from_attr(message: &NetlinkMessage) -> bool {
+    if message.data.len() < mem::size_of::<rtmsg>() {
+        return false;
+    }
+    let Ok(attrs) = parse_attrs(&message.data[mem::size_of::<rtmsg>()..]) else {
+        return false;
+    };
+    attrs.contains_key(&libc::RTA_TABLE)
 }
 
 fn parse_link(message: &NetlinkMessage) -> Option<LinkEntry> {
@@ -395,9 +434,12 @@ fn parse_link(message: &NetlinkMessage) -> Option<LinkEntry> {
     let master_ifindex = attrs
         .get(&libc::IFLA_MASTER)
         .and_then(|attr| read_u32_ne(attr.data))
-        .map(IfIndex::new);
+        .and_then(IfIndex::try_new);
     Some(LinkEntry {
-        ifindex: IfIndex::new(info.ifi_index as u32),
+        // `ifi_index` from the kernel is non-zero for every real interface;
+        // skip any entry that violates that invariant rather than panicking
+        // inside the strict `IfIndex::new`.
+        ifindex: IfIndex::try_new(info.ifi_index as u32)?,
         master_ifindex,
         mac,
         mtu,
@@ -413,7 +455,9 @@ fn parse_neighbor(
     }
     // SAFETY: checked length and unaligned reads are allowed.
     let ndm = unsafe { ptr::read_unaligned(message.data.as_ptr().cast::<ndmsg>()) };
-    let ifindex = IfIndex::new(ndm.ndm_ifindex as u32);
+    // Some neighbor entries (e.g., a half-finalized FAILED entry) can carry
+    // `ndm_ifindex == 0`. Skip them instead of panicking.
+    let ifindex = IfIndex::try_new(ndm.ndm_ifindex as u32)?;
     if filter_ifindex.is_some_and(|filter| filter != ifindex) {
         return None;
     }
@@ -451,10 +495,15 @@ fn parse_route(message: &NetlinkMessage) -> Option<RouteEntry> {
     let out_ifindex = attrs
         .get(&libc::RTA_OIF)
         .and_then(|attr| read_u32_ne(attr.data))
-        .map(IfIndex::new);
+        .and_then(IfIndex::try_new);
     let priority = attrs
         .get(&libc::RTA_PRIORITY)
         .and_then(|attr| read_u32_ne(attr.data));
+    // Prefer the 32-bit RTA_TABLE attribute when present; only fall back to
+    // the 8-bit `rtm_table` field when the kernel did not emit it. The
+    // fallback can never represent table ids > 255 (RT_TABLE_LOCAL etc.
+    // legitimately exceed that range), so consumers that filter by a
+    // > 255 table id must require the attribute.
     let table = attrs
         .get(&libc::RTA_TABLE)
         .and_then(|attr| read_u32_ne(attr.data))

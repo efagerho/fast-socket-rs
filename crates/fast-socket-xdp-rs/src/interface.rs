@@ -13,7 +13,15 @@ use std::path::Path;
 use fast_socket_rs::{IfIndex, NumaNode, QueueId};
 
 /// One AF_XDP-bindable RX queue.
+///
+/// Construct via [`resolve_xdp_queue_slot`] or
+/// [`xdp_queue_slots_for_interface`] — the `flat_index` field is meaningful
+/// only when it comes from the system enumeration of the interface's queues,
+/// and hand-fabricated slots were the root cause of past per-queue source-
+/// port collisions. The `#[non_exhaustive]` attribute prevents direct
+/// construction with field-init syntax.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct XdpQueueSlot {
     /// Interface name to bind to. For bonds this is the slave name.
     pub iface: String,
@@ -23,6 +31,22 @@ pub struct XdpQueueSlot {
     pub queue: QueueId,
     /// Position in the flattened queue list for the requested interface.
     pub flat_index: QueueId,
+}
+
+impl XdpQueueSlot {
+    /// Builds a queue slot directly. Prefer the discovery helpers
+    /// ([`resolve_xdp_queue_slot`], [`xdp_queue_slots_for_interface`]); this
+    /// constructor exists for tests and for callers that have already done
+    /// their own queue enumeration.
+    #[must_use]
+    pub fn new(iface: String, ifindex: IfIndex, queue: QueueId, flat_index: QueueId) -> Self {
+        Self {
+            iface,
+            ifindex,
+            queue,
+            flat_index,
+        }
+    }
 }
 
 /// Resolves an interface name to its kernel ifindex.
@@ -117,9 +141,24 @@ pub fn resolve_xdp_queue_slot(iface: &str, flat_queue: QueueId) -> io::Result<Xd
 
 /// Returns the single CPU handling interrupts for `slot`'s RX queue.
 ///
-/// This intentionally rejects multi-CPU IRQ affinity. If `irqbalance` or a
-/// manual affinity mask allows one NIC queue to run on multiple CPUs, AF_XDP
-/// worker pinning becomes ambiguous and cache locality falls apart.
+/// # Single-CPU requirement
+///
+/// This function returns an error rather than guessing when one RX queue's
+/// IRQ is steered to multiple CPUs. The whole "busy-poll worker pinned per
+/// queue" design assumes a 1:1 NIC-queue-to-CPU mapping so cache lines stay
+/// hot and the kernel-side soft-IRQ does not race the AF_XDP user worker on
+/// a different core. There is intentionally **no escape hatch**:
+///
+/// - If `irqbalance` is running, stop it (`systemctl stop irqbalance` and
+///   `systemctl mask irqbalance`) or configure its policy file to leave the
+///   AF_XDP NIC alone.
+/// - If a manual `/proc/irq/{N}/smp_affinity[_list]` mask has more than one
+///   bit set, write a single CPU id back to it before starting the workers.
+///
+/// Loosening this contract would couple every consumer to "which of the N
+/// CPUs do we pick?" decisions that are workload-specific and easy to get
+/// wrong silently. The error message at the caller surfaces exactly what
+/// the operator needs to fix.
 pub fn cpu_for_xdp_queue(slot: &XdpQueueSlot) -> io::Result<u32> {
     cpu_for_rx_queue(&slot.iface, slot.queue)
 }
@@ -277,6 +316,97 @@ fn cpu_for_rx_queue(iface: &str, queue: QueueId) -> io::Result<u32> {
 }
 
 fn irq_for_rx_queue(iface: &str, queue: QueueId) -> io::Result<u32> {
+    // Prefer the structured sysfs path: for any NIC that publishes MSI-X
+    // IRQs (every modern multi-queue card does), `/sys/class/net/{iface}/
+    // device/msi_irqs/` lists the IRQ numbers and the per-IRQ
+    // `/proc/irq/{N}` directory contains an "action" file or per-driver
+    // descriptor file naming the queue. If sysfs doesn't yield an answer we
+    // fall back to scraping `/proc/interrupts` with a generalized token
+    // matcher (no per-vendor special cases).
+    if let Some(irq) = irq_from_sysfs(iface, queue)? {
+        return Ok(irq);
+    }
+    irq_from_proc_interrupts(iface, queue)
+}
+
+/// Walk `/sys/class/net/{iface}/device/msi_irqs/` (each subentry name is an
+/// IRQ number) and for each IRQ check whether `/proc/irq/{irq}/` carries an
+/// "actions" entry or a per-driver subdirectory whose name encodes the queue
+/// id. Returns `Ok(None)` if the sysfs path is absent (non-PCIe device,
+/// virtio without MSI-X) so the caller can fall back.
+fn irq_from_sysfs(iface: &str, queue: QueueId) -> io::Result<Option<u32>> {
+    let dir = format!("/sys/class/net/{iface}/device/msi_irqs");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("read {dir}: {error}"),
+            ));
+        }
+    };
+    let queue_str = queue.get().to_string();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(irq) = name.parse::<u32>() else {
+            continue;
+        };
+        if irq_descriptor_names_queue(irq, iface, &queue_str)? {
+            return Ok(Some(irq));
+        }
+    }
+    Ok(None)
+}
+
+/// `/proc/irq/{irq}/` may contain a file named `actions` (newer kernels) or a
+/// subdirectory per registered handler. Either way the names embed the queue
+/// id when the driver registered MSI-X per RX queue, so we re-use the same
+/// token matcher used for `/proc/interrupts` lines.
+fn irq_descriptor_names_queue(irq: u32, iface: &str, queue_str: &str) -> io::Result<bool> {
+    let actions_path = format!("/proc/irq/{irq}/actions");
+    match fs::read_to_string(&actions_path) {
+        Ok(actions) => {
+            for token in actions.split(',') {
+                if token_names_iface_queue(token.trim(), iface, queue_str) {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("read {actions_path}: {error}"),
+            ));
+        }
+    }
+
+    let dir = format!("/proc/irq/{irq}");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(io::Error::new(error.kind(), format!("read {dir}: {error}")));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if let Some(name) = file_name.to_str()
+            && token_names_iface_queue(name, iface, queue_str)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn irq_from_proc_interrupts(iface: &str, queue: QueueId) -> io::Result<u32> {
     let raw = fs::read_to_string("/proc/interrupts")
         .map_err(|error| io::Error::new(error.kind(), format!("read /proc/interrupts: {error}")))?;
     let queue = queue.get();
@@ -290,13 +420,7 @@ fn irq_for_rx_queue(iface: &str, queue: QueueId) -> io::Result<u32> {
             continue;
         };
         for token in rest.split_whitespace() {
-            if !token.contains(iface) {
-                continue;
-            }
-            let matches = token.ends_with(&format!("-{queue_string}"))
-                || token.ends_with(&format!(".{queue_string}"))
-                || token.starts_with(&format!("mlx5_comp{queue_string}@"));
-            if matches {
+            if token_names_iface_queue(token, iface, &queue_string) {
                 return Ok(irq);
             }
         }
@@ -306,6 +430,35 @@ fn irq_for_rx_queue(iface: &str, queue: QueueId) -> io::Result<u32> {
         io::ErrorKind::NotFound,
         format!("no IRQ in /proc/interrupts matches {iface} rx-{queue}"),
     ))
+}
+
+/// Returns true when `token` is the IRQ handler name for `iface` RX queue
+/// `queue_str`. Generalized over the per-vendor naming conventions:
+/// - `iface-{queue}`            (Intel `ice`, `i40e`)
+/// - `iface.{queue}`            (some Broadcom)
+/// - `iface@{queue}`            (Mellanox short form)
+/// - `*comp{queue}*iface*`      (Mellanox `mlx5_comp42@eth0`)
+/// - `bnxt_en_{queue}_iface`    (Broadcom long form)
+///
+/// The token must contain `iface` somewhere AND one of its alphanumeric
+/// sub-parts (split on `-`, `.`, `@`, `_`) must be exactly `queue_str` or
+/// must end in `queue_str` with an alphabetic prefix (e.g., `comp42`).
+fn token_names_iface_queue(token: &str, iface: &str, queue_str: &str) -> bool {
+    if !token.contains(iface) {
+        return false;
+    }
+    token
+        .split(|c: char| c == '-' || c == '.' || c == '@' || c == '_')
+        .any(|part| {
+            if part == queue_str {
+                return true;
+            }
+            let Some(prefix) = part.strip_suffix(queue_str) else {
+                return false;
+            };
+            !prefix.is_empty()
+                && prefix.chars().all(|c| c.is_ascii_alphabetic())
+        })
 }
 
 fn parse_numa_node(raw: &str) -> Result<NumaNode, String> {

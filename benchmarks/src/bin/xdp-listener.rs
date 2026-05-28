@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::{Parser, ValueEnum};
 use fast_socket_benchmarks::{
-    Args, BoxError, Progress, RunLimit, XdpProgramMap, attach_xdp_programs_for_slots,
+    BoxError, Progress, RunLimit, XdpProgramMap, attach_xdp_programs_for_slots,
     install_shutdown_signal_handlers, parse_ipv4_udp, pin_current_thread_to_cpu, reflect_ipv4_udp,
     shutdown_requested, xdp_program_for_slot,
 };
 use fast_socket_rs::{
-    IfIndex, IpPacketSocket, IpPacketTransmit, PacketBuffer, PacketBufferMut, QueueId, RecvBatch,
+    IfIndex, IpPacketSocket, IpPacketTransmit, PacketBuffer, PacketBufferMut, RecvBatch,
     TxSlot,
 };
 use fast_socket_xdp_rs::{
@@ -20,9 +21,7 @@ use fast_socket_xdp_rs::{
     cpu_for_xdp_queue, if_index_to_name, xdp_queue_slots_for_interface,
 };
 
-const USAGE: &str = "usage: xdp-listener <count|pong> (--ifindex N | --iface NAME) --bind IPv4:PORT [--count N] [--duration-ms N]";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
     Count,
     Pong,
@@ -33,18 +32,36 @@ struct QueueGroup {
     slots: Vec<XdpQueueSlot>,
 }
 
+#[derive(Debug, Parser)]
+#[command(about = "AF_XDP IP packet listener: count or reflect received IPv4 UDP datagrams")]
+struct Cli {
+    /// Listen mode.
+    #[arg(value_enum)]
+    mode: Mode,
+
+    /// Interface index whose XDP queues should own the sockets.
+    #[arg(long, conflicts_with = "iface")]
+    ifindex: Option<u32>,
+
+    /// Interface name whose XDP queues should own the sockets.
+    #[arg(long, conflicts_with = "ifindex")]
+    iface: Option<String>,
+
+    /// IPv4 bind endpoint.
+    #[arg(long)]
+    bind: SocketAddrV4,
+
+    #[command(flatten)]
+    limit: RunLimit,
+}
+
 fn main() -> Result<(), BoxError> {
     install_shutdown_signal_handlers()?;
-    let mut args = Args::new();
-    let mode = match args.mode(USAGE)?.as_str() {
-        "count" => Mode::Count,
-        "pong" => Mode::Pong,
-        other => return Err(format!("unknown mode {other}\n{USAGE}").into()),
-    };
-    let slots = queue_slots_from_args(&mut args)?;
-    let bind = socket_addr_v4(args.required("--bind")?, "--bind")?;
-    let limit = RunLimit::from_args(&mut args)?;
-    args.finish()?;
+    let cli = Cli::parse();
+    let mode = cli.mode;
+    let slots = queue_slots_from_cli(cli.ifindex, cli.iface)?;
+    let bind = cli.bind;
+    let limit = cli.limit;
 
     let programs = Arc::new(attach_xdp_programs_for_slots(&slots)?);
     let groups = queue_groups_by_cpu(slots)?;
@@ -54,9 +71,10 @@ fn main() -> Result<(), BoxError> {
         groups.len()
     );
 
-    let routes = RouteSnapshot::from_netlink(QueueId::new(0))?;
+    let routes = RouteSnapshot::from_netlink()?;
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
     let (error_tx, error_rx) = mpsc::channel::<String>();
     let mut handles = Vec::with_capacity(groups.len());
 
@@ -64,6 +82,7 @@ fn main() -> Result<(), BoxError> {
         let worker_routes = routes.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_total = Arc::clone(&total);
+        let worker_dropped = Arc::clone(&dropped);
         let worker_error_tx = error_tx.clone();
         let worker_programs = Arc::clone(&programs);
         handles.push(thread::spawn(move || {
@@ -76,6 +95,7 @@ fn main() -> Result<(), BoxError> {
                 bind.port(),
                 worker_stop.clone(),
                 worker_total,
+                worker_dropped,
             ) {
                 let _ = worker_error_tx.send(format!("worker cpu {}: {error}", group.cpu));
                 worker_stop.store(true, Relaxed);
@@ -109,27 +129,28 @@ fn main() -> Result<(), BoxError> {
     if let Ok(error) = error_rx.try_recv() {
         return Err(error.into());
     }
-    progress.finish(total.load(Relaxed));
+    let final_total = total.load(Relaxed);
+    let final_dropped = dropped.load(Relaxed);
+    progress.finish(final_total);
+    if final_dropped > 0 {
+        eprintln!(
+            "xdp-listener: dropped {final_dropped} packets (port mismatch, parse failure, missing egress, or send failure)"
+        );
+    }
     Ok(())
 }
 
-fn queue_slots_from_args(args: &mut Args) -> Result<Vec<XdpQueueSlot>, BoxError> {
-    let ifindex = args
-        .take("--ifindex")
-        .map(|value| value.parse::<u32>())
-        .transpose()?
-        .map(IfIndex::new);
-    let iface = args.take("--iface");
-
-    match (ifindex, iface) {
-        (Some(ifindex), None) => {
-            let iface = if_index_to_name(ifindex)?;
-            Ok(xdp_queue_slots_for_interface(&iface)?)
-        }
-        (None, Some(iface)) => Ok(xdp_queue_slots_for_interface(&iface)?),
-        (Some(_), Some(_)) => Err("use only one of --ifindex or --iface".into()),
-        (None, None) => Err("missing --ifindex N or --iface NAME".into()),
-    }
+fn queue_slots_from_cli(
+    ifindex: Option<u32>,
+    iface: Option<String>,
+) -> Result<Vec<XdpQueueSlot>, BoxError> {
+    let iface = match (ifindex.map(IfIndex::new), iface) {
+        (Some(ifindex), None) => if_index_to_name(ifindex)?,
+        (None, Some(iface)) => iface,
+        (Some(_), Some(_)) => return Err("use only one of --ifindex or --iface".into()),
+        (None, None) => return Err("missing --ifindex N or --iface NAME".into()),
+    };
+    Ok(xdp_queue_slots_for_interface(&iface)?)
 }
 
 fn queue_groups_by_cpu(slots: Vec<XdpQueueSlot>) -> Result<Vec<QueueGroup>, BoxError> {
@@ -154,6 +175,7 @@ fn run_worker(
     bind_port: u16,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<(), BoxError> {
     pin_current_thread_to_cpu(cpu)?;
 
@@ -163,13 +185,13 @@ fn run_worker(
         let socket = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
             .bind_udp_port(bind_port)
             .attached_program(program.clone())
-            .open_busy_poll_live()?;
+            .open_busy_poll()?;
         sockets.push((slot, socket));
     }
 
     let mut rx = RecvBatch::with_capacity(64);
     while !stop.load(Relaxed) && !shutdown_requested() {
-        let mut made_progress = false;
+        let mut delivered_this_pass = 0u64;
         for (slot, socket) in &mut sockets {
             rx.clear();
             let received = socket.recv(&mut rx)?;
@@ -179,13 +201,18 @@ fn run_worker(
                 }
                 continue;
             }
-            made_progress = true;
-            match mode {
-                Mode::Count => count_received(&mut rx, bind_port, &total),
-                Mode::Pong => pong_received(socket, &routes, slot, bind_port, &total, &mut rx)?,
-            }
+            // Only frames that pass filtering count as forward progress. A
+            // batch of packets for the wrong port, fragments, or destinations
+            // with no egress would otherwise suppress the `spin_loop` hint
+            // even when zero useful work was done.
+            delivered_this_pass += match mode {
+                Mode::Count => count_received(&mut rx, bind_port, &total, &dropped),
+                Mode::Pong => {
+                    pong_received(socket, &routes, slot, bind_port, &total, &dropped, &mut rx)?
+                }
+            };
         }
-        if !made_progress {
+        if delivered_this_pass == 0 {
             std::hint::spin_loop();
         }
     }
@@ -200,33 +227,44 @@ fn count_received(
     >,
     bind_port: u16,
     total: &AtomicU64,
-) {
+    dropped: &AtomicU64,
+) -> u64 {
+    let mut delivered = 0u64;
     for item in rx.drain() {
         if parse_ipv4_udp(item.packet.segments().next().unwrap_or_default())
             .is_some_and(|udp| udp.destination_port == bind_port)
         {
             total.fetch_add(1, Relaxed);
+            delivered += 1;
+        } else {
+            dropped.fetch_add(1, Relaxed);
         }
     }
+    delivered
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pong_received(
     socket: &mut BusyPollXdpIpPacketSocket,
     routes: &RouteSnapshot,
     slot: &XdpQueueSlot,
     bind_port: u16,
     total: &AtomicU64,
+    dropped: &AtomicU64,
     rx: &mut RecvBatch<
         fast_socket_rs::IpPacketReceive<
             fast_socket_rs::IpPacketRxBuffer<BusyPollXdpIpPacketSocket>,
         >,
     >,
-) -> Result<(), BoxError> {
+) -> Result<u64, BoxError> {
+    let mut delivered = 0u64;
     for mut item in rx.drain() {
         let Some(parsed) = parse_ipv4_udp(item.packet.segments().next().unwrap_or_default()) else {
+            dropped.fetch_add(1, Relaxed);
             continue;
         };
         if parsed.destination_port != bind_port {
+            dropped.fetch_add(1, Relaxed);
             continue;
         }
         if item.packet.len() > parsed.total_len {
@@ -234,10 +272,12 @@ fn pong_received(
                 .trim_suffix(item.packet.len() - parsed.total_len)?;
         }
         let Some(destination) = reflect_ipv4_udp(item.packet.as_mut_slice()) else {
+            dropped.fetch_add(1, Relaxed);
             continue;
         };
         let Some(egress) = routes.egress_v4_for_interface(destination, slot.ifindex, slot.queue)
         else {
+            dropped.fetch_add(1, Relaxed);
             continue;
         };
         let mut tx = [TxSlot::Ready(IpPacketTransmit::new(
@@ -246,10 +286,13 @@ fn pong_received(
         ))];
         if socket.send(&mut tx)? == 1 {
             total.fetch_add(1, Relaxed);
+            delivered += 1;
+        } else {
+            dropped.fetch_add(1, Relaxed);
         }
     }
     socket.drain_tx_completions()?;
-    Ok(())
+    Ok(delivered)
 }
 
 fn join_workers(handles: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError> {
@@ -261,11 +304,3 @@ fn join_workers(handles: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn socket_addr_v4(addr: SocketAddr, name: &str) -> Result<SocketAddrV4, BoxError> {
-    match addr {
-        SocketAddr::V4(addr) => Ok(addr),
-        SocketAddr::V6(_) => {
-            Err(format!("{name} must be IPv4 for the first XDP benchmark path").into())
-        }
-    }
-}

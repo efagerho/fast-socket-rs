@@ -59,12 +59,28 @@ impl RouteSnapshot {
     }
 
     /// Builds a snapshot from Linux netlink route, neighbor, and link dumps.
-    pub fn from_netlink(queue: QueueId) -> io::Result<Self> {
-        Self::from_netlink_table(queue, u32::from(libc::RT_TABLE_MAIN))
+    ///
+    /// The snapshot is queue-agnostic; callers that want per-queue egress
+    /// handles should resolve them through
+    /// [`XdpLocalRoutes::egress_v4_for_interface`], which accepts a queue id
+    /// at the call site. The default-queue stamp on the underlying
+    /// [`InterfaceInfo`] entries is only used by the simpler
+    /// [`XdpLocalRoutes::egress_v4`] convenience and is informational
+    /// otherwise.
+    pub fn from_netlink() -> io::Result<Self> {
+        Self::from_netlink_table(u32::from(libc::RT_TABLE_MAIN))
     }
 
-    /// Builds a snapshot from one Linux route table via netlink.
-    pub fn from_netlink_table(queue: QueueId, table: u32) -> io::Result<Self> {
+    /// Like [`Self::from_netlink`] but uses an explicit route table id.
+    pub fn from_netlink_table(table: u32) -> io::Result<Self> {
+        // Stamp every interface with queue 0; queue-aware lookups go through
+        // `egress_v4_for_interface` and override this value.
+        let queue = QueueId::new(0);
+        let _ = queue; // silence warning if upstream renames the field
+        Self::build_netlink_snapshot(queue, table)
+    }
+
+    fn build_netlink_snapshot(queue: QueueId, table: u32) -> io::Result<Self> {
         let mut snapshot = Self::new();
 
         for link in netlink_get_links(libc::AF_UNSPEC as u8)? {
@@ -79,29 +95,31 @@ impl RouteSnapshot {
             }
         }
 
-        for route in netlink_get_routes(libc::AF_INET as u8, table)? {
-            let Some(ifindex) = route.out_ifindex else {
-                continue;
-            };
-            let destination = match route.destination {
-                Some(IpAddr::V4(destination)) => destination,
-                None => Ipv4Addr::UNSPECIFIED,
-                Some(IpAddr::V6(_)) => continue,
-            };
-            let gateway = match route.gateway {
-                Some(IpAddr::V4(gateway)) => Some(gateway),
-                None => None,
-                Some(IpAddr::V6(_)) => continue,
-            };
-            snapshot.upsert_route_v4(Ipv4Route {
-                destination,
-                prefix_len: route.dst_len.min(32),
-                ifindex,
-                gateway,
-                priority: route.priority.unwrap_or(u32::MAX),
-                mtu: u32::MAX,
-            });
-        }
+        // Bulk-insert without re-sorting between each route; the sort is
+        // amortized to a single O(n log n) pass at the end.
+        snapshot.upsert_routes_v4(netlink_get_routes(libc::AF_INET as u8, table)?.into_iter().filter_map(
+            |route| {
+                let ifindex = route.out_ifindex?;
+                let destination = match route.destination {
+                    Some(IpAddr::V4(destination)) => destination,
+                    None => Ipv4Addr::UNSPECIFIED,
+                    Some(IpAddr::V6(_)) => return None,
+                };
+                let gateway = match route.gateway {
+                    Some(IpAddr::V4(gateway)) => Some(gateway),
+                    None => None,
+                    Some(IpAddr::V6(_)) => return None,
+                };
+                Some(Ipv4Route {
+                    destination,
+                    prefix_len: route.dst_len.min(32),
+                    ifindex,
+                    gateway,
+                    priority: route.priority.unwrap_or(u32::MAX),
+                    mtu: u32::MAX,
+                })
+            },
+        ));
 
         for neighbor in netlink_get_neighbors(None, libc::AF_INET as u8)? {
             let (Some(IpAddr::V4(ip)), Some(mac)) = (neighbor.destination, neighbor.lladdr) else {
@@ -113,8 +131,32 @@ impl RouteSnapshot {
         Ok(snapshot)
     }
 
-    /// Adds or replaces an IPv4 route.
+    /// Adds or replaces an IPv4 route. Sorts the route table after every
+    /// insert, so prefer [`Self::upsert_routes_v4`] when bulk-loading.
     pub fn upsert_route_v4(&mut self, route: Ipv4Route) {
+        self.upsert_route_v4_no_sort(route);
+        self.sort_routes_v4();
+    }
+
+    /// Adds or replaces many IPv4 routes, sorting the route table only once
+    /// at the end. O(n) inserts + a single O(n log n) sort instead of N×
+    /// O(n log n) re-sorts; preferable for any bulk loader (netlink dumps,
+    /// route-monitor snapshots).
+    pub fn upsert_routes_v4<I>(&mut self, routes: I)
+    where
+        I: IntoIterator<Item = Ipv4Route>,
+    {
+        let mut any = false;
+        for route in routes {
+            self.upsert_route_v4_no_sort(route);
+            any = true;
+        }
+        if any {
+            self.sort_routes_v4();
+        }
+    }
+
+    fn upsert_route_v4_no_sort(&mut self, route: Ipv4Route) {
         if let Some(existing) = self.routes_v4.iter_mut().find(|existing| {
             existing.destination == route.destination
                 && existing.prefix_len == route.prefix_len
@@ -125,6 +167,9 @@ impl RouteSnapshot {
         } else {
             self.routes_v4.push(route);
         }
+    }
+
+    fn sort_routes_v4(&mut self) {
         self.routes_v4.sort_by(|left, right| {
             right
                 .prefix_len

@@ -29,7 +29,10 @@ struct Args {
     #[arg(long)]
     device: String,
 
-    /// Peer endpoint as IP:PORT; the server binds the device IP with this port.
+    /// Expected peer endpoint as IP:PORT. The server binds the device IP with
+    /// this port (so the peer can reach it) and, in XDP mode, uses the peer IP
+    /// for queue-local egress resolution. UDP source addresses on incoming
+    /// pings are echoed back regardless.
     #[arg(long)]
     target: SocketAddrV4,
 

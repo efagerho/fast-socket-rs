@@ -304,8 +304,9 @@ impl Umem {
         }
 
         let huge_page = match huge_page_size {
-            HugePageSize::Default | HugePageSize::Size2M => Some(2 * 1024 * 1024),
+            HugePageSize::Size4K => None,
             HugePageSize::Size1G => Some(1024 * 1024 * 1024),
+            // Default and Size2M both prefer 2 MiB hugepages.
             _ => Some(2 * 1024 * 1024),
         };
         let backing = huge_page
@@ -343,8 +344,9 @@ impl Umem {
         }
 
         let huge_page = match huge_page_size {
-            HugePageSize::Default | HugePageSize::Size2M => Some(2 * 1024 * 1024),
+            HugePageSize::Size4K => None,
             HugePageSize::Size1G => Some(1024 * 1024 * 1024),
+            // Default and Size2M both prefer 2 MiB hugepages.
             _ => Some(2 * 1024 * 1024),
         };
         let mut huge_page_error = None;

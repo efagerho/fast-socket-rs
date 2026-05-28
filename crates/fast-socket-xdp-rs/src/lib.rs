@@ -46,9 +46,8 @@ pub use interface::{
 };
 #[cfg(target_os = "linux")]
 pub use program::{
-    AttachMode, BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_UDP_FRAGMENT,
-    DROP_REASON_UDP_OPTIONS, MAX_BOUND_PORTS, MAX_QUEUES, XdpProgram, XdpProgramHandle,
-    embedded_program_bytes, get_or_load, xdp_program_bytes,
+    AttachMode, BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, MAX_BOUND_PORTS, MAX_QUEUES, XdpProgram,
+    XdpProgramHandle, embedded_program_bytes, get_or_load, xdp_program_bytes,
 };
 #[cfg(target_os = "linux")]
 pub use raw_socket::{RawXdpSocket, RingSizes, XdpMode};

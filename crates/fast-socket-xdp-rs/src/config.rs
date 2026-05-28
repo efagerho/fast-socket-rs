@@ -61,7 +61,10 @@ impl Default for XdpIpPacketSocketConfig {
             .with_fixed_chunk(4096, 4096)
             .expect("default XDP tx layout is valid");
         Self {
-            ifindex: IfIndex::new(0),
+            // Placeholder ifindex (loopback). Every entry point that exposes
+            // `Default` lives behind a builder that overwrites this with the
+            // caller's real interface before the config leaves the crate.
+            ifindex: IfIndex::new(1),
             queue_id: QueueId::new(0),
             numa_node: None,
             huge_page_size: HugePageSize::Default,
@@ -197,20 +200,22 @@ impl XdpIpPacketSocketBuilder {
         self
     }
 
-    /// Builds the first-pass busy-poll IP packet socket.
+    /// Builds a test-only (heap-backed) busy-poll IP packet socket.
+    /// `cfg(test)`-only — production callers use [`Self::open_busy_poll`].
+    #[cfg(test)]
     #[must_use]
-    pub fn open_busy_poll(self) -> BusyPollXdpIpPacketSocket {
+    pub fn open_busy_poll_test(self) -> BusyPollXdpIpPacketSocket {
+        XdpIpPacketSocket::new_busy_poll_test(self.config)
+    }
+
+    /// Builds a busy-poll AF_XDP IP packet socket.
+    pub fn open_busy_poll(self) -> io::Result<BusyPollXdpIpPacketSocket> {
         XdpIpPacketSocket::new_busy_poll(self.config)
     }
 
-    /// Builds a live busy-poll AF_XDP IP packet socket.
-    pub fn open_busy_poll_live(self) -> io::Result<BusyPollXdpIpPacketSocket> {
-        XdpIpPacketSocket::new_busy_poll_live(self.config)
-    }
-
-    /// Builds a live readiness-driven AF_XDP IP packet socket.
-    pub fn open_readiness_live(self) -> io::Result<ReadinessXdpIpPacketSocket> {
-        XdpIpPacketSocket::new_readiness_live(self.config)
+    /// Builds a readiness-driven AF_XDP IP packet socket.
+    pub fn open_readiness(self) -> io::Result<ReadinessXdpIpPacketSocket> {
+        XdpIpPacketSocket::new_readiness(self.config)
     }
 
     /// Returns the accumulated configuration.
@@ -340,22 +345,25 @@ impl<R> XdpUdpSocketBuilder<R> {
         }
     }
 
-    /// Builds the first-pass busy-poll UDP socket.
+    /// Builds the first-pass (non-live, heap-backed) busy-poll UDP socket.
+    /// `cfg(test)`-only — production callers use
+    /// [`Self::open_busy_poll`].
+    #[cfg(test)]
     #[must_use]
-    pub fn open_busy_poll(self) -> BusyPollXdpUdpSocket<R>
+    pub fn open_busy_poll_test(self) -> BusyPollXdpUdpSocket<R>
     where
         R: XdpUdpRouter,
     {
-        let ip = XdpIpPacketSocket::new_busy_poll(self.config);
+        let ip = XdpIpPacketSocket::new_busy_poll_test(self.config);
         XdpUdpSocket::from_ip_socket(ip, self.local_addr, self.router)
     }
 
-    /// Builds a live busy-poll AF_XDP UDP socket.
-    pub fn open_busy_poll_live(self) -> io::Result<BusyPollXdpUdpSocket<R>>
+    /// Builds a busy-poll AF_XDP UDP socket.
+    pub fn open_busy_poll(self) -> io::Result<BusyPollXdpUdpSocket<R>>
     where
         R: XdpUdpRouter,
     {
-        let ip = XdpIpPacketSocket::new_busy_poll_live(self.config)?;
+        let ip = XdpIpPacketSocket::new_busy_poll(self.config)?;
         Ok(XdpUdpSocket::from_ip_socket(
             ip,
             self.local_addr,
@@ -363,12 +371,12 @@ impl<R> XdpUdpSocketBuilder<R> {
         ))
     }
 
-    /// Builds a live readiness-driven AF_XDP UDP socket.
-    pub fn open_readiness_live(self) -> io::Result<ReadinessXdpUdpSocket<R>>
+    /// Builds a readiness-driven AF_XDP UDP socket.
+    pub fn open_readiness(self) -> io::Result<ReadinessXdpUdpSocket<R>>
     where
         R: XdpUdpRouter,
     {
-        let ip = XdpIpPacketSocket::new_readiness_live(self.config)?;
+        let ip = XdpIpPacketSocket::new_readiness(self.config)?;
         Ok(XdpUdpSocket::from_ip_socket(
             ip,
             self.local_addr,

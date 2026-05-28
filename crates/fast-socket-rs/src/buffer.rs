@@ -7,37 +7,11 @@ use core::num::NonZeroUsize;
 pub type Segment<'a> = &'a [u8];
 
 /// Iterator over packet segments in packet-byte order.
-#[derive(Clone, Debug)]
-pub struct Segments<'a> {
-    segment: Option<Segment<'a>>,
-}
-
-impl<'a> Segments<'a> {
-    fn empty() -> Self {
-        Self { segment: None }
-    }
-
-    fn one(segment: Segment<'a>) -> Self {
-        Self {
-            segment: Some(segment),
-        }
-    }
-}
-
-impl<'a> Iterator for Segments<'a> {
-    type Item = Segment<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.segment.take()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = usize::from(self.segment.is_some());
-        (len, Some(len))
-    }
-}
-
-impl ExactSizeIterator for Segments<'_> {}
+///
+/// The heap-backed buffers in this crate always have at most one segment, so
+/// `Segments` is an alias for `Option::into_iter()`. Multi-segment backends
+/// (AF_XDP UMEM, DPDK mempools) define their own iterator type.
+pub type Segments<'a> = core::option::IntoIter<Segment<'a>>;
 
 /// Borrowed scatter-gather view over packet segments.
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +65,19 @@ impl BufferLayout {
         Self::with_headroom_and_tailroom(payload_capacity, 0, 0)
     }
 
+    /// Creates a layout sized for a UDP/IP-like payload of at most
+    /// `payload_capacity` bytes, rounded up to at least 2 KiB so a single
+    /// buffer comfortably holds an MTU-sized Ethernet frame after backend-
+    /// reserved L2 headroom is added.
+    ///
+    /// Equivalent to `BufferLayout::new(payload_capacity.max(2048))`. Use
+    /// this instead of repeating the magic `2048` constant at every callsite.
+    #[must_use]
+    pub fn for_payload(payload_capacity: usize) -> Self {
+        const PACKET_CAPACITY_FLOOR: usize = 2048;
+        Self::new(payload_capacity.max(PACKET_CAPACITY_FLOOR))
+    }
+
     /// Creates a contiguous packet layout with public headroom and tailroom.
     #[must_use]
     pub fn with_headroom_and_tailroom(
@@ -126,6 +113,15 @@ impl BufferLayout {
     pub fn with_l2_headroom(mut self, l2_headroom: usize) -> Self {
         self.l2_headroom = l2_headroom;
         self.data_offset = self.l2_headroom + self.headroom;
+        // The packet's first byte sits at `data_offset` bytes into each chunk,
+        // so it must still satisfy the layout's alignment requirement no matter
+        // which branch we take below.
+        let align = self.align.get();
+        assert!(
+            self.data_offset.is_multiple_of(align),
+            "with_l2_headroom violates alignment: data_offset {} not a multiple of {align}",
+            self.data_offset,
+        );
         if !self.chunk_fixed {
             self.chunk_size = self.data_offset + self.payload_capacity + self.tailroom;
             self.stride = self.chunk_size;
@@ -142,15 +138,28 @@ impl BufferLayout {
     }
 
     /// Returns a copy of this layout with a required data alignment.
+    ///
+    /// Panics if `align` is not a power of two.
     #[must_use]
     pub const fn with_alignment(mut self, align: NonZeroUsize) -> Self {
+        assert!(
+            align.get().is_power_of_two(),
+            "BufferLayout alignment must be a power of two",
+        );
         self.align = align;
         self
     }
 
     /// Returns a copy of this layout with a maximum segment count.
+    ///
+    /// Panics if `max_segments` is zero. A layout with zero segments cannot
+    /// describe any packet.
     #[must_use]
     pub const fn with_max_segments(mut self, max_segments: usize) -> Self {
+        assert!(
+            max_segments >= 1,
+            "BufferLayout max_segments must be at least 1",
+        );
         self.max_segments = max_segments;
         self
     }
@@ -336,6 +345,10 @@ pub enum BufferAccessError {
         packet_len: usize,
     },
     /// The append operation did not fit in the available tailroom.
+    ///
+    /// This is a *buffer-layout* error raised while building a packet on the
+    /// caller side. The wire-level "packet exceeds socket MTU" check on the
+    /// transmit path is reported as [`crate::Error::OversizeForMtu`] instead.
     InsufficientTailroom {
         /// Available tailroom bytes.
         available: usize,
@@ -560,9 +573,10 @@ impl PacketBuffer for PacketBuf {
     }
 
     fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
-            .expect("packet start >= l2_headroom by layout invariant")
+        // start >= layout.l2_headroom() is upheld by every constructor and by
+        // the operations on PacketBufMut (prepend/trim_prefix). saturating_sub
+        // protects against a future constructor accidentally violating that.
+        self.start.saturating_sub(self.layout.l2_headroom())
     }
 
     fn tailroom(&self) -> usize {
@@ -575,9 +589,9 @@ impl PacketBuffer for PacketBuf {
 
     fn segments(&self) -> Self::Segments<'_> {
         if self.is_empty() {
-            Segments::empty()
+            None.into_iter()
         } else {
-            Segments::one(self.as_slice())
+            Some(self.as_slice()).into_iter()
         }
     }
 
@@ -634,39 +648,10 @@ impl PacketBufMut {
         &mut self.storage[self.start..self.end]
     }
 
-    /// Prepends bytes immediately before the current packet start.
-    pub fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        if bytes.len() > self.headroom() {
-            return Err(ReserveError::InsufficientHeadroom {
-                available: self.headroom(),
-                requested: bytes.len(),
-            });
-        }
-        let new_start = self.start - bytes.len();
-        self.storage[new_start..self.start].copy_from_slice(bytes);
-        self.start = new_start;
-        Ok(())
-    }
-
-    /// Prepends bytes, relocating packet bytes when in-place headroom is insufficient.
-    pub fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        if bytes.len() > self.headroom() {
-            self.relocate(self.headroom().max(bytes.len()), self.tailroom());
-        }
-        self.prepend(bytes)
-    }
-
-    /// Appends bytes, relocating packet bytes when in-place tailroom is insufficient.
-    pub fn extend_from_slice_relocating(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
-        if bytes.len() > self.tailroom() {
-            self.relocate(self.headroom(), bytes.len());
-        }
-        <Self as PacketBufferMut>::extend_from_slice(self, bytes)
-    }
-
     fn relocate(&mut self, headroom: usize, tailroom: usize) {
         let packet = self.as_slice().to_vec();
-        let layout = BufferLayout::with_headroom_and_tailroom(packet.len(), headroom, tailroom)
+        let payload_capacity = self.layout.payload_capacity().max(packet.len());
+        let layout = BufferLayout::with_headroom_and_tailroom(payload_capacity, headroom, tailroom)
             .with_l2_headroom(self.layout.l2_headroom())
             .with_alignment(self.layout.align())
             .with_max_segments(self.layout.max_segments());
@@ -690,9 +675,8 @@ impl PacketBuffer for PacketBufMut {
     }
 
     fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
-            .expect("packet start >= l2_headroom by layout invariant")
+        // See PacketBuf::headroom for the invariant rationale.
+        self.start.saturating_sub(self.layout.l2_headroom())
     }
 
     fn tailroom(&self) -> usize {
@@ -705,9 +689,9 @@ impl PacketBuffer for PacketBufMut {
 
     fn segments(&self) -> Self::Segments<'_> {
         if self.is_empty() {
-            Segments::empty()
+            None.into_iter()
         } else {
-            Segments::one(self.as_slice())
+            Some(self.as_slice()).into_iter()
         }
     }
 
@@ -720,11 +704,23 @@ impl PacketBufferMut for PacketBufMut {
     type Frozen = PacketBuf;
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        PacketBufMut::prepend(self, bytes)
+        if bytes.len() > self.headroom() {
+            return Err(ReserveError::InsufficientHeadroom {
+                available: self.headroom(),
+                requested: bytes.len(),
+            });
+        }
+        let new_start = self.start - bytes.len();
+        self.storage[new_start..self.start].copy_from_slice(bytes);
+        self.start = new_start;
+        Ok(())
     }
 
     fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        PacketBufMut::prepend_relocating(self, bytes)
+        if bytes.len() > self.headroom() {
+            self.relocate(self.headroom().max(bytes.len()), self.tailroom());
+        }
+        <Self as PacketBufferMut>::prepend(self, bytes)
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
@@ -742,7 +738,10 @@ impl PacketBufferMut for PacketBufMut {
     }
 
     fn extend_from_slice_relocating(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
-        PacketBufMut::extend_from_slice_relocating(self, bytes)
+        if bytes.len() > self.tailroom() {
+            self.relocate(self.headroom(), self.tailroom().max(bytes.len()));
+        }
+        <Self as PacketBufferMut>::extend_from_slice(self, bytes)
     }
 
     fn trim_prefix(&mut self, len: usize) -> Result<(), BufferAccessError> {

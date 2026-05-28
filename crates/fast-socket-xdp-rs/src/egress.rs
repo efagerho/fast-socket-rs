@@ -47,10 +47,24 @@ impl XdpEgress {
             mtu,
         }
     }
-}
 
-impl IpPacketEgress for XdpEgress {
-    fn default_egress() -> Option<Self> {
-        None
+    /// Returns this egress with the given 802.1Q VLAN id attached.
+    ///
+    /// Prefer this over `XdpEgress { vlan: Some(...), ..base }` field-init
+    /// syntax: the builder version is self-documenting at call sites and
+    /// keeps the struct's field surface internal to the crate.
+    #[must_use]
+    pub const fn with_vlan(mut self, vlan: u16) -> Self {
+        self.vlan = Some(vlan);
+        self
+    }
+
+    /// Returns this egress with any previously-attached VLAN cleared.
+    #[must_use]
+    pub const fn without_vlan(mut self) -> Self {
+        self.vlan = None;
+        self
     }
 }
+
+impl IpPacketEgress for XdpEgress {}

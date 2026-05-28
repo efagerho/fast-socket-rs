@@ -43,14 +43,18 @@ impl RingRange {
 pub struct RingMmap<T> {
     ptr: NonNull<u8>,
     len: usize,
-    /// Producer index.
-    pub producer: *mut AtomicU32,
-    /// Consumer index.
-    pub consumer: *mut AtomicU32,
-    /// Descriptor array.
-    pub desc: *mut T,
-    /// Ring flags word.
-    pub flags: *mut AtomicU32,
+    /// Producer index. Crate-private so misuse (concurrent producers,
+    /// out-of-order reads) is caught at the module boundary.
+    pub(crate) producer: *mut AtomicU32,
+    /// Consumer index. Crate-private — see `producer`.
+    pub(crate) consumer: *mut AtomicU32,
+    /// Descriptor array. Crate-private — only the cursor types
+    /// ([`RingProducer`] / [`RingConsumer`]) and the `raw_socket` glue should
+    /// touch the underlying descriptor pointer.
+    pub(crate) desc: *mut T,
+    /// Ring flags word. Crate-private; readers should go through
+    /// [`RingMmap::needs_wakeup`].
+    pub(crate) flags: *mut AtomicU32,
     _marker: PhantomData<T>,
 }
 
@@ -134,7 +138,12 @@ pub unsafe fn mmap_ring<T>(
 }
 
 /// Userspace producer cursor for FILL and TX rings.
-#[derive(Clone, Copy, Debug)]
+///
+/// Intentionally **not** `Copy` or `Clone`: the cursor owns the cached
+/// producer/consumer indexes that pair with the kernel-side atomics, and
+/// silently duplicating it would let two writers diverge their views of the
+/// ring (each thinks it "produced" up to its own `cached_producer`).
+#[derive(Debug)]
 pub struct RingProducer {
     producer: *mut AtomicU32,
     consumer: *mut AtomicU32,
@@ -207,13 +216,23 @@ impl RingProducer {
     /// Returns free descriptor slots based on the cached indexes.
     #[must_use]
     pub fn available(&self) -> u32 {
-        self.size
-            .saturating_sub(self.cached_producer.wrapping_sub(self.cached_consumer))
+        // `cached_producer.wrapping_sub(cached_consumer)` is the in-flight
+        // count, always `<= self.size` by ring invariant, so the outer
+        // subtraction never underflows. Matches the `wrapping_sub` style used
+        // by `produce` / `produce_many` so all three helpers compute the same
+        // quantity the same way.
+        let in_flight = self.cached_producer.wrapping_sub(self.cached_consumer);
+        debug_assert!(in_flight <= self.size);
+        self.size - in_flight
     }
 }
 
 /// Userspace consumer cursor for RX and COMPLETION rings.
-#[derive(Clone, Copy, Debug)]
+///
+/// Intentionally **not** `Copy` or `Clone` — see [`RingProducer`] for the
+/// rationale. Duplicating a consumer cursor would let two readers each
+/// "consume" the same entries from their cached view of the ring.
+#[derive(Debug)]
 pub struct RingConsumer {
     producer: *mut AtomicU32,
     consumer: *mut AtomicU32,

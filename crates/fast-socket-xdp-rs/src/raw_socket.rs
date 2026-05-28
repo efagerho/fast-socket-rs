@@ -44,8 +44,12 @@ impl RingSizes {
 }
 
 /// AF_XDP bind mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum XdpMode {
+    /// Let the kernel pick between zero-copy and copy modes based on driver
+    /// support. Equivalent to passing neither `XDP_ZEROCOPY` nor `XDP_COPY`.
+    #[default]
+    Auto,
     /// Request driver zero-copy mode.
     ZeroCopy,
     /// Request copy mode.
@@ -55,6 +59,7 @@ pub enum XdpMode {
 impl XdpMode {
     fn flag(self) -> u16 {
         match self {
+            Self::Auto => 0,
             Self::ZeroCopy => libc::XDP_ZEROCOPY,
             Self::Copy => libc::XDP_COPY,
         }
@@ -201,7 +206,14 @@ impl RawXdpSocket {
         let mask = sizes.fill - 1;
         for addr in pre_fill_frames {
             let Some(index) = fill_prod.produce() else {
-                break;
+                fill_prod.commit();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "pre_fill_frames exceeds FILL ring capacity {}",
+                        sizes.fill
+                    ),
+                ));
             };
             // SAFETY: index was reserved from the FILL ring producer.
             unsafe { fill_mmap.desc.add((index & mask) as usize).write(addr) };
@@ -289,7 +301,9 @@ impl RawXdpSocket {
     {
         self.fill_prod.sync(false);
         let mut written = 0;
-        let mask = self.sizes.fill.saturating_sub(1);
+        // `sizes.fill` is a non-zero power of two (RingSizes::validate), so
+        // `-1` cannot underflow and produces the canonical ring mask.
+        let mask = self.sizes.fill - 1;
         for addr in addrs {
             let Some(index) = self.fill_prod.produce() else {
                 break;
@@ -364,7 +378,7 @@ impl RawXdpSocket {
             return Ok(0);
         }
 
-        let mask = self.sizes.completion.saturating_sub(1);
+        let mask = self.sizes.completion - 1;
         let mut error = None;
         for offset in 0..range.count {
             let index = range.start.wrapping_add(offset);
@@ -411,7 +425,7 @@ impl RawXdpSocket {
         let Some(index) = self.tx_prod.produce() else {
             return false;
         };
-        let mask = self.sizes.tx.saturating_sub(1);
+        let mask = self.sizes.tx - 1;
         // SAFETY: index was reserved from the TX producer cursor.
         unsafe { self.tx_mmap.desc.add((index & mask) as usize).write(desc) };
         true
@@ -482,11 +496,16 @@ impl RawXdpSocket {
         }
     }
 
-    /// Wakes TX when NEED_WAKEUP is set.
+    /// Pokes the TX queue with a zero-length sendto doorbell.
+    ///
+    /// Earlier versions guarded on `tx_needs_wakeup()` first, but the kernel
+    /// can set that flag *after* userspace publishes descriptors and *before*
+    /// the next caller reads it. Skipping the doorbell in that race window
+    /// leaves the just-committed TX entries parked indefinitely. The canonical
+    /// xdpsock pattern is to always poke after publishing; transient errors
+    /// (EAGAIN / EBUSY / ENETDOWN) are tolerated below since the descriptors
+    /// are already in the ring and the next poke will retry.
     pub fn wake_tx(&self) -> io::Result<()> {
-        if !self.tx_needs_wakeup() {
-            return Ok(());
-        }
         // SAFETY: sendto with null buffer/zero length is the documented AF_XDP
         // doorbell nudge and does not retain pointers.
         let rc = unsafe {
