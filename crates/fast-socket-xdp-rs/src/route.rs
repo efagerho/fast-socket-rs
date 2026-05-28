@@ -1,6 +1,8 @@
 //! Queue-local route and neighbor snapshots for XDP egress resolution.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -15,8 +17,8 @@ use crate::netlink::{netlink_get_links, netlink_get_neighbors, netlink_get_route
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteSnapshot {
     routes_v4: Vec<Ipv4Route>,
-    neighbors_v4: HashMap<(IfIndex, Ipv4Addr), LinkAddr>,
-    interfaces: HashMap<IfIndex, InterfaceInfo>,
+    neighbors_v4: FxHashMap<(IfIndex, Ipv4Addr), LinkAddr>,
+    interfaces: FxHashMap<IfIndex, InterfaceInfo>,
 }
 
 /// IPv4 route entry.
