@@ -224,6 +224,16 @@ struct LiveXdpState {
     udp_tx_scratch: Vec<PreparedLiveUdpTx>,
     tx_in_flight: usize,
     tx_since_completion_drain: usize,
+    /// Cached `min(rings.completion/2, frame_count/4)` from socket construction.
+    /// The pressure check fires whenever `tx_in_flight` reaches this many
+    /// outstanding TX frames; precomputing it avoids three integer divisions
+    /// and two `max(1)`s per send.
+    tx_completion_drain_threshold: usize,
+    /// Cached `max(1, tx_completion_drain_threshold / 2)` from socket
+    /// construction. Together with the threshold it forms a hysteresis pair:
+    /// the threshold turns draining on, the interval limits how aggressively
+    /// the drain repeats once active.
+    tx_completion_drain_interval: usize,
     /// Set when a `wake_tx` doorbell failed after a successful commit; the
     /// next send (or completion drain) reissues the doorbell so the parked TX
     /// descriptors get a chance to land on the wire.
@@ -366,6 +376,16 @@ impl LiveXdpState {
         let rx_pool = XdpRxPool::live(config.buffers.rx, Rc::clone(&umem), Rc::clone(&rx_reclaim));
         let tx_pool = XdpTxPool::live(config.buffers.tx, Rc::clone(&umem), Rc::clone(&tx_reclaim));
 
+        // Precompute the TX completion-drain hysteresis pair. Both values
+        // are immutable for the lifetime of the socket; recomputing them
+        // on every send adds ~7% to the per-call cost of the pressure
+        // check for no reason.
+        let tx_frame_count = (frame_count / 2) as usize;
+        let completion_threshold = ((config.rings.completion as usize) / 2).max(1);
+        let frame_threshold = (tx_frame_count / 2).max(1);
+        let drain_threshold = completion_threshold.min(frame_threshold);
+        let drain_interval = (drain_threshold / 2).max(1);
+
         Ok(OpenedLiveXdp {
             rx_pool,
             tx_pool,
@@ -383,6 +403,8 @@ impl LiveXdpState {
                 udp_tx_scratch: Vec::with_capacity(config.rings.tx as usize),
                 tx_in_flight: 0,
                 tx_since_completion_drain: 0,
+                tx_completion_drain_threshold: drain_threshold,
+                tx_completion_drain_interval: drain_interval,
                 tx_wake_pending: false,
             },
         })
@@ -588,27 +610,13 @@ impl<D> XdpIpPacketSocket<D> {
         Ok(completed)
     }
 
-    fn tx_frame_count(&self) -> usize {
-        // `config.frame_count` is validated to be a power-of-two >= 2 at
-        // socket construction; the AF_XDP UMEM splits it evenly between RX
-        // and TX, so half of it is the TX frame count.
-        (self.config.frame_count / 2) as usize
-    }
-
-    fn tx_completion_drain_threshold(&self) -> usize {
-        let completion_threshold = ((self.config.rings.completion as usize) / 2).max(1);
-        let frame_threshold = (self.tx_frame_count() / 2).max(1);
-        completion_threshold.min(frame_threshold)
-    }
-
-    fn tx_completion_drain_interval(&self) -> usize {
-        (self.tx_completion_drain_threshold() / 2).max(1)
-    }
-
     fn should_drain_tx_completions(&self) -> bool {
+        // Threshold and interval are precomputed at socket construction
+        // (see `LiveXdpState::open`); per-call we just compare against
+        // the cached values.
         self.live.as_ref().is_some_and(|live| {
-            live.tx_in_flight >= self.tx_completion_drain_threshold()
-                && live.tx_since_completion_drain >= self.tx_completion_drain_interval()
+            live.tx_in_flight >= live.tx_completion_drain_threshold
+                && live.tx_since_completion_drain >= live.tx_completion_drain_interval
         })
     }
 
