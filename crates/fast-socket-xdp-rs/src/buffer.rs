@@ -236,9 +236,13 @@ impl<T: Send> MpscQueue<T> {
     }
 
     fn drain_into(&self, out: &mut Vec<T>) {
+        let mut drained = 0usize;
         while let Some(value) = self.inner.pop() {
             out.push(value);
-            self.len.fetch_sub(1, Ordering::Relaxed);
+            drained += 1;
+        }
+        if drained > 0 {
+            self.len.fetch_sub(drained, Ordering::Relaxed);
         }
     }
 }
