@@ -49,9 +49,17 @@ pub struct Progress {
     started: Instant,
     last: Instant,
     last_count: u64,
+    ticks_since_clock_check: u32,
 }
 
 impl Progress {
+    /// Sample `Instant::now()` (a vdso `clock_gettime` call) at most once
+    /// per this many ticks. At benchmark-scale call rates a per-tick clock
+    /// sample showed up as ~7% of total CPU in single-thread profiles; the
+    /// display gate only needs second-resolution timing, so reading the
+    /// clock every few thousand ticks is plenty.
+    const TICKS_BETWEEN_CLOCK_CHECKS: u32 = 1024;
+
     pub fn new(name: &'static str) -> Self {
         let now = Instant::now();
         Self {
@@ -59,14 +67,22 @@ impl Progress {
             started: now,
             last: now,
             last_count: 0,
+            ticks_since_clock_check: 0,
         }
     }
 
     pub fn tick(&mut self, count: u64) {
-        // Sample `now` once per tick so the rate window matches the interval
-        // between successive `self.last` values. The previous code called
-        // `Instant::now()` twice and stored a later instant than the one used
-        // to compute the rate, leaving a small unaccounted gap between ticks.
+        // Throttle the clock sample: most ticks are no-ops after the
+        // 1-second display gate below, so paying for a `clock_gettime`
+        // every tick is pure overhead.
+        self.ticks_since_clock_check = self.ticks_since_clock_check.wrapping_add(1);
+        if self.ticks_since_clock_check < Self::TICKS_BETWEEN_CLOCK_CHECKS {
+            return;
+        }
+        self.ticks_since_clock_check = 0;
+
+        // Sample `now` once so the rate window matches the interval between
+        // successive `self.last` values.
         let now = Instant::now();
         let elapsed = now.duration_since(self.last);
         if elapsed < Duration::from_secs(1) {

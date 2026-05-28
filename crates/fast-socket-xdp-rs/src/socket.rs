@@ -1012,14 +1012,29 @@ impl<D> XdpIpPacketSocket<D> {
             self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(packet_len as u64);
         }
 
-        // Always poke when we just committed descriptors AND clear any
-        // pending wake left over from a prior failure. Both paths use the
-        // same `tx_wake_pending` latch so the doorbell is never lost.
-        let needs_wake = accepted > 0
-            || self
-                .live
-                .as_ref()
-                .is_some_and(|live| live.tx_wake_pending);
+        // Skip the sendto doorbell when the kernel hasn't asked for it.
+        // The kernel sets `XDP_RING_NEED_WAKEUP` on `tx_prod->flags`
+        // whenever it parks the TX poll and needs userspace to kick it
+        // back; while the flag stays clear, the kernel is actively
+        // draining the TX ring and an extra sendto is pure syscall
+        // overhead. There is a small race where the kernel can set the
+        // flag *between* our check and the next publish, but a sustained
+        // sender re-evaluates the gate on the next batch and recovers
+        // within one iteration. End-of-stream callers must flush
+        // explicitly via [`UdpSocket::notify_tx`], which still issues an
+        // unconditional doorbell.
+        //
+        // Always retry a pending wake from a prior failure; that path is
+        // already off the fast lane.
+        let live_needs_wakeup = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.raw.tx_needs_wakeup());
+        let pending_retry = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.tx_wake_pending);
+        let needs_wake = pending_retry || (accepted > 0 && live_needs_wakeup);
         if needs_wake {
             let live = self
                 .live
@@ -1450,12 +1465,14 @@ where
                 }
             }
 
-            // Drain any wake we owe from a prior call before deciding whether
-            // we need to issue a fresh one. Either way, after a successful
-            // commit we always poke; the kernel may have flushed the
-            // descriptors already, but skipping the doorbell would risk
-            // parking them forever.
-            let needs_wake = accepted > 0 || live.tx_wake_pending;
+            // Gate the doorbell on `XDP_RING_NEED_WAKEUP`: while the
+            // kernel is actively draining the TX ring the flag stays
+            // clear and the sendto is pure syscall overhead. See
+            // `send_inner` for the race-window / end-of-stream notes; the
+            // same reasoning applies here. Always retry a pending wake
+            // left over from a prior failure.
+            let needs_wake = live.tx_wake_pending
+                || (accepted > 0 && live.raw.tx_needs_wakeup());
             if needs_wake {
                 match live.raw.wake_tx() {
                     Ok(()) => live.tx_wake_pending = false,
