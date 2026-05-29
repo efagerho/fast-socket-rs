@@ -98,17 +98,57 @@ pub trait RawDevice {
     /// Stable identity for the underlying NIC port.
     fn ifindex(&self) -> IfIndex;
 
+    /// NIC RX queues this socket is bound to.
+    ///
+    /// Single-queue backends return a one-element slice; an aggregate socket
+    /// returns all of its member queues. The per-queue methods below
+    /// ([`queue_affinity`](Self::queue_affinity),
+    /// [`queue_numa_node`](Self::queue_numa_node), [`stats`](Self::stats))
+    /// accept any id returned here.
+    fn nic_queues(&self) -> &[QueueId];
+
     /// Static capability bitset for this port.
     fn capabilities(&self) -> Capabilities;
 
-    /// Per-queue affinity hint.
+    /// Affinity hint for one NIC queue in [`nic_queues`](Self::nic_queues).
     fn queue_affinity(&self, queue: QueueId) -> QueueAffinity;
 
-    /// NUMA node of the queue's DMA-visible memory.
+    /// NUMA node of one NIC queue's DMA-visible memory.
     fn queue_numa_node(&self, queue: QueueId) -> Option<NumaNode>;
 
-    /// Snapshot of cumulative counters for this device or queue.
+    /// Snapshot of cumulative counters for one NIC queue in
+    /// [`nic_queues`](Self::nic_queues).
+    ///
+    /// For an aggregate socket this returns the counters for member queue
+    /// `queue` alone; use [`total_stats`](Self::total_stats) for socket-level
+    /// totals. Single-queue backends' per-queue stats already are the socket
+    /// totals.
     fn stats(&self, queue: QueueId) -> RawDeviceStats;
+
+    /// Sum of [`stats`](Self::stats) across every queue in
+    /// [`nic_queues`](Self::nic_queues).
+    ///
+    /// Convenience for socket-level totals; single-queue backends sum a single
+    /// entry.
+    fn total_stats(&self) -> RawDeviceStats {
+        let mut total = RawDeviceStats::default();
+        for &queue in self.nic_queues() {
+            let stats = self.stats(queue);
+            total.rx_packets = total.rx_packets.saturating_add(stats.rx_packets);
+            total.rx_bytes = total.rx_bytes.saturating_add(stats.rx_bytes);
+            total.tx_packets = total.tx_packets.saturating_add(stats.tx_packets);
+            total.tx_bytes = total.tx_bytes.saturating_add(stats.tx_bytes);
+            total.dropped_fragments = total
+                .dropped_fragments
+                .saturating_add(stats.dropped_fragments);
+            total.dropped_oversize = total.dropped_oversize.saturating_add(stats.dropped_oversize);
+            total.dropped_rx_oversize = total
+                .dropped_rx_oversize
+                .saturating_add(stats.dropped_rx_oversize);
+            total.ring_full = total.ring_full.saturating_add(stats.ring_full);
+        }
+        total
+    }
 
     /// Re-reads the device MTU on administrative change.
     fn refresh_mtu(&mut self) -> Result<u32, Error>;
@@ -120,11 +160,16 @@ mod tests {
 
     struct MockDevice {
         mtu: u32,
+        queues: [QueueId; 1],
     }
 
     impl RawDevice for MockDevice {
         fn ifindex(&self) -> IfIndex {
             IfIndex::new(3)
+        }
+
+        fn nic_queues(&self) -> &[QueueId] {
+            &self.queues
         }
 
         fn capabilities(&self) -> Capabilities {
@@ -153,15 +198,20 @@ mod tests {
 
     #[test]
     fn raw_device_side_api_exposes_capabilities_and_stats() {
-        let mut device = MockDevice { mtu: 1500 };
+        let mut device = MockDevice {
+            mtu: 1500,
+            queues: [QueueId::new(0)],
+        };
 
         assert_eq!(device.ifindex(), IfIndex::new(3));
+        assert_eq!(device.nic_queues(), &[QueueId::new(0)]);
         assert!(device.capabilities().contains(Capabilities::RSS));
         assert_eq!(
             device.queue_affinity(QueueId::new(0)),
             QueueAffinity::Core(5)
         );
         assert_eq!(device.stats(QueueId::new(0)).rx_packets, 10);
+        assert_eq!(device.total_stats().rx_packets, 10);
         assert_eq!(device.refresh_mtu().unwrap(), 1500);
     }
 }

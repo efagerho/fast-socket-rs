@@ -66,6 +66,18 @@ impl XdpMode {
     }
 }
 
+/// How a [`RawXdpSocket`] obtains its UMEM at bind time.
+enum UmemBinding<'a> {
+    /// This socket registers the UMEM via `XDP_UMEM_REG` and binds as its owner.
+    Owner {
+        umem: &'a Umem,
+        umem_headroom: u32,
+    },
+    /// This socket shares an already-registered UMEM owned by `shared_fd`,
+    /// skipping `XDP_UMEM_REG` and binding with `XDP_SHARED_UMEM`.
+    Shared { shared_fd: RawFd },
+}
+
 /// Kernel-facing AF_XDP socket and ring mappings.
 #[derive(Debug)]
 pub struct RawXdpSocket {
@@ -115,6 +127,66 @@ impl RawXdpSocket {
         umem_headroom: u32,
         pre_fill_frames: impl IntoIterator<Item = u64>,
     ) -> io::Result<Self> {
+        Self::new_inner(
+            if_index,
+            queue_id,
+            UmemBinding::Owner {
+                umem,
+                umem_headroom,
+            },
+            sizes,
+            mode,
+            pre_fill_frames,
+        )
+    }
+
+    /// Opens, configures, mmaps, prefills, and binds an AF_XDP socket that
+    /// **shares** an already-registered UMEM owned by another socket.
+    ///
+    /// This is the `members[1..]` path for an aggregate socket: it skips
+    /// `XDP_UMEM_REG` (the owner socket at `shared_fd` already registered the
+    /// mapping), sets up this socket's own FILL/COMPLETION/RX/TX rings, and
+    /// binds with **only** `XDP_SHARED_UMEM`, pointing `sxdp_shared_umem_fd` at
+    /// `shared_fd`. The shared member inherits the owner's copy/zero-copy mode
+    /// and need-wakeup setting from the kernel; setting any mode or
+    /// `XDP_USE_NEED_WAKEUP` flag on a shared bind is rejected with EINVAL. The
+    /// caller owns the shared UMEM
+    /// mapping and the frame pool that feeds `pre_fill_frames`; this socket
+    /// holds no reference to either, so `shared_fd` must outlive the bind call
+    /// only (the kernel pins the UMEM internally once bound).
+    ///
+    /// `shared_fd` must be the fd of a socket bound to the *same* UMEM, and the
+    /// caller must ensure the frame addresses passed across all members of the
+    /// shared UMEM are disjoint while in flight.
+    pub fn new_shared_umem(
+        if_index: u32,
+        queue_id: u32,
+        shared_fd: RawFd,
+        sizes: RingSizes,
+        mode: XdpMode,
+        pre_fill_frames: impl IntoIterator<Item = u64>,
+    ) -> io::Result<Self> {
+        Self::new_inner(
+            if_index,
+            queue_id,
+            UmemBinding::Shared { shared_fd },
+            sizes,
+            mode,
+            pre_fill_frames,
+        )
+    }
+
+    /// Shared open/configure/mmap/bind body for both the UMEM-owner and
+    /// shared-UMEM paths. The only differences are whether `XDP_UMEM_REG` runs
+    /// and the bind-time `XDP_SHARED_UMEM` flag / `sxdp_shared_umem_fd`.
+    fn new_inner(
+        if_index: u32,
+        queue_id: u32,
+        binding: UmemBinding<'_>,
+        sizes: RingSizes,
+        mode: XdpMode,
+        pre_fill_frames: impl IntoIterator<Item = u64>,
+    ) -> io::Result<Self> {
         sizes.validate()?;
 
         // SAFETY: libc socket call returns an owned fd on success.
@@ -125,15 +197,33 @@ impl RawXdpSocket {
         // SAFETY: fd was just returned by socket and is uniquely owned.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
-        let reg = libc::xdp_umem_reg {
-            addr: umem.as_ptr() as u64,
-            len: umem.len() as u64,
-            chunk_size: umem.frame_size(),
-            headroom: umem_headroom,
-            flags: 0,
-            tx_metadata_len: 0,
+        // Owner registers the UMEM and binds with the requested copy/zero-copy
+        // mode plus XDP_USE_NEED_WAKEUP. Shared members skip XDP_UMEM_REG and
+        // bind with *only* XDP_SHARED_UMEM pointing at the owner fd: they MUST
+        // NOT set XDP_COPY/XDP_ZEROCOPY *or* XDP_USE_NEED_WAKEUP. The kernel
+        // rejects any of those on a shared bind with EINVAL (verified on a
+        // 6.x/7.0 ice host) — a shared member inherits the owner pool's mode
+        // and need-wakeup setting automatically in `xp_assign_dev_shared`.
+        // (Note: this differs from the original design note, which incorrectly
+        // listed XDP_USE_NEED_WAKEUP on the member bind.)
+        let (shared_umem_fd, bind_flags) = match binding {
+            UmemBinding::Owner {
+                umem,
+                umem_headroom,
+            } => {
+                let reg = libc::xdp_umem_reg {
+                    addr: umem.as_ptr() as u64,
+                    len: umem.len() as u64,
+                    chunk_size: umem.frame_size(),
+                    headroom: umem_headroom,
+                    flags: 0,
+                    tx_metadata_len: 0,
+                };
+                setsockopt(fd.as_raw_fd(), libc::SOL_XDP, libc::XDP_UMEM_REG, &reg)?;
+                (0u32, libc::XDP_USE_NEED_WAKEUP | mode.flag())
+            }
+            UmemBinding::Shared { shared_fd } => (shared_fd as u32, libc::XDP_SHARED_UMEM),
         };
-        setsockopt(fd.as_raw_fd(), libc::SOL_XDP, libc::XDP_UMEM_REG, &reg)?;
 
         for (opt, size) in [
             (libc::XDP_UMEM_COMPLETION_RING, sizes.completion),
@@ -222,10 +312,10 @@ impl RawXdpSocket {
 
         let sxdp = libc::sockaddr_xdp {
             sxdp_family: libc::AF_XDP as libc::sa_family_t,
-            sxdp_flags: libc::XDP_USE_NEED_WAKEUP | mode.flag(),
+            sxdp_flags: bind_flags,
             sxdp_ifindex: if_index,
             sxdp_queue_id: queue_id,
-            sxdp_shared_umem_fd: 0,
+            sxdp_shared_umem_fd: shared_umem_fd,
         };
         // SAFETY: sockaddr pointer is valid for the duration of bind.
         let rc = unsafe {
@@ -289,6 +379,43 @@ impl RawXdpSocket {
     /// Clones the AF_XDP fd for readiness-driver ownership.
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
+    }
+
+    /// Enables preferred busy polling on this socket fd.
+    ///
+    /// Sets `SO_PREFER_BUSY_POLL`, `SO_BUSY_POLL` (busy-poll time in
+    /// microseconds), and `SO_BUSY_POLL_BUDGET` (max packets drained per
+    /// busy-poll). This is the per-socket half of the AF_XDP busy-poll recipe;
+    /// the socket already binds with `XDP_USE_NEED_WAKEUP`, which preferred
+    /// busy polling requires. Per-netdev NAPI hard-IRQ deferral
+    /// (`napi_defer_hard_irqs` / `gro_flush_timeout`) is a separate
+    /// device-level concern configured by the factory, not here.
+    ///
+    /// `SO_PREFER_BUSY_POLL` and `SO_BUSY_POLL_BUDGET` require `CAP_NET_ADMIN`;
+    /// callers without it will see `EPERM`.
+    pub fn configure_busy_poll(&self, busy_poll_us: u32, budget: u32) -> io::Result<()> {
+        let enable: libc::c_int = 1;
+        setsockopt(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PREFER_BUSY_POLL,
+            &enable,
+        )?;
+        let busy_poll_us = clamp_to_c_int("busy_poll_us", busy_poll_us)?;
+        setsockopt(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &busy_poll_us,
+        )?;
+        let budget = clamp_to_c_int("busy_poll budget", budget)?;
+        setsockopt(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL_BUDGET,
+            &budget,
+        )?;
+        Ok(())
     }
 
     /// Pushes frame addresses into the FILL ring.
@@ -606,6 +733,15 @@ unsafe fn copy_ring_to_vec<T: Copy>(ring: *const T, size: u32, range: RingRange,
     unsafe { out.set_len(old_len + count) };
 }
 
+fn clamp_to_c_int(name: &str, value: u32) -> io::Result<libc::c_int> {
+    libc::c_int::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("AF_XDP {name} value {value} exceeds c_int range"),
+        )
+    })
+}
+
 fn validate_ring_size(name: &str, size: u32) -> io::Result<()> {
     if size.is_power_of_two() {
         return Ok(());
@@ -641,5 +777,19 @@ mod tests {
             non_power_of_two.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn new_shared_umem_validates_ring_sizes_before_touching_the_kernel() {
+        // Invalid ring sizes must be rejected up front, before any AF_XDP
+        // syscall runs, so this is checkable without a NIC. `shared_fd` is
+        // never dereferenced on this path.
+        let bad = RingSizes {
+            fill: 3,
+            ..RingSizes::default()
+        };
+        let err = RawXdpSocket::new_shared_umem(1, 0, -1, bad, XdpMode::Auto, std::iter::empty())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

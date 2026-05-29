@@ -50,8 +50,8 @@ impl IpPacketSocket for CaptureIpPacketSocket {
     type Driver = BusyPollDriver;
     type RecvMeta = IpPacketRecvMeta;
 
-    fn queue_id(&self) -> fast_socket_rs::QueueId {
-        fast_socket_rs::QueueId::new(0)
+    fn socket_id(&self) -> fast_socket_rs::SocketId {
+        fast_socket_rs::SocketId::new(0)
     }
 
     fn mtu(&self) -> usize {

@@ -5,8 +5,11 @@
 //! intentionally has no dependency on OS, AF_XDP, or DPDK crates.
 
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// `unsafe` is denied crate-wide and permitted only inside the thread-pinning
+// helpers in `affinity`, which must issue the `sched_setaffinity` syscall.
+#![deny(unsafe_code)]
 
+pub mod affinity;
 pub mod batch;
 pub mod buffer;
 pub mod device;
@@ -17,6 +20,10 @@ pub mod route;
 pub mod sys;
 pub mod udp;
 
+pub use affinity::{
+    PinOutcome, pin_current_thread_to_affinity, pin_current_thread_to_cpu,
+    pin_current_thread_to_ip_packet_socket, pin_current_thread_to_socket,
+};
 pub use batch::{RecvBatch, SendError, TxSlot};
 pub use buffer::{
     BufferAccessError, BufferCapabilities, BufferLayout, BufferLayoutError, BufferPool,
@@ -38,7 +45,7 @@ pub use route::{
     EgressResolver, LinkAddr, LinkAddrParseError, NeighborId, NeighborTable, RouteHop, RouteId,
     RouteTable, TunnelId, TunnelTable, TunnelTarget,
 };
-pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId};
+pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId, SocketId};
 pub use udp::{
     BusyPollUdpSocket, EcnCodepoint, ReadinessUdpSocket, UdpCapabilities, UdpReceive, UdpRecvMeta,
     UdpRxBuffer, UdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut,

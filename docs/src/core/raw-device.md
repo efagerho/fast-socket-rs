@@ -6,11 +6,19 @@ monitoring, and diagnostic facts, but send and receive do not require it.
 The trait reports:
 
 - the operating-system interface index;
+- the NIC RX queues the socket is bound to (`nic_queues()` — one entry for a
+  single-queue backend, several for an aggregate socket);
 - static device capabilities;
-- queue CPU-affinity hints;
-- queue NUMA-node hints;
-- cumulative per-device or per-queue statistics;
+- per-queue CPU-affinity hints;
+- per-queue NUMA-node hints;
+- cumulative per-queue statistics, plus a `total_stats()` sum across
+  `nic_queues()`;
 - refreshed MTU after administrative changes.
+
+Because socket identity (`UdpSocket::socket_id` / `IpPacketSocket::socket_id`)
+is now distinct from a NIC queue, `nic_queues()` is the canonical way to learn
+which queues back a socket, and `queue_affinity`, `queue_numa_node`, and `stats`
+all resolve per NIC queue id returned from it.
 
 Keeping this separate from `IpPacketSocket` keeps device-control branches out of
 simple IP packet paths. Generic UDP code gets device APIs only through concrete

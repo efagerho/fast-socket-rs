@@ -4,7 +4,8 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    BufferPool, Error, PacketBufferMut, PollDriver, QueueId, RecvBatch, SendError, TxSlot,
+    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId,
+    TxSlot,
 };
 use crate::{BusyPollDriverMode, ReadinessDriverMode};
 
@@ -118,11 +119,24 @@ pub trait UdpSocket {
     /// Receive metadata type delivered by this socket.
     type RecvMeta;
 
-    /// Returns the queue identifier owned by this socket.
-    fn queue_id(&self) -> QueueId;
+    /// Returns the logical identity of this socket.
+    ///
+    /// Unique among the sockets a factory hands out. The backing NIC queues are
+    /// reported by [`RawDevice::nic_queues`](crate::RawDevice::nic_queues), not
+    /// this method.
+    fn socket_id(&self) -> SocketId;
 
     /// Returns the maximum UDP payload length accepted on transmit.
     fn mtu(&self) -> usize;
+
+    /// Returns the CPU(s) a worker owning this socket should pin to.
+    ///
+    /// Defaults to [`QueueAffinity::Any`] (no hint). Backends that know their
+    /// target core override this; see
+    /// [`pin_current_thread_to_socket`](crate::pin_current_thread_to_socket).
+    fn worker_affinity(&self) -> QueueAffinity {
+        QueueAffinity::Any
+    }
 
     /// Returns UDP socket capabilities.
     fn capabilities(&self) -> UdpCapabilities {
@@ -303,8 +317,8 @@ mod tests {
         type Driver = BusyPollDriver;
         type RecvMeta = UdpRecvMeta;
 
-        fn queue_id(&self) -> QueueId {
-            QueueId::new(7)
+        fn socket_id(&self) -> SocketId {
+            SocketId::new(7)
         }
 
         fn mtu(&self) -> usize {
@@ -379,7 +393,7 @@ mod tests {
     fn udp_socket_trait_surface_accepts_mock_backend() {
         let mut socket = MockUdpSocket::new();
         assert_busy_poll_udp_socket(&socket);
-        assert_eq!(socket.queue_id(), QueueId::new(7));
+        assert_eq!(socket.socket_id(), SocketId::new(7));
 
         let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999).into();
         let packet = PacketBufMut::copy_from_slice(b"ping").freeze();

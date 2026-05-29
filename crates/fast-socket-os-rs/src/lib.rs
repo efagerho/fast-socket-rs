@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use fast_socket_rs::{
     BufferLayout, BufferPool, DeviceError, DeviceErrorKind, Error, IfIndex, PacketBuffer,
-    QueueAffinity, QueueId, ReadinessDriver, ReadinessSource, RecvBatch, SendError, TxSlot,
-    UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, WaitOutcome, WakeHandle,
+    QueueAffinity, QueueId, ReadinessDriver, ReadinessSource, RecvBatch, SendError, SocketId,
+    TxSlot, UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, WaitOutcome,
+    WakeHandle,
 };
 
 pub use buffer::{OsBufferPool, OsPacketBuf, OsPacketBufMut};
@@ -385,8 +386,12 @@ impl UdpSocket for OsUdpSocket {
     type Driver = ReadinessDriver<OsReadinessSource>;
     type RecvMeta = UdpRecvMeta;
 
-    fn queue_id(&self) -> QueueId {
-        self.queue_id
+    fn socket_id(&self) -> SocketId {
+        SocketId::new(self.queue_id.get())
+    }
+
+    fn worker_affinity(&self) -> QueueAffinity {
+        self.queue_affinity
     }
 
     fn mtu(&self) -> usize {
@@ -1439,7 +1444,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(socket.if_index(), Some(IfIndex::new(12)));
-        assert_eq!(socket.queue_id(), QueueId::new(3));
+        assert_eq!(socket.socket_id(), SocketId::new(3));
     }
 
     #[test]

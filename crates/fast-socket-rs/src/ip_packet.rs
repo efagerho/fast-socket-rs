@@ -4,8 +4,8 @@ use core::num::NonZeroU16;
 
 use crate::route::{NeighborId, RouteId};
 use crate::{
-    BufferPool, BusyPollDriverMode, Error, IpFamily, Mixed, PacketBufferMut, PollDriver, QueueId,
-    ReadinessDriverMode, RecvBatch, SendError, TxSlot,
+    BufferPool, BusyPollDriverMode, Error, IpFamily, Mixed, PacketBufferMut, PollDriver,
+    QueueAffinity, ReadinessDriverMode, RecvBatch, SendError, SocketId, TxSlot,
 };
 
 /// IP version carried by an IP packet.
@@ -223,11 +223,24 @@ pub trait IpPacketSocket {
     /// Receive metadata type delivered by this socket.
     type RecvMeta;
 
-    /// Returns the queue identifier owned by this socket.
-    fn queue_id(&self) -> QueueId;
+    /// Returns the logical identity of this socket.
+    ///
+    /// Unique among the sockets a factory hands out. The backing NIC queues are
+    /// reported by [`RawDevice::nic_queues`](crate::RawDevice::nic_queues), not
+    /// this method.
+    fn socket_id(&self) -> SocketId;
 
     /// Returns the IP-layer MTU for complete datagrams passed across this trait.
     fn mtu(&self) -> usize;
+
+    /// Returns the CPU(s) a worker owning this socket should pin to.
+    ///
+    /// Defaults to [`QueueAffinity::Any`] (no hint). Backends that know their
+    /// target core override this; see
+    /// [`pin_current_thread_to_ip_packet_socket`](crate::pin_current_thread_to_ip_packet_socket).
+    fn worker_affinity(&self) -> QueueAffinity {
+        QueueAffinity::Any
+    }
 
     /// Returns the socket-owned receive buffer pool.
     fn rx_pool(&self) -> &Self::RxPool;
@@ -325,8 +338,8 @@ mod tests {
         type Driver = BusyPollDriver;
         type RecvMeta = IpPacketRecvMeta;
 
-        fn queue_id(&self) -> QueueId {
-            QueueId::new(1)
+        fn socket_id(&self) -> SocketId {
+            SocketId::new(1)
         }
 
         fn mtu(&self) -> usize {

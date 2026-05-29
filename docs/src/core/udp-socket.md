@@ -11,7 +11,8 @@ pub trait UdpSocket {
     type Driver: PollDriver;
     type RecvMeta;
 
-    fn queue_id(&self) -> QueueId;
+    fn socket_id(&self) -> SocketId;
+    fn worker_affinity(&self) -> QueueAffinity; // default: QueueAffinity::Any
     fn mtu(&self) -> usize;
     fn capabilities(&self) -> UdpCapabilities;
 
@@ -57,9 +58,13 @@ Associated types keep buffer pools, polling mode, and receive metadata
 statically known for each backend. Generic code monomorphizes around those
 types instead of carrying trait objects or dynamic packet state in the hot path.
 
-`queue_id()` identifies the socket's queue. `mtu()` gives the maximum UDP
-payload length accepted by transmit. `capabilities()` defaults to no optional
-UDP offloads, so backends opt in only to features they honor.
+`socket_id()` returns the socket's logical identity (a `SocketId`), distinct
+from the NIC queues backing it — those are reported by `RawDevice::nic_queues()`.
+`worker_affinity()` reports the CPU(s) a worker owning the socket should pin to,
+defaulting to `QueueAffinity::Any` (no hint); pass it to
+`pin_current_thread_to_socket()`. `mtu()` gives the maximum UDP payload length
+accepted by transmit. `capabilities()` defaults to no optional UDP offloads, so
+backends opt in only to features they honor.
 
 `UdpTransmit<B>` contains a payload packet, remote destination, and optional
 source IP, ECN, and GSO segment-size hints. `UdpReceive<B, M>` contains a

@@ -13,8 +13,8 @@ use fast_socket_rs::{
     EgressResolver, Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
     IpPacketTransmit, IpVersion, NumaNode, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     PollDriver, QueueAffinity, QueueId, RawDevice, RawDeviceStats, ReadinessDriver,
-    ReadinessSource, RecvBatch, SendError, TxSlot, UdpCapabilities, UdpReceive, UdpRecvMeta,
-    UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
+    ReadinessSource, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
+    UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -81,6 +81,10 @@ impl ReadinessSource for XdpReadinessSource {
 #[derive(Debug)]
 pub struct XdpIpPacketSocket<D = BusyPollDriver> {
     config: XdpIpPacketSocketConfig,
+    /// Single backing NIC queue, stored so [`RawDevice::nic_queues`] can return
+    /// a slice. Always one element for this single-queue socket; aggregate
+    /// sockets carry several.
+    nic_queues: [QueueId; 1],
     rx_pool: XdpRxPool,
     tx_pool: XdpTxPool,
     driver: D,
@@ -532,7 +536,9 @@ const MAX_PENDING_TX_FRAMES: usize = 4096;
 fn construct_state<D>(config: XdpIpPacketSocketConfig, driver: D) -> XdpIpPacketSocket<D> {
     let rx_capacity = config.rings.rx as usize;
     let tx_capacity = config.rings.tx as usize;
+    let nic_queues = [config.queue_id];
     XdpIpPacketSocket {
+        nic_queues,
         rx_pool: XdpRxPool::with_heap_capacity(config.buffers.rx, rx_capacity),
         tx_pool: XdpTxPool::with_heap_capacity(config.buffers.tx, tx_capacity),
         routes: XdpLocalRoutes::new(config.route_snapshot.clone()),
@@ -1660,8 +1666,12 @@ where
     type Driver = D;
     type RecvMeta = UdpRecvMeta;
 
-    fn queue_id(&self) -> QueueId {
-        self.ip.queue_id()
+    fn socket_id(&self) -> SocketId {
+        IpPacketSocket::socket_id(&self.ip)
+    }
+
+    fn worker_affinity(&self) -> QueueAffinity {
+        IpPacketSocket::worker_affinity(&self.ip)
     }
 
     fn mtu(&self) -> usize {
@@ -1747,8 +1757,12 @@ where
     type Driver = D;
     type RecvMeta = XdpIpPacketRecvMeta;
 
-    fn queue_id(&self) -> QueueId {
-        self.config.queue_id
+    fn socket_id(&self) -> SocketId {
+        SocketId::new(self.config.queue_id.get())
+    }
+
+    fn worker_affinity(&self) -> QueueAffinity {
+        RawDevice::queue_affinity(self, self.config.queue_id)
     }
 
     fn mtu(&self) -> usize {
@@ -1831,6 +1845,10 @@ where
         self.config.ifindex
     }
 
+    fn nic_queues(&self) -> &[QueueId] {
+        &self.nic_queues
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities::NONE
     }
@@ -1863,6 +1881,10 @@ where
 {
     fn ifindex(&self) -> IfIndex {
         RawDevice::ifindex(&self.ip)
+    }
+
+    fn nic_queues(&self) -> &[QueueId] {
+        RawDevice::nic_queues(&self.ip)
     }
 
     fn capabilities(&self) -> Capabilities {

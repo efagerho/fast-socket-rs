@@ -333,6 +333,9 @@ dependencies = [
 [[package]]
 name = "fast-socket-rs"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "fast-socket-xdp-ebpf"

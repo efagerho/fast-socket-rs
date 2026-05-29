@@ -56,6 +56,33 @@ impl QueueId {
     }
 }
 
+/// Logical socket identity, distinct from a NIC [`QueueId`].
+///
+/// A live socket used to be 1:1 with a NIC queue, so the queue id doubled as
+/// the socket's identity. Aggregate sockets (one logical socket fed by several
+/// NIC queues over a shared UMEM) break that 1:1, so socket identity is carried
+/// separately by this type. It is unique among the sockets a factory hands out;
+/// the backing NIC queues are reported by
+/// [`RawDevice::nic_queues`](crate::RawDevice::nic_queues). Single-queue
+/// backends assign one too.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct SocketId(u32);
+
+impl SocketId {
+    /// Creates a logical socket identity from its raw numeric value.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw numeric socket identity.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// NUMA node identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
