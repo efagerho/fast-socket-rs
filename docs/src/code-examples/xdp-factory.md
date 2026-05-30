@@ -5,22 +5,38 @@ in two phases (matching the `Send` builder / `!Send` live socket split):
 
 1. **Phase 1 — any thread.** Discover the interface's queues, attach the eBPF
    program once per interface, fill the port filter, and partition the claimed
-   queues into `threads(T)` contiguous blocks. Produces a `Vec<XdpWorkerPlan>`
-   — one plan (one aggregate socket) per worker thread. Plans are `Send`.
+   queues **by NUMA node** (see below). Produces a `Vec<XdpWorkerPlan>` — one plan
+   (one aggregate socket) per worker thread. Plans are `Send`.
 2. **Phase 2 — per worker thread.** Move one plan to a thread and call an
-   `open_*` opener. The opener pins the thread to `plan.cpu()` (the lowest member
-   IRQ CPU) and opens that worker's `XdpUdpAggregate` / `XdpIpPacketAggregate` —
-   all member queues sharing one NUMA-local UMEM.
+   `open_*` opener. The opener pins the thread to `plan.cpu()` — a dedicated,
+   NUMA-local core — and opens that worker's `XdpUdpAggregate` /
+   `XdpIpPacketAggregate`, all member queues sharing one NUMA-local UMEM.
 
-The whole partition is driven by one knob, `threads(T)`: `T` must divide the
-claimed queue count `Q`. `threads(1)` is one aggregate over every claimed queue,
-`threads(Q)` is one single-queue socket per queue, and any value in between fans
-`Q/T` queues into each worker. If `threads` is omitted it defaults to `Q`.
+### How queues map to workers
 
-> One shared UMEM binds to one netdev, so every queue in a block must be on the
-> same interface. On a bond, choose a `threads` value whose blocks stay within a
-> single slave (or run one factory per slave); a block that would span slaves is
-> a `build()` error.
+`build()`:
+
+1. maps each claimed queue to the NUMA node it lives on (the node of its IRQ CPU,
+   falling back to the interface's device node);
+2. splits the `threads` budget evenly across those nodes (`threads / nodes`);
+3. within each node, spreads the node's queues evenly over that many **dedicated,
+   node-local cores** — one aggregate socket per core.
+
+So `threads` is the knob: `threads(2)` on a single-node 2-slave bond is one
+aggregate per slave; larger values fan fewer queues into each (more) workers. If
+`threads` is omitted it defaults to the queue count (one queue per worker).
+
+A worker only ever drives queues on its own NUMA node, each worker pins to a
+distinct node-local core, and each worker stays single-interface. Under preferred
+busy polling NAPI runs inline on the busy-polling core and hard IRQs are
+deferred, so `plan.cpu()` is a dedicated node-local core, *not* the queue's IRQ
+core — the IRQ core doesn't matter.
+
+`build()` errors if `threads` isn't divisible by the number of NUMA nodes the
+queues span, if a node's queue count isn't divisible by its share of threads, or
+if a block would span interfaces (one shared UMEM binds one netdev — e.g.
+`threads(1)` across a bond's two slaves errors; use `threads(2)` or run one
+factory per slave).
 
 ## Sender: blast across `--threads` aggregates
 
@@ -95,6 +111,50 @@ let builder = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?
 let cpus = builder.irq_cpu_count()?;     // one aggregate per IRQ CPU
 let factory = builder.threads(cpus as usize).port_filter(PortFilter::AllIp).build()?;
 ```
+
+**Sizing — more threads is not always more throughput.** Each worker
+round-robins its queues, overlapping their TX/RX rings so the NIC's completion
+latency stays hidden. With only one queue per worker (`threads` == queue count)
+there is nothing to overlap: the worker stalls on that queue's completions and
+degenerates into a busy-spin, so peak throughput is usually reached with a
+*handful* of queues per worker, not one. Tune `threads` to where the NIC
+saturates rather than maxing it.
+
+## Escape hatches
+
+If the default placement isn't what you want, there are two override points.
+
+**1. Custom core assignment.** Keep the NUMA grouping and single-interface
+blocks, but choose the core yourself. The closure gets the worker's NUMA node,
+that node's CPU ids, and the worker's 0-based index on the node, and returns a
+core (which must be one of those CPUs):
+
+```rust,ignore
+let factory = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?
+    .threads(8)
+    .core_assignment(|_node, cpus, worker_index| cpus[(worker_index * 2) % cpus.len()])
+    .build()?;
+```
+
+**2. Build plans by hand (bypass the factory).** For full control over queue
+grouping and placement, construct `XdpWorkerPlan`s directly and drive them with
+the same `open_*` openers:
+
+```rust,ignore
+let program = XdpProgramHandle::load(ifindex.get(), AttachMode::Default, None)?;
+let config = XdpIpPacketSocketConfig {
+    ifindex,
+    attached_program: Some(program),
+    ..Default::default()
+};
+// queues must all be on config.ifindex; cpu is the core open_* pins to.
+let plan = XdpWorkerPlan::new(config, vec![QueueId::new(0), QueueId::new(1)], /*cpu*/ 3, numa);
+let mut aggregate = plan.open_ip_packet_busy_poll()?;
+```
+
+(The aggregate openers `XdpUdpAggregate::open_busy_poll` /
+`XdpIpPacketAggregate::open_busy_poll` are also public if you don't want plans at
+all.)
 
 ## Other knobs
 

@@ -176,6 +176,84 @@ pub fn numa_node_for_interface(iface: &str) -> io::Result<NumaNode> {
     })
 }
 
+/// Returns the online CPU ids on `node`, parsed from
+/// `/sys/devices/system/node/node{N}/cpulist`.
+///
+/// Used by the factory to hand each worker a dedicated, NUMA-local core. Under
+/// preferred busy polling the queue's IRQ core is not where the hot work runs
+/// (NAPI runs inline on the busy-polling worker), so only the NUMA node — not
+/// the specific IRQ CPU — matters for placement.
+pub fn cpus_for_numa_node(node: NumaNode) -> io::Result<Vec<u32>> {
+    let path = format!("/sys/devices/system/node/node{}/cpulist", node.get());
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| io::Error::new(error.kind(), format!("read {path}: {error}")))?;
+    parse_cpu_list(raw.trim())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {error}")))
+}
+
+/// Returns the online NUMA node ids, parsed from
+/// `/sys/devices/system/node/online`.
+pub fn online_numa_nodes() -> io::Result<Vec<NumaNode>> {
+    let path = "/sys/devices/system/node/online";
+    let raw = fs::read_to_string(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("read {path}: {error}")))?;
+    let ids = parse_cpu_list(raw.trim())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {error}")))?;
+    ids.into_iter()
+        .map(|id| {
+            u16::try_from(id).map(NumaNode::new).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("NUMA node id {id} does not fit u16"),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Returns the online CPU ids, parsed from `/sys/devices/system/cpu/online`.
+/// Fallback core pool for workers whose interface NUMA node is unknown.
+pub fn online_cpus() -> io::Result<Vec<u32>> {
+    let path = "/sys/devices/system/cpu/online";
+    let raw = fs::read_to_string(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("read {path}: {error}")))?;
+    parse_cpu_list(raw.trim())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {error}")))
+}
+
+/// Parses a kernel CPU-range list (e.g. `"0-15,32-47"`) into sorted CPU ids.
+fn parse_cpu_list(list: &str) -> Result<Vec<u32>, String> {
+    let mut cpus = Vec::new();
+    for part in list
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let start: u32 = start
+                    .parse()
+                    .map_err(|error| format!("bad range start {part:?}: {error}"))?;
+                let end: u32 = end
+                    .parse()
+                    .map_err(|error| format!("bad range end {part:?}: {error}"))?;
+                if end < start {
+                    return Err(format!("inverted range {part:?}"));
+                }
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(
+                part.parse()
+                    .map_err(|error| format!("bad CPU id {part:?}: {error}"))?,
+            ),
+        }
+    }
+    if cpus.is_empty() {
+        return Err(format!("empty CPU list {list:?}"));
+    }
+    Ok(cpus)
+}
+
 fn fill_queue_slots(iface: &str, slots: &mut Vec<XdpQueueSlot>) -> io::Result<()> {
     if let Some(slaves) = bond_slaves(iface)? {
         for slave in xdp_bindable_bond_slaves(iface, slaves)? {

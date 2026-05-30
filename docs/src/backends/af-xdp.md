@@ -119,23 +119,72 @@ in two phases, matching the `Send` builder / `!Send` live socket split:
   `First(n)`, or an explicit `Queues(..)` set); `port_filter(PortFilter)` selects
   the redirect filter (`AllIp`, or `UdpPorts(..)` bound into the program);
   `threads(T)` sets the worker count. `claimed_queue_count()` and
-  `irq_cpu_count()` are readable after `claim` to compute `T`. `build()` attaches
-  one program per interface, fills the filter, validates that `T` divides the
-  claimed queue count, and partitions the claim-order queues into `T` contiguous
-  single-interface blocks — one `XdpWorkerPlan` (one aggregate socket) per block.
+  `irq_cpu_count()` are readable after `claim` to help compute `T`. `build()`
+  attaches one program per interface, fills the filter, and partitions the
+  claimed queues **by NUMA node** into one `XdpWorkerPlan` (one aggregate socket)
+  per worker.
 - **Phase 2 (per worker thread).** Move one `Send` `XdpWorkerPlan` to a thread
-  and call `plan.open_udp_busy_poll(local)` /
-  `plan.open_ip_packet_busy_poll()` (or `open_udp_busy_poll_with_router` for a
-  custom `XdpUdpRouter`). Each opener pins the thread to `plan.cpu()` (the lowest
-  member IRQ CPU) before allocating, so the UMEM, rings, and scratch are
-  NUMA-local; `open_*_unpinned` variants skip pinning for custom placement.
-  `plan.numa_node()` and `plan.queue_ids()` expose the block's placement.
+  and call `plan.open_udp_busy_poll(local)` / `plan.open_ip_packet_busy_poll()`
+  (or `open_udp_busy_poll_with_router` for a custom `XdpUdpRouter`). Each opener
+  pins the thread to `plan.cpu()` before allocating, so the UMEM, rings, and
+  scratch are NUMA-local. `plan.numa_node()` and `plan.queue_ids()` expose the
+  placement; `open_*_unpinned` variants skip pinning for custom placement.
 
-So the worker-thread count is the single knob: `threads(1)` is one aggregate over
-every claimed queue on an interface, `threads(Q)` is one single-queue socket per
-queue, and intermediate values fan `Q/T` queues into each worker. A block that
-would span interfaces (for example `threads(1)` across a bond's two slaves) is a
-`build()` error, since one shared UMEM binds to one netdev.
+### NUMA-aware partitioning
+
+`build()` places workers as follows:
+
+1. Each claimed queue is mapped to the NUMA node it lives on — the node of its
+   IRQ CPU, with the interface's device node as a fallback when that can't be
+   resolved (e.g. multi-CPU IRQ affinity, or a NIC whose sysfs node is `-1`).
+2. The `threads` budget is split evenly across the nodes the queues span
+   (`threads / nodes`).
+3. Within each node, its queues are spread evenly over that many **dedicated,
+   node-local cores** — one aggregate socket per core, each pinned to a distinct
+   CPU on the node.
+
+A worker only ever drives queues on its own NUMA node, each worker stays on a
+single interface (one shared UMEM binds one netdev), and every worker gets its
+own dedicated core.
+
+`plan.cpu()` is therefore a dedicated node-local core, **not** the queue's IRQ
+core. Under preferred busy polling NAPI runs inline on the busy-polling core and
+hard IRQs are deferred, so the IRQ core is irrelevant to placement; only the
+NUMA node matters, and distinct cores avoid the worker-on-worker collisions a
+shared IRQ CPU would cause (e.g. a bond's two slaves whose queue IRQs map to the
+same CPU set).
+
+`build()` errors if `threads` is not divisible by the number of NUMA nodes the
+queues span, if a node's queue count is not divisible by its share of threads,
+or if a resulting block would span interfaces (for example `threads(1)` across a
+bond's two slaves — one UMEM can't bind two netdevs).
+
+### Escape hatches
+
+Two ways to override the default placement:
+
+- **Custom core assignment.** `XdpFactoryBuilder::core_assignment(|node, cpus,
+  worker_index| -> core)` replaces the default round-robin core picker. The
+  closure gets the worker's NUMA node, the CPU ids on that node, and the worker's
+  0-based index among that node's workers, and returns the core to pin it to
+  (which must be one of the given CPUs, else `build()` errors). NUMA grouping and
+  single-interface blocks are unchanged — only the core chosen within a node is.
+- **Bypass the factory.** `XdpWorkerPlan::new(config, queues, cpu, numa)` builds
+  a plan by hand for full control over queue grouping and placement: provide an
+  `XdpIpPacketSocketConfig` (interface, attached program, frame count, rings,
+  ...), the queues (all on `config.ifindex`), the core to pin, and the UMEM node,
+  then drive it with the same `open_*` openers. The aggregate openers
+  `XdpUdpAggregate::open_busy_poll` / `XdpIpPacketAggregate::open_busy_poll` are
+  also public if you don't want plans at all.
+
+### Sizing
+
+Throughput is best when each worker drives **several** queues: a worker
+round-robins its queues, overlapping their TX/RX rings so the NIC's completion
+latency is hidden. Driving a single queue per worker exposes that latency and
+degenerates into a completion-drain busy-spin, so more threads is not always more
+throughput — tune `threads` to the point where the NIC saturates (a handful of
+queues per worker), not the maximum.
 
 The embedded eBPF program is closed by default: with no UDP ports bound it
 returns `XDP_PASS` for every frame so attaching the program alone does not

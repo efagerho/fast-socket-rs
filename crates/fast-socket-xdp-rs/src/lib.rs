@@ -47,8 +47,8 @@ pub use config::{XdpIpPacketSocketBuilder, XdpIpPacketSocketConfig, XdpUdpSocket
 pub use egress::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, XdpEgress};
 #[cfg(target_os = "linux")]
 pub use factory::{
-    InterfaceSelector, PortFilter, QueueClaim, XdpFactory, XdpFactoryBuilder, XdpWorkerPlan,
-    resolve_interface_index,
+    CoreAssignmentFn, InterfaceSelector, PortFilter, QueueClaim, XdpFactory, XdpFactoryBuilder,
+    XdpWorkerPlan, resolve_interface_index,
 };
 #[cfg(target_os = "linux")]
 pub use interface::{

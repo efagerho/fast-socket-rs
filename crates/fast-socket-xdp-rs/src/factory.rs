@@ -2,20 +2,26 @@
 //!
 //! Phase 1 ([`XdpFactoryBuilder`] -> [`XdpFactory`], any thread) discovers NIC
 //! queues, attaches one eBPF program per interface, fills the port filter, and
-//! partitions the claimed queues into `threads(T)` contiguous blocks — one
-//! [`XdpWorkerPlan`] (one aggregate socket) per block.
+//! partitions the claimed queues **by NUMA node** into one [`XdpWorkerPlan`]
+//! (one aggregate socket) per worker.
 //!
 //! Phase 2 (per worker thread) moves one `Send` plan to a thread and calls
 //! `plan.open_*`, which pins the thread to `plan.cpu()` and opens that worker's
 //! aggregate socket — all member queues sharing one NUMA-local UMEM.
 //!
-//! The single `threads(T)` knob drives everything: `T` must divide the claimed
-//! queue count `Q`, and each contiguous `Q/T` block must sit on a single
-//! interface (shared-UMEM aggregates are single-interface) and NUMA node.
+//! Partitioning: each queue is mapped to the NUMA node it lives on (its IRQ
+//! CPU's node, with the interface's device node as a fallback); `threads` is
+//! split evenly across those nodes (`threads / nodes`); and each node's queues
+//! are spread evenly over that many dedicated, node-local cores. A worker only
+//! ever drives queues on its own node, on one interface (one shared UMEM binds
+//! one netdev). Placement is overridable via [`XdpFactoryBuilder::core_assignment`]
+//! (custom core picker) or [`XdpWorkerPlan::new`] (build plans by hand).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 
 use fast_socket_rs::{
     BusyPollDriver, HugePageSize, IfIndex, NumaNode, QueueBufferConfig, QueueId,
@@ -25,8 +31,8 @@ use fast_socket_rs::{
 use crate::aggregate::{XdpIpPacketAggregate, XdpUdpAggregate};
 use crate::config::XdpIpPacketSocketConfig;
 use crate::interface::{
-    XdpQueueSlot, cpu_for_xdp_queue, if_index_to_name, if_name_to_index, numa_node_for_interface,
-    xdp_queue_slots_for_interface,
+    XdpQueueSlot, cpu_for_xdp_queue, cpus_for_numa_node, if_index_to_name, if_name_to_index,
+    numa_node_for_interface, online_numa_nodes, xdp_queue_slots_for_interface,
 };
 use crate::program::{AttachMode, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
@@ -63,8 +69,13 @@ pub enum PortFilter {
     UdpPorts(Vec<u16>),
 }
 
+/// User strategy for choosing a worker's core: given the worker's NUMA node,
+/// the CPU ids on that node, and the worker's 0-based index among that node's
+/// workers, return the core id to pin it to (must be one of the given CPUs).
+pub type CoreAssignmentFn = dyn Fn(NumaNode, &[u32], usize) -> u32 + Send + Sync;
+
 /// Phase-1 factory builder. `Send`; build on any thread.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XdpFactoryBuilder {
     iface: String,
     slots: Vec<XdpQueueSlot>,
@@ -79,6 +90,24 @@ pub struct XdpFactoryBuilder {
     attach_mode: AttachMode,
     buffers: QueueBufferConfig,
     route_snapshot: RouteSnapshot,
+    core_assignment: Option<Arc<CoreAssignmentFn>>,
+}
+
+impl fmt::Debug for XdpFactoryBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdpFactoryBuilder")
+            .field("iface", &self.iface)
+            .field("claim", &self.claim)
+            .field("threads", &self.threads)
+            .field("port_filter", &self.port_filter)
+            .field("frame_count", &self.frame_count)
+            .field("mtu", &self.mtu)
+            .field(
+                "core_assignment",
+                &self.core_assignment.as_ref().map(|_| "<custom fn>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl XdpFactoryBuilder {
@@ -104,6 +133,7 @@ impl XdpFactoryBuilder {
             attach_mode: defaults.attach_mode,
             buffers: defaults.buffers,
             route_snapshot: RouteSnapshot::new(),
+            core_assignment: None,
         })
     }
 
@@ -206,6 +236,24 @@ impl XdpFactoryBuilder {
         self
     }
 
+    /// Overrides how each worker's core is chosen (escape hatch).
+    ///
+    /// `f` receives the worker's NUMA node, the CPU ids on that node, and the
+    /// worker's 0-based index among that node's workers, and returns the core id
+    /// to pin it to. The returned core **must** be one of the provided CPUs;
+    /// [`Self::build`] errors otherwise. The default is round-robin over the
+    /// node's CPUs (`cpus[worker_index % cpus.len()]`). Grouping queues by NUMA
+    /// node and keeping each worker single-interface are unchanged — only the
+    /// core picked within a node is.
+    #[must_use]
+    pub fn core_assignment(
+        mut self,
+        f: impl Fn(NumaNode, &[u32], usize) -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.core_assignment = Some(Arc::new(f));
+        self
+    }
+
     fn claimed_slots(&self) -> Vec<XdpQueueSlot> {
         match &self.claim {
             QueueClaim::All => self.slots.clone(),
@@ -261,9 +309,20 @@ impl XdpFactoryBuilder {
         ))
     }
 
-    /// Phase-1 build: attach programs, fill the filter, partition into worker
-    /// plans. Validates `threads` divides the claim and that each block is on a
-    /// single interface and NUMA node.
+    /// Phase-1 build: attach programs, fill the filter, and partition into
+    /// worker plans by NUMA node.
+    ///
+    /// Queues are grouped by the NUMA node they live on (the node of each
+    /// queue's IRQ CPU, falling back to the interface's device node). `threads`
+    /// is split evenly across those nodes (`threads / nodes`), and within each
+    /// node its queues are spread evenly over that many **dedicated, node-local
+    /// cores** — one aggregate socket per core. A worker only ever drives
+    /// queues on its own NUMA node, and each block stays on a single interface
+    /// (one shared UMEM binds one netdev).
+    ///
+    /// Errors if `threads` is not divisible by the number of NUMA nodes the
+    /// claimed queues span, if a node's queue count is not divisible by its
+    /// share of threads, or if a resulting block would span interfaces.
     pub fn build(self) -> io::Result<XdpFactory> {
         let claimed = self.claimed_slots_checked()?;
         if claimed.is_empty() {
@@ -280,13 +339,6 @@ impl XdpFactoryBuilder {
                 "threads(T) must be >= 1",
             ));
         }
-        if !queue_count.is_multiple_of(threads) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("threads({threads}) must divide the claimed queue count {queue_count}"),
-            ));
-        }
-        let per_block = queue_count / threads;
 
         // Attach one program per distinct interface index among the claimed
         // queues (bond masters fan out to slave ifindexes).
@@ -312,60 +364,143 @@ impl XdpFactoryBuilder {
             }
         }
 
+        // Group the claimed queues by the NUMA node they live on (the node of
+        // each queue's IRQ CPU; the interface's device node as a fallback).
+        let cpu_node = build_cpu_node_map()?;
+        let mut by_node: BTreeMap<NumaNode, Vec<XdpQueueSlot>> = BTreeMap::new();
+        for slot in claimed {
+            let node = queue_numa_node(&slot, &cpu_node)?;
+            by_node.entry(node).or_default().push(slot);
+        }
+
+        // Split the thread budget evenly across the nodes the queues span.
+        let num_nodes = by_node.len();
+        if !threads.is_multiple_of(num_nodes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "threads({threads}) must be divisible by the {num_nodes} NUMA node(s) the \
+                     claimed queues span"
+                ),
+            ));
+        }
+        let threads_per_node = threads / num_nodes;
+
         let mut plans = Vec::with_capacity(threads);
-        for block in claimed.chunks(per_block) {
-            // Single-interface invariant: one shared UMEM binds to one netdev.
-            let ifindex = block[0].ifindex;
-            if block.iter().any(|slot| slot.ifindex != ifindex) {
+        for (node, mut slots) in by_node {
+            // Group queues by interface within the node so each contiguous block
+            // stays on one interface (one shared UMEM binds one netdev). A stable
+            // sort keeps each interface's queues in claim order.
+            slots.sort_by_key(|slot| slot.ifindex);
+            let node_queue_count = slots.len();
+            if !node_queue_count.is_multiple_of(threads_per_node) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "threads({threads}) produced a block spanning multiple interfaces on \
-                         {}; choose a thread count whose blocks stay on one slave, or run one \
-                         factory per slave",
-                        self.iface
+                        "NUMA node {} has {node_queue_count} claimed queue(s), not divisible by \
+                         its {threads_per_node} thread(s) (threads / nodes)",
+                        node.get()
                     ),
                 ));
             }
-            let block_name = if_index_to_name(ifindex)?;
-            let numa = numa_node_for_interface(&block_name).ok();
-            let mut cpu = None;
-            for slot in block {
-                let slot_cpu = cpu_for_xdp_queue(slot)?;
-                cpu = Some(cpu.map_or(slot_cpu, |best: u32| best.min(slot_cpu)));
+            let per_block = node_queue_count / threads_per_node;
+            // Dedicated, node-local cores — one per worker on this node. Under
+            // preferred busy polling NAPI runs inline on the busy-polling core
+            // and hard IRQs are deferred, so the queue's IRQ core is irrelevant;
+            // only the node matters, and distinct cores avoid worker collisions.
+            let cores = cpus_for_numa_node(node)?;
+
+            for (index, block) in slots.chunks(per_block).enumerate() {
+                let ifindex = block[0].ifindex;
+                if block.iter().any(|slot| slot.ifindex != ifindex) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "a worker block on NUMA node {} would span multiple interfaces; \
+                             choose a thread count whose per-node blocks stay on one interface",
+                            node.get()
+                        ),
+                    ));
+                }
+                // Distinct core per worker on this node (wraps only if the node
+                // has fewer cores than workers), or the caller's strategy.
+                let cpu = match &self.core_assignment {
+                    Some(assign) => {
+                        let chosen = assign(node, &cores, index);
+                        if !cores.contains(&chosen) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "core_assignment returned CPU {chosen}, which is not among \
+                                     NUMA node {}'s CPUs {cores:?}",
+                                    node.get()
+                                ),
+                            ));
+                        }
+                        chosen
+                    }
+                    None => cores[index % cores.len()],
+                };
+                let queues: Vec<QueueId> = block.iter().map(|slot| slot.queue).collect();
+
+                let config = XdpIpPacketSocketConfig {
+                    ifindex,
+                    queue_id: queues[0],
+                    numa_node: Some(node),
+                    buffers: self.buffers,
+                    rings: self.rings,
+                    mode: self.mode,
+                    mtu: self.mtu,
+                    frame_count: self.frame_count,
+                    huge_page_size: self.huge_page_size,
+                    attach_mode: self.attach_mode,
+                    program_bytes: None,
+                    attached_program: Some(programs[&ifindex].clone()),
+                    // Filter ports were bound once above; the UDP opener binds
+                    // the local port itself (refcounted).
+                    bind_udp_port: None,
+                    route_snapshot: self.route_snapshot.clone(),
+                };
+
+                plans.push(XdpWorkerPlan {
+                    cpu,
+                    numa: Some(node),
+                    ifindex,
+                    queues,
+                    config,
+                });
             }
-            let queues: Vec<QueueId> = block.iter().map(|slot| slot.queue).collect();
-
-            let config = XdpIpPacketSocketConfig {
-                ifindex,
-                queue_id: queues[0],
-                numa_node: numa,
-                buffers: self.buffers,
-                rings: self.rings,
-                mode: self.mode,
-                mtu: self.mtu,
-                frame_count: self.frame_count,
-                huge_page_size: self.huge_page_size,
-                attach_mode: self.attach_mode,
-                program_bytes: None,
-                attached_program: Some(programs[&ifindex].clone()),
-                // Filter ports were bound once above; the UDP opener binds the
-                // local port itself (refcounted).
-                bind_udp_port: None,
-                route_snapshot: self.route_snapshot.clone(),
-            };
-
-            plans.push(XdpWorkerPlan {
-                cpu: cpu.expect("non-empty block has a CPU"),
-                numa,
-                ifindex,
-                queues,
-                config,
-            });
         }
 
         Ok(XdpFactory { plans, programs })
     }
+}
+
+/// Builds a CPU-id -> NUMA-node map from the online nodes' CPU lists.
+fn build_cpu_node_map() -> io::Result<BTreeMap<u32, NumaNode>> {
+    let mut map = BTreeMap::new();
+    for node in online_numa_nodes()? {
+        for cpu in cpus_for_numa_node(node)? {
+            map.insert(cpu, node);
+        }
+    }
+    Ok(map)
+}
+
+/// Resolves the NUMA node a queue lives on: the node of its IRQ CPU, falling
+/// back to the interface's device node when the IRQ CPU can't be resolved
+/// (e.g. multi-CPU IRQ affinity) or is absent from `cpu_node`.
+fn queue_numa_node(
+    slot: &XdpQueueSlot,
+    cpu_node: &BTreeMap<u32, NumaNode>,
+) -> io::Result<NumaNode> {
+    if let Ok(cpu) = cpu_for_xdp_queue(slot)
+        && let Some(node) = cpu_node.get(&cpu)
+    {
+        return Ok(*node);
+    }
+    let iface = if_index_to_name(slot.ifindex)?;
+    numa_node_for_interface(&iface)
 }
 
 /// Phase-1 result: per-worker plans plus the retained program handles.
@@ -401,8 +536,39 @@ pub struct XdpWorkerPlan {
 }
 
 impl XdpWorkerPlan {
-    /// Lowest-numbered IRQ CPU among the block's queues — the core a worker
-    /// owning this aggregate should pin to.
+    /// Constructs a worker plan directly, bypassing [`XdpFactoryBuilder`]
+    /// (escape hatch).
+    ///
+    /// For callers that want full control over queue grouping and placement.
+    /// `config` carries the interface, the attached program (or `None` to load
+    /// one at open), frame count, rings, MTU, etc.; `queues` are the NIC queues
+    /// — all on `config.ifindex` — this worker's aggregate drives; `cpu` is the
+    /// core the pinned `open_*` openers pin to; `numa` is the node used for UMEM
+    /// placement (must match the interface's node when its sysfs node is known,
+    /// or `None` to take the interface's node). The plan can then be driven with
+    /// the same `open_*` openers as a factory-produced one.
+    #[must_use]
+    pub fn new(
+        config: XdpIpPacketSocketConfig,
+        queues: Vec<QueueId>,
+        cpu: u32,
+        numa: Option<NumaNode>,
+    ) -> Self {
+        Self {
+            cpu,
+            numa,
+            ifindex: config.ifindex,
+            queues,
+            config,
+        }
+    }
+
+    /// The dedicated, NUMA-local core this worker should pin to.
+    ///
+    /// Assigned round-robin over [`Self::numa_node`]'s CPU list, distinct per
+    /// worker on that node. Under preferred busy polling NAPI runs inline on the
+    /// busy-polling core and hard IRQs are deferred, so the queue's IRQ core is
+    /// irrelevant; a dedicated node-local core is what matters.
     #[must_use]
     pub fn cpu(&self) -> u32 {
         self.cpu
@@ -514,6 +680,7 @@ mod tests {
             attach_mode: defaults.attach_mode,
             buffers: defaults.buffers,
             route_snapshot: RouteSnapshot::new(),
+            core_assignment: None,
         }
     }
 
