@@ -7,13 +7,15 @@ use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::ptr;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use clap::ValueEnum;
 use fast_socket_os_rs::{OsUdpSocket, OsUdpSocketConfig};
 use fast_socket_rs::{BufferLayout, QueueAffinity, QueueId};
 use fast_socket_xdp_rs::{
-    BusyPollXdpUdpSocket, RouteSnapshot, XdpProgramHandle, XdpQueueSlot, XdpUdpSocket,
-    cpu_for_xdp_queue, xdp_queue_slots_for_interface,
+    BusyPollXdpUdpSocket, RouteSnapshot, XdpProgramHandle, XdpQueueSlot, XdpRouteMonitor,
+    XdpRouteMonitorHandle, XdpUdpSocket, cpu_for_xdp_queue, xdp_queue_slots_for_interface,
 };
 
 // Re-export shared helpers so existing examples can keep referring to them via
@@ -37,6 +39,20 @@ pub struct QueuePlan {
     pub cpu: u32,
 }
 
+pub struct MonitoredXdpUdpSocket {
+    pub socket: BusyPollXdpUdpSocket,
+    route_updates: XdpRouteMonitorHandle,
+    _route_monitor_thread: JoinHandle<()>,
+}
+
+impl MonitoredXdpUdpSocket {
+    /// Applies the latest netlink route snapshot to this socket's queue-local
+    /// router. Call from the worker loop before packet work, not per packet.
+    pub fn apply_route_updates(&mut self) -> usize {
+        self.route_updates.apply_updates(self.socket.routes_mut())
+    }
+}
+
 pub fn queue_plan(device: &str) -> Result<Vec<QueuePlan>, BoxError> {
     xdp_queue_slots_for_interface(device)?
         .into_iter()
@@ -57,17 +73,25 @@ pub fn open_xdp_udp_socket(
     local: SocketAddrV4,
     peer: SocketAddrV4,
     program: &XdpProgramHandle,
-) -> Result<BusyPollXdpUdpSocket, BoxError> {
+) -> Result<MonitoredXdpUdpSocket, BoxError> {
     let routes = RouteSnapshot::from_netlink()?;
+    let mut route_monitor = XdpRouteMonitor::new();
+    let route_updates = route_monitor.register_queue();
+    let route_monitor_thread = route_monitor.start_netlink(slot.queue, Duration::from_secs(1));
     let egress = routes
         .egress_v4_for_interface(*peer.ip(), slot.ifindex, slot.queue)
         .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", peer.ip()))?;
-    Ok(XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
+    let socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
         .mtu(egress.mtu as usize)
         .route_snapshot(routes)
         .bind_udp_port(local.port())
         .attached_program(program.clone())
-        .open_busy_poll()?)
+        .open_busy_poll()?;
+    Ok(MonitoredXdpUdpSocket {
+        socket,
+        route_updates,
+        _route_monitor_thread: route_monitor_thread,
+    })
 }
 
 pub fn open_os_udp_socket(

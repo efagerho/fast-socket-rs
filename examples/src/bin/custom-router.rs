@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use fast_socket_rs::{
-    LinkAddr, NeighborTable, PacketBufferMut, RouteHop, RouteTable, TxSlot,
+    LinkAddr, NeighborTable, PacketBufferMut, QueueId, RouteHop, RouteTable, TxSlot,
     UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut, V4Only,
 };
 use fast_socket_xdp_rs::{
-    InterfaceSelector, PortFilter, XdpEgress, XdpFactoryBuilder, XdpRouteContext, XdpUdpRouter,
-    XdpUdpSocket,
+    InterfaceSelector, PortFilter, XdpEgress, XdpFactoryBuilder, XdpRouteContext, XdpRouteMonitor,
+    XdpUdpRouter, XdpUdpSocket,
 };
 
 use common::{
@@ -112,20 +112,40 @@ fn main() -> Result<(), BoxError> {
         .mtu(mtu as usize)
         .build()?;
     let plans = factory.into_worker_plans();
+    let monitor_queue = plans
+        .first()
+        .and_then(|plan| plan.queue_ids().first())
+        .copied()
+        .unwrap_or_else(|| QueueId::new(0));
+    let mut route_monitor = XdpRouteMonitor::new();
+    let mut workers = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let route_updates = plan
+            .queue_ids()
+            .iter()
+            .map(|_| route_monitor.register_queue())
+            .collect::<Vec<_>>();
+        workers.push((plan, route_updates));
+    }
+    let _route_monitor_thread = route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
     eprintln!(
         "custom-router: {} aggregate socket(s) / thread(s) sending 64-byte UDP payloads from \
          {local} to {} via {:?} every second",
-        plans.len(),
+        workers.len(),
         args.target,
         args.mac
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::with_capacity(plans.len());
-    for plan in plans {
+    let mut handles = Vec::with_capacity(workers.len());
+    for (plan, route_updates) in workers {
         let stop = Arc::clone(&stop);
         let mac = args.mac;
         handles.push(thread::spawn(move || -> Result<(), String> {
+            // Keep the monitor handles alive for this worker. This static demo
+            // router does not apply them directly; real custom routers should
+            // use monitor updates to rebuild or invalidate any cached egress.
+            let _route_updates = route_updates;
             let router = CustomRouter {
                 routes: DefaultRouteTable {
                     ifindex: plan.ifindex(),

@@ -106,6 +106,10 @@ worker thread opens one `XdpUdpAggregate` with `plan.open_udp_busy_poll` (which
 pins to `plan.cpu()`) and pongs across its member queues round-robin —
 reflection on each member stays on the queue the frame arrived on. Only
 construction differs; the per-socket reflect uses the same generic helpers.
+The XDP setup also starts one `XdpRouteMonitor::start_netlink` thread and
+registers one update handle per aggregate member; workers apply those handles to
+their queue-local route snapshots outside the packet path before receive/send
+work.
 
 For `pong-server`, `--target` names the expected peer endpoint. The server binds
 the device IP with `target.port()`. The XDP setup uses `target.ip()` to preflight

@@ -16,6 +16,7 @@ use fast_socket_rs::{
 
 use fast_socket_xdp_rs::{
     BusyPollXdpUdpSocket, InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder,
+    XdpRouteMonitor, XdpRouteMonitorHandle,
 };
 
 use common::{
@@ -122,6 +123,7 @@ fn run_os(device: String, target: SocketAddrV4) -> Result<(), BoxError> {
 fn run_xdp(device: String, target: SocketAddrV4, threads: usize) -> Result<(), BoxError> {
     let local = SocketAddrV4::new(interface_ipv4_addr(&device)?, target.port());
     let routes = RouteSnapshot::from_netlink()?;
+    let mut route_monitor = XdpRouteMonitor::new();
     // Phase 1: discover queues, attach the program, partition into `threads`
     // worker plans (one aggregate socket each over queues/threads queues).
     let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(device))?
@@ -130,21 +132,36 @@ fn run_xdp(device: String, target: SocketAddrV4, threads: usize) -> Result<(), B
         .route_snapshot(routes)
         .build()?;
     let plans = factory.into_worker_plans();
+    let monitor_queue = plans
+        .first()
+        .and_then(|plan| plan.queue_ids().first())
+        .copied()
+        .unwrap_or_else(|| QueueId::new(0));
+    let mut workers = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let route_updates = plan
+            .queue_ids()
+            .iter()
+            .map(|_| route_monitor.register_queue())
+            .collect::<Vec<_>>();
+        workers.push((plan, route_updates));
+    }
+    let _route_monitor_thread = route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
     eprintln!(
         "pong-server xdp: {} aggregate socket(s) / thread(s) bound to {} with egress toward {}",
-        plans.len(),
+        workers.len(),
         local,
         target.ip()
     );
 
     run_workers(
         "pong-server xdp",
-        plans,
-        |plan| plan.cpu(),
-        move |plan, stop, total| {
+        workers,
+        |(plan, _)| plan.cpu(),
+        move |(plan, mut route_updates), stop, total| {
             // Pins to plan.cpu() and opens this worker's aggregate.
             let mut aggregate = plan.open_udp_busy_poll(local)?;
-            pong_aggregate(&mut aggregate, &stop, &total)
+            pong_aggregate(&mut aggregate, &mut route_updates, &stop, &total)
         },
     )
 }
@@ -156,6 +173,7 @@ fn pong_aggregate(
         fast_socket_rs::BusyPollDriver,
         fast_socket_xdp_rs::XdpQueueLocalRouter,
     >,
+    route_updates: &mut [XdpRouteMonitorHandle],
     stop: &AtomicBool,
     reflected: &AtomicU64,
 ) -> Result<(), BoxError> {
@@ -163,10 +181,16 @@ fn pong_aggregate(
         RecvBatch::with_capacity(BATCH_SIZE);
     let mut tx: Vec<TxSlot<UdpTransmit<UdpTxBuffer<BusyPollXdpUdpSocket>>>> =
         Vec::with_capacity(BATCH_SIZE);
+    debug_assert_eq!(route_updates.len(), aggregate.len());
 
     while !stop.load(Relaxed) && !shutdown_requested() {
         let mut progress = 0usize;
-        for socket in aggregate.members_mut() {
+        for (socket, route_update) in aggregate
+            .members_mut()
+            .iter_mut()
+            .zip(route_updates.iter_mut())
+        {
+            route_update.apply_updates(socket.routes_mut());
             rx.clear();
             if socket.recv(&mut rx)? == 0 {
                 socket.drain_tx_completions()?;

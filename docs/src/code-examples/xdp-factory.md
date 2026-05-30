@@ -44,10 +44,16 @@ Each worker thread owns one aggregate socket and round-robins transmit across
 its member queues:
 
 ```rust,ignore
-use fast_socket_xdp_rs::{InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder};
+use std::time::Duration;
+
+use fast_socket_rs::QueueId;
+use fast_socket_xdp_rs::{
+    InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpRouteMonitor,
+};
 
 let routes = RouteSnapshot::from_netlink()?;
 // The snapshot includes precomputed L2 headers for IPv4 gateway routes.
+let mut route_monitor = XdpRouteMonitor::new();
 
 // Phase 1: discover queues, attach the program, partition into `threads` plans.
 let factory = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?
@@ -56,15 +62,40 @@ let factory = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?
     .route_snapshot(routes)
     .build()?;
 
+let plans = factory.into_worker_plans();
+let monitor_queue = plans
+    .first()
+    .and_then(|plan| plan.queue_ids().first())
+    .copied()
+    .unwrap_or_else(|| QueueId::new(0));
+
+let mut workers = Vec::with_capacity(plans.len());
+for plan in plans {
+    // Register one update handle per member socket. Handles remember the last
+    // generation they applied, so sharing one handle across members would update
+    // only the first member.
+    let route_updates = plan
+        .queue_ids()
+        .iter()
+        .map(|_| route_monitor.register_queue())
+        .collect::<Vec<_>>();
+    workers.push((plan, route_updates));
+}
+
+let _route_monitor_thread =
+    route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
+
 let mut handles = Vec::new();
-for plan in factory.into_worker_plans() {
+for (plan, mut route_updates) in workers {
     handles.push(std::thread::spawn(move || -> std::io::Result<()> {
         // Phase 2: pins to plan.cpu(); one aggregate over this worker's queues.
         let mut aggregate = plan.open_udp_busy_poll(local)?;
         let member_count = aggregate.len();
+        debug_assert_eq!(route_updates.len(), member_count);
         let mut next = 0;
         loop {
             let socket = &mut aggregate.members_mut()[next];
+            route_updates[next].apply_updates(socket.routes_mut());
             // allocate_tx_batch + send + drain_tx_completions on this member ...
             next = (next + 1) % member_count;
         }
@@ -79,18 +110,47 @@ its members. `recv` fans in across queues; reflection sends back on the queue a
 frame arrived on (each member owns its shared-UMEM frame slice):
 
 ```rust,ignore
+let routes = RouteSnapshot::from_netlink()?;
+let mut route_monitor = XdpRouteMonitor::new();
+
 let factory = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?
     .threads(threads)
     .port_filter(PortFilter::UdpPorts(vec![bind.port()]))
     .route_snapshot(routes.clone())
     .build()?;
 
-for plan in factory.into_worker_plans() {
+let plans = factory.into_worker_plans();
+let monitor_queue = plans
+    .first()
+    .and_then(|plan| plan.queue_ids().first())
+    .copied()
+    .unwrap_or_else(|| QueueId::new(0));
+
+let mut workers = Vec::with_capacity(plans.len());
+for plan in plans {
+    let route_updates = plan
+        .queue_ids()
+        .iter()
+        .map(|_| route_monitor.register_queue())
+        .collect::<Vec<_>>();
+    workers.push((plan, route_updates));
+}
+
+let _route_monitor_thread =
+    route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
+
+for (plan, mut route_updates) in workers {
     std::thread::spawn(move || -> std::io::Result<()> {
         let mut aggregate = plan.open_ip_packet_busy_poll()?; // pins to plan.cpu()
         let mut rx = RecvBatch::with_capacity(64);
+        debug_assert_eq!(route_updates.len(), aggregate.len());
         loop {
-            for socket in aggregate.members_mut() {
+            for (socket, route_update) in aggregate
+                .members_mut()
+                .iter_mut()
+                .zip(route_updates.iter_mut())
+            {
+                route_update.apply_updates(socket.routes_mut());
                 rx.clear();
                 socket.recv(&mut rx)?;
                 // parse / reflect on this same socket, then drain ...
@@ -148,9 +208,25 @@ let config = XdpIpPacketSocketConfig {
     attached_program: Some(program),
     ..Default::default()
 };
+let mut route_monitor = XdpRouteMonitor::new();
+let queues = vec![QueueId::new(0), QueueId::new(1)];
+let mut route_updates = queues
+    .iter()
+    .map(|_| route_monitor.register_queue())
+    .collect::<Vec<_>>();
+let _route_monitor_thread =
+    route_monitor.start_netlink(queues[0], Duration::from_secs(1));
+
 // queues must all be on config.ifindex; cpu is the core open_* pins to.
-let plan = XdpWorkerPlan::new(config, vec![QueueId::new(0), QueueId::new(1)], /*cpu*/ 3, numa);
+let plan = XdpWorkerPlan::new(config, queues, /*cpu*/ 3, numa);
 let mut aggregate = plan.open_ip_packet_busy_poll()?;
+for (socket, route_update) in aggregate
+    .members_mut()
+    .iter_mut()
+    .zip(route_updates.iter_mut())
+{
+    route_update.apply_updates(socket.routes_mut());
+}
 ```
 
 (The aggregate openers `XdpUdpAggregate::open_busy_poll` /

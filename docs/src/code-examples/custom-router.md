@@ -96,6 +96,12 @@ caller-supplied `XdpUdpRouter` (the default openers use `XdpQueueLocalRouter`).
 The opener pins the thread to `plan.cpu()` and shares one UMEM across the
 aggregate's queues.
 
+This example still starts `XdpRouteMonitor` and registers one update handle per
+aggregate member so the XDP setup has the same live-monitoring shape as the
+default router examples. The demo router ignores those handles because it uses
+the static `--mac` egress supplied by the operator; real custom routers should
+use monitor updates to rebuild or invalidate any cached egress.
+
 ```rust,ignore
 let local = SocketAddrV4::new(interface_ipv4_addr(&args.device)?, dynamic_source_port());
 let mtu = interface_mtu(&args.device)?;
@@ -107,13 +113,35 @@ let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(args.device.clone()
     .mtu(mtu as usize)
     .build()?;
 
-for plan in factory.into_worker_plans() {
+let plans = factory.into_worker_plans();
+let monitor_queue = plans
+    .first()
+    .and_then(|plan| plan.queue_ids().first())
+    .copied()
+    .unwrap_or_else(|| QueueId::new(0));
+let mut route_monitor = XdpRouteMonitor::new();
+
+let mut workers = Vec::with_capacity(plans.len());
+for plan in plans {
+    let route_updates = plan
+        .queue_ids()
+        .iter()
+        .map(|_| route_monitor.register_queue())
+        .collect::<Vec<_>>();
+    workers.push((plan, route_updates));
+}
+
+let _route_monitor_thread =
+    route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
+
+for (plan, route_updates) in workers {
     let router = CustomRouter {
         routes: DefaultRouteTable { ifindex: plan.ifindex() },
         arp: ConstantArpTable { mac: args.mac },
         src_mac,
         mtu,
     };
+    let _route_updates = route_updates; // keep handles alive; custom refresh policy owns use.
     // Pins to plan.cpu(); one aggregate socket over this worker's queues.
     let mut aggregate = plan.open_udp_busy_poll_with_router(local, || router)?;
     // ... spawn a worker that sends across aggregate.members_mut() ...
@@ -193,6 +221,13 @@ and serve it from the router on every packet. A router that only implements
 the trait's default adapter. Override `resolve_udp_egress_resolved` when the
 router owns a resolved value.
 
+For long-lived caches built from Linux route state, keep the same netlink
+monitor thread shown in the [XDP Factory](xdp-factory.md) setup and rebuild or
+invalidate the custom cache when a new snapshot is published. The built-in
+`XdpRouteMonitorHandle` applies directly to `XdpQueueLocalRouter`; custom
+routers own their refresh policy, but the setup code should still start the
+monitor so the refresh source exists.
+
 ### Single destination
 
 When the server talks to exactly one peer (a log shipper writing to a single
@@ -227,12 +262,21 @@ queues per worker, resolve a per-queue egress for each of `plan.queue_ids()`):
 ```rust,ignore
 let routes = RouteSnapshot::from_netlink()?;
 let plan = factory.into_worker_plans().pop().expect("one worker plan");
+let mut route_monitor = XdpRouteMonitor::new();
+let route_updates = plan
+    .queue_ids()
+    .iter()
+    .map(|_| route_monitor.register_queue())
+    .collect::<Vec<_>>();
 let queue = plan.queue_ids()[0];
+let _route_monitor_thread =
+    route_monitor.start_netlink(queue, Duration::from_secs(1));
 let egress = routes
     .egress_v4_for_interface(*target.ip(), plan.ifindex(), queue)
     .map(XdpResolvedEgress::from_egress)
     .ok_or("no route to target")?;
 
+let _route_updates = route_updates; // keep handles alive; custom refresh policy owns use.
 let mut aggregate =
     plan.open_udp_busy_poll_with_router(local, || SingleDestinationRouter { egress })?;
 ```
@@ -276,7 +320,15 @@ optimization is to do that work once per peer, not once per packet:
 
 ```rust,ignore
 let routes = RouteSnapshot::from_netlink()?;
+let mut route_monitor = XdpRouteMonitor::new();
+let route_updates = plan
+    .queue_ids()
+    .iter()
+    .map(|_| route_monitor.register_queue())
+    .collect::<Vec<_>>();
 let queue = plan.queue_ids()[0];
+let _route_monitor_thread =
+    route_monitor.start_netlink(queue, Duration::from_secs(1));
 let peers = peer_addrs
     .into_iter()
     .map(|addr| {
@@ -287,7 +339,9 @@ let peers = peer_addrs
         Ok((addr, egress))
     })
     .collect::<Result<Vec<_>, BoxError>>()?;
-let mut aggregate = plan.open_udp_busy_poll_with_router(local, || PeerCacheRouter { peers: peers.clone() })?;
+let _route_updates = route_updates; // keep handles alive; custom refresh policy owns use.
+let mut aggregate =
+    plan.open_udp_busy_poll_with_router(local, || PeerCacheRouter { peers: peers.clone() })?;
 ```
 
 If the peer count grows past the point where a linear scan stops fitting in

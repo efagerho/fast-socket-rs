@@ -130,6 +130,13 @@ in two phases, matching the `Send` builder / `!Send` live socket split:
   scratch are NUMA-local. `plan.numa_node()` and `plan.queue_ids()` expose the
   placement; `open_*_unpinned` variants skip pinning for custom placement.
 
+Examples that use the default queue-local router start one
+`XdpRouteMonitor::start_netlink` thread next to the factory setup and register
+one `XdpRouteMonitorHandle` per aggregate member socket. Workers apply those
+handles to `socket.routes_mut()` outside the packet path so route, neighbor, and
+precomputed L2-header changes reach each queue-local snapshot without adding
+cross-core synchronization to every send.
+
 ### NUMA-aware partitioning
 
 `build()` places workers as follows:

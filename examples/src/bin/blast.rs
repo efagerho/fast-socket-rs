@@ -22,7 +22,7 @@ use fast_socket_rs::{
 };
 use fast_socket_xdp_rs::{
     InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpQueueLocalRouter,
-    if_name_to_index,
+    XdpRouteMonitor, XdpRouteMonitorHandle, if_name_to_index,
 };
 
 const PAYLOAD_LEN: usize = 64;
@@ -70,6 +70,7 @@ fn run_xdp_blast(device: &str, target: SocketAddrV4, threads: usize) -> Result<(
     let local_ip = interface_ipv4_addr(device)?;
     let local = SocketAddrV4::new(local_ip, kernel_assigned_udp_port(local_ip)?);
     let routes = RouteSnapshot::from_netlink()?;
+    let mut route_monitor = XdpRouteMonitor::new();
     // Phase 1: discover queues, attach the program, partition into `threads`
     // worker plans (one aggregate socket each over queues/threads queues).
     let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(device.to_string()))?
@@ -78,20 +79,39 @@ fn run_xdp_blast(device: &str, target: SocketAddrV4, threads: usize) -> Result<(
         .route_snapshot(routes)
         .build()?;
     let plans = factory.into_worker_plans();
-    eprintln!("blast xdp: {} aggregate socket(s) / thread(s)", plans.len());
+    let monitor_queue = plans
+        .first()
+        .and_then(|plan| plan.queue_ids().first())
+        .copied()
+        .unwrap_or_else(|| QueueId::new(0));
+    let mut workers = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let route_updates = plan
+            .queue_ids()
+            .iter()
+            .map(|_| route_monitor.register_queue())
+            .collect::<Vec<_>>();
+        workers.push((plan, route_updates));
+    }
+    let _route_monitor_thread = route_monitor.start_netlink(monitor_queue, Duration::from_secs(1));
+    eprintln!(
+        "blast xdp: {} aggregate socket(s) / thread(s)",
+        workers.len()
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
-    let mut handles = Vec::with_capacity(plans.len());
-    for plan in plans {
+    let mut handles = Vec::with_capacity(workers.len());
+    for (plan, mut route_updates) in workers {
         let stop = Arc::clone(&stop);
         let total = Arc::clone(&total);
         let dest: SocketAddr = target.into();
         handles.push(thread::spawn(move || -> Result<(), String> {
             // Pins to plan.cpu() and opens this worker's aggregate.
             let mut aggregate = plan.open_udp_busy_poll(local).map_err(|e| e.to_string())?;
-            blast_aggregate(&mut aggregate, dest, &stop, &total).map_err(|e| e.to_string())
+            blast_aggregate(&mut aggregate, &mut route_updates, dest, &stop, &total)
+                .map_err(|e| e.to_string())
         }));
     }
 
@@ -120,6 +140,7 @@ fn run_xdp_blast(device: &str, target: SocketAddrV4, threads: usize) -> Result<(
 /// Blasts round-robin across an aggregate's member queues until `stop`.
 fn blast_aggregate(
     aggregate: &mut fast_socket_xdp_rs::XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter>,
+    route_updates: &mut [XdpRouteMonitorHandle],
     target: SocketAddr,
     stop: &AtomicBool,
     total: &AtomicU64,
@@ -131,9 +152,11 @@ fn blast_aggregate(
     let mut payload_bytes = payload(PAYLOAD_LEN);
     let mut tx_buffers = Vec::with_capacity(BATCH_SIZE);
     let mut batch = Vec::with_capacity(BATCH_SIZE);
+    debug_assert_eq!(route_updates.len(), member_count);
 
     while !stop.load(Relaxed) && !shutdown_requested() {
         let socket = &mut aggregate.members_mut()[next];
+        route_updates[next].apply_updates(socket.routes_mut());
         tx_buffers.clear();
         batch.clear();
         socket.allocate_tx_batch(&mut tx_buffers, BATCH_SIZE)?;
