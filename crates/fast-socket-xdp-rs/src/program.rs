@@ -263,13 +263,22 @@ impl XdpProgramHandle {
 
 impl Clone for XdpProgramHandle {
     fn clone(&self) -> Self {
+        let program = self
+            .program
+            .as_ref()
+            .expect("XDP program handle cloned after drop");
+        // Serialize the strong-count bump with `release`/`get_or_load` on the
+        // registry mutex. A lock-free `Arc::clone` here could race `release`'s
+        // `strong_count == 2` check and either orphan the registry entry (clone
+        // observed after the check) or have it removed out from under a live
+        // clone, so the increment must happen inside the same critical section.
+        let _registry = PROGRAMS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("XDP program registry mutex poisoned");
         Self {
             if_index: self.if_index,
-            program: Some(Arc::clone(
-                self.program
-                    .as_ref()
-                    .expect("XDP program handle cloned after drop"),
-            )),
+            program: Some(Arc::clone(program)),
         }
     }
 }
@@ -343,9 +352,10 @@ pub fn get_or_load(
 /// Releases a program registry reference when the last queue user drops it.
 ///
 /// The strong-count check is performed while holding the registry mutex, and
-/// `get_or_load` takes the same mutex before handing out fresh clones, so the
-/// count is stable for the duration of this critical section: a value of 2
-/// means "this caller + the registry slot itself" and nothing else.
+/// `get_or_load` *and* `XdpProgramHandle::clone` take the same mutex before
+/// bumping the count, so it is stable for the duration of this critical
+/// section: a value of 2 means "this caller + the registry slot itself" and
+/// nothing else.
 ///
 /// Note that a handle that is `mem::forget`'d will keep the strong count
 /// elevated forever, leaving an orphan registry entry behind. Callers that

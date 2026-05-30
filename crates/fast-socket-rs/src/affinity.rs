@@ -66,6 +66,18 @@ pub fn pin_current_thread_to_affinity(affinity: QueueAffinity) -> io::Result<Pin
 pub fn pin_current_thread_to_cpu(cpu: u32) -> io::Result<()> {
     let cpu = usize::try_from(cpu)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU index out of range"))?;
+    // `CPU_SET` indexes a fixed-size bitmap (`cpu_set_t`, `CPU_SETSIZE` bits);
+    // an index at/over that capacity would panic inside `CPU_SET`. Reject it
+    // with a clean error instead. Real IRQ CPU ids are far below this.
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "CPU index {cpu} exceeds CPU_SETSIZE ({})",
+                libc::CPU_SETSIZE
+            ),
+        ));
+    }
     // SAFETY: `set` is fully initialized by `CPU_ZERO`/`CPU_SET` before it is
     // passed to `sched_setaffinity`, and the size argument matches its type.
     #[allow(unsafe_code)]

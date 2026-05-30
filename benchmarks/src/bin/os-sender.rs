@@ -8,9 +8,7 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use fast_socket_benchmarks::{BoxError, Progress, RunLimit, payload, write_sequence};
 use fast_socket_os_rs::{OsPacketBuf, OsUdpSocket, OsUdpSocketBuilder};
-use fast_socket_rs::{
-    BufferLayout, BufferPool, PacketBufferMut, TxSlot, UdpSocket, UdpTransmit,
-};
+use fast_socket_rs::{BufferLayout, BufferPool, PacketBufferMut, TxSlot, UdpSocket, UdpTransmit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
@@ -18,7 +16,9 @@ enum Mode {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "OS UDP sender: blast packets at a destination as fast as the socket accepts them")]
+#[command(
+    about = "OS UDP sender: blast packets at a destination as fast as the socket accepts them"
+)]
 struct Cli {
     /// Sender mode (only `blast` is supported).
     #[arg(value_enum)]

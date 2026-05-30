@@ -141,7 +141,9 @@ pub trait RawDevice {
             total.dropped_fragments = total
                 .dropped_fragments
                 .saturating_add(stats.dropped_fragments);
-            total.dropped_oversize = total.dropped_oversize.saturating_add(stats.dropped_oversize);
+            total.dropped_oversize = total
+                .dropped_oversize
+                .saturating_add(stats.dropped_oversize);
             total.dropped_rx_oversize = total
                 .dropped_rx_oversize
                 .saturating_add(stats.dropped_rx_oversize);

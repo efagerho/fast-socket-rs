@@ -3,21 +3,24 @@ mod common;
 
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
 use fast_socket_rs::{
-    LinkAddr, NeighborTable, PacketBufferMut, QueueId, RouteHop, RouteTable, TxSlot,
+    LinkAddr, NeighborTable, PacketBufferMut, RouteHop, RouteTable, TxSlot,
     UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut, V4Only,
 };
 use fast_socket_xdp_rs::{
-    resolve_xdp_queue_slot, XdpEgress, XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
+    InterfaceSelector, PortFilter, XdpEgress, XdpFactoryBuilder, XdpRouteContext, XdpUdpRouter,
+    XdpUdpSocket,
 };
 
 use common::{
-    dynamic_source_port, install_shutdown_signal_handlers, interface_ipv4_addr, shutdown_requested,
-    BoxError,
+    BoxError, dynamic_source_port, install_shutdown_signal_handlers, interface_ipv4_addr,
+    shutdown_requested,
 };
 
 const PAYLOAD_LEN: usize = 64;
@@ -36,6 +39,12 @@ struct Args {
     /// Destination MAC address used for every routed IP.
     #[arg(long)]
     mac: LinkAddr,
+
+    /// Number of worker threads. All NIC queues are used and split into this
+    /// many contiguous blocks; each thread drives one aggregate socket (with the
+    /// custom router) over its queues/threads queues. Must divide the queue count.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,42 +101,85 @@ fn main() -> Result<(), BoxError> {
     install_shutdown_signal_handlers()?;
     let args = Args::parse();
     let target: SocketAddr = args.target.into();
-    let slot = resolve_xdp_queue_slot(&args.device, QueueId::new(0))?;
     let local = SocketAddrV4::new(interface_ipv4_addr(&args.device)?, dynamic_source_port());
-    let mtu = interface_mtu(&slot.iface)?;
-    let router = CustomRouter {
-        routes: DefaultRouteTable {
-            ifindex: slot.ifindex,
-        },
-        arp: ConstantArpTable { mac: args.mac },
-        src_mac: interface_mac(&slot.iface)?,
-        mtu,
-    };
-    let mut socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
+    let mtu = interface_mtu(&args.device)?;
+    let src_mac = interface_mac(&args.device)?;
+    // Phase 1: discover queues, attach the program, partition into `threads`
+    // worker plans (one aggregate socket each).
+    let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(args.device.clone()))?
+        .threads(args.threads)
+        .port_filter(PortFilter::UdpPorts(vec![local.port()]))
         .mtu(mtu as usize)
-        .router(router)
-        .open_busy_poll()?;
-    let payload = payload();
-    let mut sent = 0u64;
-
+        .build()?;
+    let plans = factory.into_worker_plans();
     eprintln!(
-        "custom-router: sending 64-byte UDP payloads from {local} to {} via {:?} every second",
-        args.target, args.mac
+        "custom-router: {} aggregate socket(s) / thread(s) sending 64-byte UDP payloads from \
+         {local} to {} via {:?} every second",
+        plans.len(),
+        args.target,
+        args.mac
     );
 
-    // Reuse the same scratch Vec across iterations so the 1 Hz sender does
-    // not allocate per call. send_one only needs space for one packet.
-    let mut tx_buffers: Vec<UdpTxBufferMut<XdpUdpSocket>> = Vec::with_capacity(1);
-    let mut batch: Vec<TxSlot<UdpTransmit<UdpTxBuffer<XdpUdpSocket>>>> = Vec::with_capacity(1);
-
-    while !shutdown_requested() {
-        send_one(&mut socket, target, &payload, &mut tx_buffers, &mut batch)?;
-        sent = sent.saturating_add(1);
-        eprintln!("custom-router: sent {sent} packets");
-        thread::sleep(SEND_INTERVAL);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let stop = Arc::clone(&stop);
+        let mac = args.mac;
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            let router = CustomRouter {
+                routes: DefaultRouteTable {
+                    ifindex: plan.ifindex(),
+                },
+                arp: ConstantArpTable { mac },
+                src_mac,
+                mtu,
+            };
+            // Phase 2: pin + open this worker's aggregate with the custom router.
+            let mut aggregate = plan
+                .open_udp_busy_poll_with_router(local, || router)
+                .map_err(|error| error.to_string())?;
+            run_custom_router(&mut aggregate, target, &stop).map_err(|error| error.to_string())
+        }));
     }
 
-    socket.drain_tx_completions()?;
+    while !shutdown_requested() {
+        thread::sleep(Duration::from_millis(200));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err("custom-router worker thread panicked".into()),
+        }
+    }
+    Ok(())
+}
+
+/// A UDP socket using the [`CustomRouter`], and its TX scratch types.
+type RouterSocket = XdpUdpSocket<fast_socket_rs::BusyPollDriver, CustomRouter>;
+type RouterAggregate =
+    fast_socket_xdp_rs::XdpUdpAggregate<fast_socket_rs::BusyPollDriver, CustomRouter>;
+type RouterTxBufMut = UdpTxBufferMut<RouterSocket>;
+type RouterTxItem = TxSlot<UdpTransmit<UdpTxBuffer<RouterSocket>>>;
+
+/// Sends one 64-byte payload per member queue every [`SEND_INTERVAL`] until
+/// `stop`, exercising the custom router on each member.
+fn run_custom_router(
+    aggregate: &mut RouterAggregate,
+    target: SocketAddr,
+    stop: &AtomicBool,
+) -> Result<(), BoxError> {
+    let payload = payload();
+    let mut tx_buffers: Vec<RouterTxBufMut> = Vec::with_capacity(1);
+    let mut batch: Vec<RouterTxItem> = Vec::with_capacity(1);
+    while !stop.load(Ordering::Relaxed) && !shutdown_requested() {
+        for socket in aggregate.members_mut() {
+            send_one(socket, target, &payload, &mut tx_buffers, &mut batch)?;
+            socket.drain_tx_completions()?;
+        }
+        thread::sleep(SEND_INTERVAL);
+    }
     Ok(())
 }
 
@@ -183,7 +235,9 @@ fn payload() -> [u8; PAYLOAD_LEN] {
 
 fn interface_mac(iface: &str) -> Result<LinkAddr, BoxError> {
     let raw = fs::read_to_string(format!("/sys/class/net/{iface}/address"))?;
-    raw.trim().parse().map_err(|error| format!("{error}").into())
+    raw.trim()
+        .parse()
+        .map_err(|error| format!("{error}").into())
 }
 
 fn interface_mtu(iface: &str) -> Result<u32, BoxError> {

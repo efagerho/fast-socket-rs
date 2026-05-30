@@ -209,9 +209,9 @@ struct MpscQueue<T: Send> {
     inner: ArrayQueue<T>,
     // Pending or imminently pending entries in `inner`. Cross-thread pushes
     // reserve a slot before publishing into `inner`; the owner thread
-    // decrements as it drains. The hot drain path loads this with Relaxed and
-    // skips touching `inner` when zero, so single-threaded workloads never pay
-    // the cross-thread cache-line cost on `inner.pop`.
+    // decrements as it drains. The drain gate loads this with `Acquire` to
+    // pair with the producer's `Release` increment, so once the owner observes
+    // a non-zero count the corresponding `inner.push` is visible to its `pop`.
     len: AtomicUsize,
 }
 
@@ -232,7 +232,7 @@ impl<T: Send> MpscQueue<T> {
     }
 
     fn is_empty(&self) -> bool {
-        self.len.load(Ordering::Relaxed) == 0
+        self.len.load(Ordering::Acquire) == 0
     }
 
     fn drain_into(&self, out: &mut Vec<T>) {
@@ -758,6 +758,16 @@ impl XdpPacketBuf {
         })
     }
 
+    /// Marks this buffer as handed to the kernel's TX ring, disarming the
+    /// `Drop` reclaim.
+    ///
+    /// For `Umem` storage the frame is reclaimed later through the COMPLETION
+    /// ring, so dropping the reclaim handle here is correct. For the `Heap`
+    /// fallback (test / unprivileged mode only) there is no completion ring, so
+    /// the boxed frame is intentionally **not** returned to the heap pool — a
+    /// submitted heap buffer is consumed. Production uses `Umem` storage; the
+    /// heap path is scaffolding where leaking a pooled buffer per submit is
+    /// acceptable.
     pub(crate) fn into_submitted(mut self) {
         if let Some(storage) = self.storage.as_mut() {
             match storage {

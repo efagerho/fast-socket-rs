@@ -2,9 +2,9 @@
 mod common;
 
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -14,10 +14,13 @@ use fast_socket_rs::{
     UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer,
 };
 
+use fast_socket_xdp_rs::{
+    BusyPollXdpUdpSocket, InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder,
+};
+
 use common::{
-    attach_xdp_programs, install_shutdown_signal_handlers, interface_ipv4_addr, open_os_udp_socket,
-    open_xdp_udp_socket, pin_current_thread_to_cpu, queue_plan, shutdown_requested,
-    xdp_program_for_slot, BoxError, Mode, Progress,
+    BoxError, Mode, Progress, install_shutdown_signal_handlers, interface_ipv4_addr,
+    open_os_udp_socket, pin_current_thread_to_cpu, queue_plan, shutdown_requested,
 };
 
 const PAYLOAD_LEN: usize = 64;
@@ -39,6 +42,12 @@ struct Args {
     /// Socket backend to use.
     #[arg(long, value_enum, ignore_case = true)]
     mode: Mode,
+
+    /// XDP mode only: number of worker threads. All NIC queues are used and
+    /// split into this many contiguous blocks; each thread drives one aggregate
+    /// socket over its queues/threads queues. Must divide the queue count.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
 }
 
 fn main() -> Result<(), BoxError> {
@@ -47,7 +56,7 @@ fn main() -> Result<(), BoxError> {
 
     match args.mode {
         Mode::Os => run_os(args.device, args.target),
-        Mode::Xdp => run_xdp(args.device, args.target),
+        Mode::Xdp => run_xdp(args.device, args.target, args.threads),
     }
 }
 
@@ -92,44 +101,105 @@ fn run_os(device: String, target: SocketAddrV4) -> Result<(), BoxError> {
         bind
     );
 
-    run_workers("pong-server os", plans, move |plan, stop, total| {
-        pin_current_thread_to_cpu(plan.cpu)?;
-        let mut socket = open_os_udp_socket(
-            &device,
-            bind,
-            plan.cpu,
-            QueueId::new(plan.slot.flat_index.get()),
-            PAYLOAD_LEN,
-        )?;
-        pong_server(&mut socket, &stop, &total)
-    })
+    run_workers(
+        "pong-server os",
+        plans,
+        |plan| plan.cpu,
+        move |plan, stop, total| {
+            pin_current_thread_to_cpu(plan.cpu)?;
+            let mut socket = open_os_udp_socket(
+                &device,
+                bind,
+                plan.cpu,
+                QueueId::new(plan.slot.flat_index.get()),
+                PAYLOAD_LEN,
+            )?;
+            pong_server(&mut socket, &stop, &total)
+        },
+    )
 }
 
-fn run_xdp(device: String, target: SocketAddrV4) -> Result<(), BoxError> {
-    let plans = queue_plan(&device)?;
-    let programs = Arc::new(attach_xdp_programs(&plans)?);
+fn run_xdp(device: String, target: SocketAddrV4, threads: usize) -> Result<(), BoxError> {
     let local = SocketAddrV4::new(interface_ipv4_addr(&device)?, target.port());
+    let routes = RouteSnapshot::from_netlink()?;
+    // Phase 1: discover queues, attach the program, partition into `threads`
+    // worker plans (one aggregate socket each over queues/threads queues).
+    let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(device))?
+        .threads(threads)
+        .port_filter(PortFilter::UdpPorts(vec![target.port()]))
+        .route_snapshot(routes)
+        .build()?;
+    let plans = factory.into_worker_plans();
     eprintln!(
-        "pong-server xdp: {} queue sockets bound to {} with egress toward {}",
+        "pong-server xdp: {} aggregate socket(s) / thread(s) bound to {} with egress toward {}",
         plans.len(),
         local,
         target.ip()
     );
 
-    run_workers("pong-server xdp", plans, move |plan, stop, total| {
-        pin_current_thread_to_cpu(plan.cpu)?;
-        let program = xdp_program_for_slot(&programs, &plan.slot)?;
-        let mut socket = open_xdp_udp_socket(&plan.slot, local, target, program)?;
-        pong_server(&mut socket, &stop, &total)
-    })
+    run_workers(
+        "pong-server xdp",
+        plans,
+        |plan| plan.cpu(),
+        move |plan, stop, total| {
+            // Pins to plan.cpu() and opens this worker's aggregate.
+            let mut aggregate = plan.open_udp_busy_poll(local)?;
+            pong_aggregate(&mut aggregate, &stop, &total)
+        },
+    )
 }
 
-fn run_workers<F>(name: &'static str, plans: Vec<common::QueuePlan>, run: F) -> Result<(), BoxError>
+/// Pongs across every member of an aggregate, round-robin. Reflection leaves on
+/// the queue a frame arrived on (each member owns its shared-UMEM frame slice).
+fn pong_aggregate(
+    aggregate: &mut fast_socket_xdp_rs::XdpUdpAggregate<
+        fast_socket_rs::BusyPollDriver,
+        fast_socket_xdp_rs::XdpQueueLocalRouter,
+    >,
+    stop: &AtomicBool,
+    reflected: &AtomicU64,
+) -> Result<(), BoxError> {
+    let mut rx: RecvBatch<UdpReceive<UdpRxBuffer<BusyPollXdpUdpSocket>, UdpRecvMeta>> =
+        RecvBatch::with_capacity(BATCH_SIZE);
+    let mut tx: Vec<TxSlot<UdpTransmit<UdpTxBuffer<BusyPollXdpUdpSocket>>>> =
+        Vec::with_capacity(BATCH_SIZE);
+
+    while !stop.load(Relaxed) && !shutdown_requested() {
+        let mut progress = 0usize;
+        for socket in aggregate.members_mut() {
+            rx.clear();
+            if socket.recv(&mut rx)? == 0 {
+                socket.drain_tx_completions()?;
+                continue;
+            }
+            tx.clear();
+            for item in rx.drain() {
+                tx.push(TxSlot::Ready(UdpTransmit::new(
+                    item.packet.freeze(),
+                    item.meta.source,
+                )));
+            }
+            reflected.fetch_add(send_all(socket, &mut tx)? as u64, Relaxed);
+            socket.drain_tx_completions()?;
+            progress += 1;
+        }
+        if progress == 0 {
+            thread::sleep(Duration::from_micros(50));
+        }
+    }
+    Ok(())
+}
+
+fn run_workers<P, C, F>(
+    name: &'static str,
+    plans: Vec<P>,
+    cpu_of: C,
+    run: F,
+) -> Result<(), BoxError>
 where
-    F: Fn(common::QueuePlan, Arc<AtomicBool>, Arc<AtomicU64>) -> Result<(), BoxError>
-        + Send
-        + Sync
-        + 'static,
+    P: Send + 'static,
+    C: Fn(&P) -> u32,
+    F: Fn(P, Arc<AtomicBool>, Arc<AtomicU64>) -> Result<(), BoxError> + Send + Sync + 'static,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
@@ -138,12 +208,12 @@ where
     let mut handles = Vec::with_capacity(plans.len());
 
     for plan in plans {
+        let cpu = cpu_of(&plan);
         let worker_stop = Arc::clone(&stop);
         let worker_total = Arc::clone(&total);
         let worker_error_tx = error_tx.clone();
         let worker_run = Arc::clone(&run);
         handles.push(thread::spawn(move || {
-            let cpu = plan.cpu;
             if let Err(error) = worker_run(plan, worker_stop.clone(), worker_total) {
                 let _ = worker_error_tx.send(format!("worker cpu {cpu}: {error}"));
                 worker_stop.store(true, Relaxed);

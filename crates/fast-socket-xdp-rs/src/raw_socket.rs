@@ -69,10 +69,7 @@ impl XdpMode {
 /// How a [`RawXdpSocket`] obtains its UMEM at bind time.
 enum UmemBinding<'a> {
     /// This socket registers the UMEM via `XDP_UMEM_REG` and binds as its owner.
-    Owner {
-        umem: &'a Umem,
-        umem_headroom: u32,
-    },
+    Owner { umem: &'a Umem, umem_headroom: u32 },
     /// This socket shares an already-registered UMEM owned by `shared_fd`,
     /// skipping `XDP_UMEM_REG` and binding with `XDP_SHARED_UMEM`.
     Shared { shared_fd: RawFd },
@@ -299,10 +296,7 @@ impl RawXdpSocket {
                 fill_prod.commit();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "pre_fill_frames exceeds FILL ring capacity {}",
-                        sizes.fill
-                    ),
+                    format!("pre_fill_frames exceeds FILL ring capacity {}", sizes.fill),
                 ));
             };
             // SAFETY: index was reserved from the FILL ring producer.
@@ -518,7 +512,8 @@ impl RawXdpSocket {
         let first_len = (cap - start).min(completed);
         // SAFETY: the range was reserved from the COMPLETION consumer cursor;
         // the slice covers indices already published by the kernel.
-        let first = unsafe { std::slice::from_raw_parts(self.comp_mmap.desc.add(start), first_len) };
+        let first =
+            unsafe { std::slice::from_raw_parts(self.comp_mmap.desc.add(start), first_len) };
         let second_len = completed - first_len;
         let second = if second_len > 0 {
             // SAFETY: the wrap-around tail starts at index 0 of the ring.

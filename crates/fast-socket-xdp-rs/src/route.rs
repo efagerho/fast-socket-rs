@@ -77,9 +77,7 @@ impl RouteSnapshot {
     pub fn from_netlink_table(table: u32) -> io::Result<Self> {
         // Stamp every interface with queue 0; queue-aware lookups go through
         // `egress_v4_for_interface` and override this value.
-        let queue = QueueId::new(0);
-        let _ = queue; // silence warning if upstream renames the field
-        Self::build_netlink_snapshot(queue, table)
+        Self::build_netlink_snapshot(QueueId::new(0), table)
     }
 
     fn build_netlink_snapshot(queue: QueueId, table: u32) -> io::Result<Self> {
@@ -99,29 +97,36 @@ impl RouteSnapshot {
 
         // Bulk-insert without re-sorting between each route; the sort is
         // amortized to a single O(n log n) pass at the end.
-        snapshot.upsert_routes_v4(netlink_get_routes(libc::AF_INET as u8, table)?.into_iter().filter_map(
-            |route| {
-                let ifindex = route.out_ifindex?;
-                let destination = match route.destination {
-                    Some(IpAddr::V4(destination)) => destination,
-                    None => Ipv4Addr::UNSPECIFIED,
-                    Some(IpAddr::V6(_)) => return None,
-                };
-                let gateway = match route.gateway {
-                    Some(IpAddr::V4(gateway)) => Some(gateway),
-                    None => None,
-                    Some(IpAddr::V6(_)) => return None,
-                };
-                Some(Ipv4Route {
-                    destination,
-                    prefix_len: route.dst_len.min(32),
-                    ifindex,
-                    gateway,
-                    priority: route.priority.unwrap_or(u32::MAX),
-                    mtu: u32::MAX,
-                })
-            },
-        ));
+        snapshot.upsert_routes_v4(
+            netlink_get_routes(libc::AF_INET as u8, table)?
+                .into_iter()
+                .filter_map(|route| {
+                    let ifindex = route.out_ifindex?;
+                    let destination = match route.destination {
+                        Some(IpAddr::V4(destination)) => destination,
+                        None => Ipv4Addr::UNSPECIFIED,
+                        Some(IpAddr::V6(_)) => return None,
+                    };
+                    let gateway = match route.gateway {
+                        Some(IpAddr::V4(gateway)) => Some(gateway),
+                        None => None,
+                        Some(IpAddr::V6(_)) => return None,
+                    };
+                    Some(Ipv4Route {
+                        destination,
+                        prefix_len: route.dst_len.min(32),
+                        ifindex,
+                        gateway,
+                        priority: route.priority.unwrap_or(u32::MAX),
+                        // Per-route MTU lives in the nested RTA_METRICS/RTAX_MTU
+                        // attribute, which the netlink parser does not read; `MAX`
+                        // means "no per-route cap", so egress falls back to the
+                        // interface MTU (`route.mtu.min(interface.mtu)`). A lower
+                        // PMTU pinned on a specific route is therefore not honored.
+                        mtu: u32::MAX,
+                    })
+                }),
+        );
 
         for neighbor in netlink_get_neighbors(None, libc::AF_INET as u8)? {
             let (Some(IpAddr::V4(ip)), Some(mac)) = (neighbor.destination, neighbor.lladdr) else {
@@ -265,6 +270,15 @@ impl RouteTable<V4Only> for RouteSnapshot {
 }
 
 impl NeighborTable<V4Only> for RouteSnapshot {
+    /// Best-effort L2 resolution by next-hop IP **only**.
+    ///
+    /// The `NeighborTable` trait has no interface parameter, so on a multi-homed
+    /// host where the same next-hop IP exists on more than one interface this
+    /// returns the first matching MAC across any interface and may pick the
+    /// wrong one. The AF_XDP transmit path does not use this method; it resolves
+    /// through the interface-keyed [`Self::egress_v4_for_interface`], which
+    /// disambiguates by `(ifindex, next_hop)`. Prefer that for queue-local
+    /// egress; this impl exists only for generic `NeighborTable` consumers.
     fn resolve_l2(&self, next_hop: Ipv4Addr) -> Option<LinkAddr> {
         self.neighbors_v4
             .iter()

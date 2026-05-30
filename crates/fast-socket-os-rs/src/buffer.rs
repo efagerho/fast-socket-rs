@@ -253,65 +253,49 @@ impl OwnedPacketBuffer for OsPacketBuf {
     }
 }
 
-impl PacketBuffer for OsPacketBuf {
-    type Segments<'a> = std::option::IntoIter<Segment<'a>>;
+/// The `PacketBuffer` read surface is identical for the immutable and mutable
+/// OS buffers (same `start`/`end`/`storage`/`layout` fields and `as_slice`), so
+/// emit it once for each type instead of duplicating the six methods.
+macro_rules! impl_os_packet_buffer {
+    ($ty:ty) => {
+        impl PacketBuffer for $ty {
+            type Segments<'a> = std::option::IntoIter<Segment<'a>>;
 
-    fn len(&self) -> usize {
-        self.end - self.start
-    }
+            fn len(&self) -> usize {
+                self.end - self.start
+            }
 
-    fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
-            .expect("packet start is above l2 headroom")
-    }
+            fn headroom(&self) -> usize {
+                self.start
+                    .checked_sub(self.layout.l2_headroom())
+                    .expect("packet start is above l2 headroom")
+            }
 
-    fn tailroom(&self) -> usize {
-        self.storage.len() - self.end
-    }
+            fn tailroom(&self) -> usize {
+                self.storage.len() - self.end
+            }
 
-    fn layout(&self) -> &BufferLayout {
-        &self.layout
-    }
+            fn layout(&self) -> &BufferLayout {
+                &self.layout
+            }
 
-    fn segments(&self) -> Self::Segments<'_> {
-        (!self.is_empty()).then_some(self.as_slice()).into_iter()
-    }
+            fn segments(&self) -> Self::Segments<'_> {
+                (!self.is_empty()).then_some(self.as_slice()).into_iter()
+            }
 
-    fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
-        read_contiguous(self.as_slice(), offset, dst)
-    }
+            fn read_at_exact(
+                &self,
+                offset: usize,
+                dst: &mut [u8],
+            ) -> Result<(), BufferAccessError> {
+                read_contiguous(self.as_slice(), offset, dst)
+            }
+        }
+    };
 }
 
-impl PacketBuffer for OsPacketBufMut {
-    type Segments<'a> = std::option::IntoIter<Segment<'a>>;
-
-    fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
-            .expect("packet start is above l2 headroom")
-    }
-
-    fn tailroom(&self) -> usize {
-        self.storage.len() - self.end
-    }
-
-    fn layout(&self) -> &BufferLayout {
-        &self.layout
-    }
-
-    fn segments(&self) -> Self::Segments<'_> {
-        (!self.is_empty()).then_some(self.as_slice()).into_iter()
-    }
-
-    fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
-        read_contiguous(self.as_slice(), offset, dst)
-    }
-}
+impl_os_packet_buffer!(OsPacketBuf);
+impl_os_packet_buffer!(OsPacketBufMut);
 
 impl PacketBufferMut for OsPacketBufMut {
     type Frozen = OsPacketBuf;
@@ -399,4 +383,3 @@ fn read_contiguous(packet: &[u8], offset: usize, dst: &mut [u8]) -> Result<(), B
     dst.copy_from_slice(src);
     Ok(())
 }
-

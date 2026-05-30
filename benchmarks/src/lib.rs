@@ -42,7 +42,6 @@ fn parse_duration_ms(value: &str) -> Result<Duration, std::num::ParseIntError> {
     Ok(Duration::from_millis(value.parse()?))
 }
 
-
 #[derive(Debug)]
 pub struct Progress {
     name: &'static str,
@@ -247,6 +246,22 @@ pub fn xdp_program_for_slot<'a>(
         )
         .into()
     })
+}
+
+/// Builds an [`InterfaceSelector`](fast_socket_xdp_rs::InterfaceSelector) from
+/// mutually-exclusive `--ifindex` / `--iface` CLI options.
+pub fn interface_selector(
+    ifindex: Option<u32>,
+    iface: Option<String>,
+) -> Result<fast_socket_xdp_rs::InterfaceSelector, BoxError> {
+    match (ifindex, iface) {
+        (Some(index), None) => Ok(fast_socket_xdp_rs::InterfaceSelector::Index(
+            fast_socket_rs::IfIndex::new(index),
+        )),
+        (None, Some(name)) => Ok(fast_socket_xdp_rs::InterfaceSelector::Name(name)),
+        (Some(_), Some(_)) => Err("use only one of --ifindex or --iface".into()),
+        (None, None) => Err("missing --ifindex N or --iface NAME".into()),
+    }
 }
 
 /// Parsed IPv4/UDP header fields for benchmark listener loops.

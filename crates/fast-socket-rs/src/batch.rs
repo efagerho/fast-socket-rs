@@ -133,7 +133,8 @@ impl<T> RecvBatch<T> {
         self.items.is_empty()
     }
 
-    /// Returns the remaining number of items that can be pushed without reallocating.
+    /// Returns the number of items that can still be pushed before the batch is
+    /// full (its fixed `capacity` minus its current `len`).
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.capacity.saturating_sub(self.items.len())

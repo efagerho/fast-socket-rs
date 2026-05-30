@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -8,28 +7,20 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use fast_socket_benchmarks::{
-    BoxError, Progress, RunLimit, XdpProgramMap, attach_xdp_programs_for_slots,
-    install_shutdown_signal_handlers, parse_ipv4_udp, pin_current_thread_to_cpu, reflect_ipv4_udp,
-    shutdown_requested, xdp_program_for_slot,
+    BoxError, Progress, RunLimit, install_shutdown_signal_handlers, interface_selector,
+    parse_ipv4_udp, reflect_ipv4_udp, shutdown_requested,
 };
 use fast_socket_rs::{
-    IfIndex, IpPacketSocket, IpPacketTransmit, PacketBuffer, PacketBufferMut, RecvBatch,
-    TxSlot,
+    IpPacketSocket, IpPacketTransmit, PacketBuffer, PacketBufferMut, RawDevice, RecvBatch, TxSlot,
 };
 use fast_socket_xdp_rs::{
-    BusyPollXdpIpPacketSocket, RouteSnapshot, XdpIpPacketSocketBuilder, XdpQueueSlot,
-    cpu_for_xdp_queue, if_index_to_name, xdp_queue_slots_for_interface,
+    BusyPollXdpIpPacketSocket, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpWorkerPlan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
     Count,
     Pong,
-}
-
-struct QueueGroup {
-    cpu: u32,
-    slots: Vec<XdpQueueSlot>,
 }
 
 #[derive(Debug, Parser)]
@@ -51,6 +42,12 @@ struct Cli {
     #[arg(long)]
     bind: SocketAddrV4,
 
+    /// Number of worker threads. All NIC queues are used and split into this
+    /// many contiguous blocks; each thread drives one aggregate socket over its
+    /// queues/threads queues. Must divide the queue count.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
+
     #[command(flatten)]
     limit: RunLimit,
 }
@@ -59,45 +56,48 @@ fn main() -> Result<(), BoxError> {
     install_shutdown_signal_handlers()?;
     let cli = Cli::parse();
     let mode = cli.mode;
-    let slots = queue_slots_from_cli(cli.ifindex, cli.iface)?;
     let bind = cli.bind;
     let limit = cli.limit;
 
-    let programs = Arc::new(attach_xdp_programs_for_slots(&slots)?);
-    let groups = queue_groups_by_cpu(slots)?;
+    let selector = interface_selector(cli.ifindex, cli.iface)?;
+    let routes = RouteSnapshot::from_netlink()?;
+    // Phase 1: discover queues, attach the program with the bind port in the
+    // filter, partition into T worker plans (one aggregate over Q/T queues).
+    let factory = XdpFactoryBuilder::new(selector)?
+        .threads(cli.threads)
+        .port_filter(PortFilter::UdpPorts(vec![bind.port()]))
+        .route_snapshot(routes.clone())
+        .build()?;
+    let plans = factory.into_worker_plans();
     eprintln!(
-        "xdp-listener: {} queue sockets coalesced onto {} CPU threads",
-        groups.iter().map(|group| group.slots.len()).sum::<usize>(),
-        groups.len()
+        "xdp-listener: {} aggregate socket(s) / thread(s)",
+        plans.len()
     );
 
-    let routes = RouteSnapshot::from_netlink()?;
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
     let (error_tx, error_rx) = mpsc::channel::<String>();
-    let mut handles = Vec::with_capacity(groups.len());
+    let mut handles = Vec::with_capacity(plans.len());
 
-    for group in groups {
+    for plan in plans {
         let worker_routes = routes.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_total = Arc::clone(&total);
         let worker_dropped = Arc::clone(&dropped);
         let worker_error_tx = error_tx.clone();
-        let worker_programs = Arc::clone(&programs);
+        let cpu = plan.cpu();
         handles.push(thread::spawn(move || {
             if let Err(error) = run_worker(
                 mode,
-                group.cpu,
-                group.slots,
+                plan,
                 worker_routes,
-                worker_programs,
                 bind.port(),
                 worker_stop.clone(),
                 worker_total,
                 worker_dropped,
             ) {
-                let _ = worker_error_tx.send(format!("worker cpu {}: {error}", group.cpu));
+                let _ = worker_error_tx.send(format!("worker cpu {cpu}: {error}"));
                 worker_stop.store(true, Relaxed);
             }
         }));
@@ -140,59 +140,25 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-fn queue_slots_from_cli(
-    ifindex: Option<u32>,
-    iface: Option<String>,
-) -> Result<Vec<XdpQueueSlot>, BoxError> {
-    let iface = match (ifindex.map(IfIndex::new), iface) {
-        (Some(ifindex), None) => if_index_to_name(ifindex)?,
-        (None, Some(iface)) => iface,
-        (Some(_), Some(_)) => return Err("use only one of --ifindex or --iface".into()),
-        (None, None) => return Err("missing --ifindex N or --iface NAME".into()),
-    };
-    Ok(xdp_queue_slots_for_interface(&iface)?)
-}
-
-fn queue_groups_by_cpu(slots: Vec<XdpQueueSlot>) -> Result<Vec<QueueGroup>, BoxError> {
-    let mut by_cpu: BTreeMap<u32, Vec<XdpQueueSlot>> = BTreeMap::new();
-    for slot in slots {
-        let cpu = cpu_for_xdp_queue(&slot)?;
-        by_cpu.entry(cpu).or_default().push(slot);
-    }
-    Ok(by_cpu
-        .into_iter()
-        .map(|(cpu, slots)| QueueGroup { cpu, slots })
-        .collect())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn run_worker(
     mode: Mode,
-    cpu: u32,
-    slots: Vec<XdpQueueSlot>,
+    plan: XdpWorkerPlan,
     routes: RouteSnapshot,
-    programs: Arc<XdpProgramMap>,
     bind_port: u16,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
 ) -> Result<(), BoxError> {
-    pin_current_thread_to_cpu(cpu)?;
-
-    let mut sockets = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let program = xdp_program_for_slot(&programs, &slot)?;
-        let socket = XdpIpPacketSocketBuilder::new(slot.ifindex, slot.queue)
-            .bind_udp_port(bind_port)
-            .attached_program(program.clone())
-            .open_busy_poll()?;
-        sockets.push((slot, socket));
-    }
+    // Pins to plan.cpu() and opens one aggregate socket over this worker's
+    // queues, all sharing a single NUMA-local UMEM.
+    let mut aggregate = plan.open_ip_packet_busy_poll()?;
 
     let mut rx = RecvBatch::with_capacity(64);
     while !stop.load(Relaxed) && !shutdown_requested() {
         let mut delivered_this_pass = 0u64;
-        for (slot, socket) in &mut sockets {
+        // Per-member service: reflection must leave on the queue a frame arrived
+        // on (each member owns its own UMEM), so pong walks members directly.
+        for socket in aggregate.members_mut() {
             rx.clear();
             let received = socket.recv(&mut rx)?;
             if received == 0 {
@@ -207,9 +173,7 @@ fn run_worker(
             // even when zero useful work was done.
             delivered_this_pass += match mode {
                 Mode::Count => count_received(&mut rx, bind_port, &total, &dropped),
-                Mode::Pong => {
-                    pong_received(socket, &routes, slot, bind_port, &total, &dropped, &mut rx)?
-                }
+                Mode::Pong => pong_received(socket, &routes, bind_port, &total, &dropped, &mut rx)?,
             };
         }
         if delivered_this_pass == 0 {
@@ -243,11 +207,9 @@ fn count_received(
     delivered
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pong_received(
     socket: &mut BusyPollXdpIpPacketSocket,
     routes: &RouteSnapshot,
-    slot: &XdpQueueSlot,
     bind_port: u16,
     total: &AtomicU64,
     dropped: &AtomicU64,
@@ -257,6 +219,10 @@ fn pong_received(
         >,
     >,
 ) -> Result<u64, BoxError> {
+    // Egress is queue-local; derive the member's interface + NIC queue from the
+    // socket so reflected frames leave on the queue they arrived on.
+    let ifindex = RawDevice::ifindex(socket);
+    let queue = RawDevice::nic_queues(socket)[0];
     let mut delivered = 0u64;
     for mut item in rx.drain() {
         let Some(parsed) = parse_ipv4_udp(item.packet.segments().next().unwrap_or_default()) else {
@@ -275,8 +241,7 @@ fn pong_received(
             dropped.fetch_add(1, Relaxed);
             continue;
         };
-        let Some(egress) = routes.egress_v4_for_interface(destination, slot.ifindex, slot.queue)
-        else {
+        let Some(egress) = routes.egress_v4_for_interface(destination, ifindex, queue) else {
             dropped.fetch_add(1, Relaxed);
             continue;
         };
@@ -303,4 +268,3 @@ fn join_workers(handles: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError> {
     }
     Ok(())
 }
-

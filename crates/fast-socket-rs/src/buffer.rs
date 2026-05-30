@@ -648,6 +648,14 @@ impl PacketBufMut {
         &mut self.storage[self.start..self.end]
     }
 
+    /// Reallocates the backing storage with new headroom/tailroom, copying the
+    /// current packet bytes over. Note this rewrites the buffer's [`layout`]
+    /// facts: the rebuilt layout drops any fixed-chunk constraint and may grow
+    /// `payload_capacity` to fit the current packet, so a caller inspecting
+    /// [`layout`] after a relocating op (`prepend_relocating` /
+    /// `extend_from_slice_relocating`) can observe different values than before.
+    ///
+    /// [`layout`]: PacketBuffer::layout
     fn relocate(&mut self, headroom: usize, tailroom: usize) {
         let packet = self.as_slice().to_vec();
         let payload_capacity = self.layout.payload_capacity().max(packet.len());

@@ -340,10 +340,7 @@ fn irq_from_sysfs(iface: &str, queue: QueueId) -> io::Result<Option<u32>> {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("read {dir}: {error}"),
-            ));
+            return Err(io::Error::new(error.kind(), format!("read {dir}: {error}")));
         }
     };
     let queue_str = queue.get().to_string();
@@ -440,25 +437,25 @@ fn irq_from_proc_interrupts(iface: &str, queue: QueueId) -> io::Result<u32> {
 /// - `*comp{queue}*iface*`      (Mellanox `mlx5_comp42@eth0`)
 /// - `bnxt_en_{queue}_iface`    (Broadcom long form)
 ///
-/// The token must contain `iface` somewhere AND one of its alphanumeric
-/// sub-parts (split on `-`, `.`, `@`, `_`) must be exactly `queue_str` or
-/// must end in `queue_str` with an alphabetic prefix (e.g., `comp42`).
+/// One alphanumeric sub-part (split on `-`, `.`, `@`, `_`) must be **exactly**
+/// `iface` AND another must be exactly `queue_str` or end in `queue_str` with an
+/// alphabetic prefix (e.g., `comp42`). The interface match is on a whole
+/// delimiter-split component rather than a substring, so `eth1` does not match a
+/// token belonging to `eth10`.
 fn token_names_iface_queue(token: &str, iface: &str, queue_str: &str) -> bool {
-    if !token.contains(iface) {
+    let delimiters = ['-', '.', '@', '_'];
+    if !token.split(delimiters).any(|part| part == iface) {
         return false;
     }
-    token
-        .split(|c: char| c == '-' || c == '.' || c == '@' || c == '_')
-        .any(|part| {
-            if part == queue_str {
-                return true;
-            }
-            let Some(prefix) = part.strip_suffix(queue_str) else {
-                return false;
-            };
-            !prefix.is_empty()
-                && prefix.chars().all(|c| c.is_ascii_alphabetic())
-        })
+    token.split(delimiters).any(|part| {
+        if part == queue_str {
+            return true;
+        }
+        let Some(prefix) = part.strip_suffix(queue_str) else {
+            return false;
+        };
+        !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic())
+    })
 }
 
 fn parse_numa_node(raw: &str) -> Result<NumaNode, String> {

@@ -9,11 +9,15 @@
 #![deny(missing_docs)]
 
 #[cfg(target_os = "linux")]
+pub mod aggregate;
+#[cfg(target_os = "linux")]
 pub mod buffer;
 #[cfg(target_os = "linux")]
 pub mod config;
 #[cfg(target_os = "linux")]
 pub mod egress;
+#[cfg(target_os = "linux")]
+pub mod factory;
 #[cfg(target_os = "linux")]
 pub mod interface;
 #[cfg(target_os = "linux")]
@@ -34,11 +38,18 @@ pub mod socket;
 pub mod umem;
 
 #[cfg(target_os = "linux")]
+pub use aggregate::{XdpIpPacketAggregate, XdpUdpAggregate};
+#[cfg(target_os = "linux")]
 pub use buffer::{XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
 #[cfg(target_os = "linux")]
 pub use config::{XdpIpPacketSocketBuilder, XdpIpPacketSocketConfig, XdpUdpSocketBuilder};
 #[cfg(target_os = "linux")]
 pub use egress::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, XdpEgress};
+#[cfg(target_os = "linux")]
+pub use factory::{
+    InterfaceSelector, PortFilter, QueueClaim, XdpFactory, XdpFactoryBuilder, XdpWorkerPlan,
+    resolve_interface_index,
+};
 #[cfg(target_os = "linux")]
 pub use interface::{
     XdpQueueSlot, bond_slaves, cpu_for_xdp_queue, if_index_to_name, if_name_to_index,

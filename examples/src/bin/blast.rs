@@ -4,20 +4,25 @@ mod common;
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket as StdUdpSocket,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use common::{
-    BoxError, Mode, bind_udp_socket_to_device, dynamic_source_port, install_shutdown_signal_handlers,
+    BoxError, Mode, bind_udp_socket_to_device, install_shutdown_signal_handlers,
     interface_ipv4_addr, payload, shutdown_requested, write_sequence,
 };
 use fast_socket_os_rs::{OsUdpSocket, OsUdpSocketConfig};
+use fast_socket_rs::BusyPollDriver;
 use fast_socket_rs::{
     BufferLayout, PacketBufferMut, QueueAffinity, QueueId, TxSlot, UdpSocket as FastUdpSocket,
     UdpTransmit, UdpTxBuffer, UdpTxBufferMut,
 };
 use fast_socket_xdp_rs::{
-    BusyPollXdpUdpSocket, RouteSnapshot, XdpUdpSocket, if_name_to_index, resolve_xdp_queue_slot,
+    InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpQueueLocalRouter,
+    if_name_to_index,
 };
 
 const PAYLOAD_LEN: usize = 64;
@@ -37,6 +42,12 @@ struct Args {
     /// Socket backend to use.
     #[arg(long, value_enum, ignore_case = true)]
     mode: Mode,
+
+    /// XDP mode only: number of worker threads. All NIC queues are used and
+    /// split into this many contiguous blocks; each thread drives one aggregate
+    /// socket over its queues/threads queues. Must divide the queue count.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
 }
 
 fn main() -> Result<(), BoxError> {
@@ -46,14 +57,100 @@ fn main() -> Result<(), BoxError> {
     match args.mode {
         Mode::Xdp => {
             let target = socket_addr_v4(args.target)?;
-            let mut socket = open_xdp_socket(&args.device, target)?;
-            blaster(&mut socket, target.into())
+            run_xdp_blast(&args.device, target, args.threads)
         }
         Mode::Os => {
             let mut socket = open_os_socket(&args.device, args.target)?;
             blaster(&mut socket, args.target)
         }
     }
+}
+
+fn run_xdp_blast(device: &str, target: SocketAddrV4, threads: usize) -> Result<(), BoxError> {
+    let local_ip = interface_ipv4_addr(device)?;
+    let local = SocketAddrV4::new(local_ip, kernel_assigned_udp_port(local_ip)?);
+    let routes = RouteSnapshot::from_netlink()?;
+    // Phase 1: discover queues, attach the program, partition into `threads`
+    // worker plans (one aggregate socket each over queues/threads queues).
+    let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(device.to_string()))?
+        .threads(threads)
+        .port_filter(PortFilter::UdpPorts(vec![local.port()]))
+        .route_snapshot(routes)
+        .build()?;
+    let plans = factory.into_worker_plans();
+    eprintln!("blast xdp: {} aggregate socket(s) / thread(s)", plans.len());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let total = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    let mut handles = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let stop = Arc::clone(&stop);
+        let total = Arc::clone(&total);
+        let dest: SocketAddr = target.into();
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            // Pins to plan.cpu() and opens this worker's aggregate.
+            let mut aggregate = plan.open_udp_busy_poll(local).map_err(|e| e.to_string())?;
+            blast_aggregate(&mut aggregate, dest, &stop, &total).map_err(|e| e.to_string())
+        }));
+    }
+
+    while !shutdown_requested() {
+        thread::sleep(Duration::from_millis(200));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err("blast worker thread panicked".into()),
+        }
+    }
+    let count = total.load(std::sync::atomic::Ordering::Relaxed);
+    let elapsed = started.elapsed();
+    let rate = if elapsed.is_zero() {
+        0.0
+    } else {
+        count as f64 / elapsed.as_secs_f64()
+    };
+    println!("blast: {count} packets in {elapsed:?} ({rate:.0} packets/s)");
+    Ok(())
+}
+
+/// Blasts round-robin across an aggregate's member queues until `stop`.
+fn blast_aggregate(
+    aggregate: &mut fast_socket_xdp_rs::XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter>,
+    target: SocketAddr,
+    stop: &AtomicBool,
+    total: &AtomicU64,
+) -> Result<(), BoxError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let member_count = aggregate.len();
+    let mut next = 0usize;
+    let mut sequence = 0u64;
+    let mut payload_bytes = payload(PAYLOAD_LEN);
+    let mut tx_buffers = Vec::with_capacity(BATCH_SIZE);
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+    while !stop.load(Relaxed) && !shutdown_requested() {
+        let socket = &mut aggregate.members_mut()[next];
+        tx_buffers.clear();
+        batch.clear();
+        socket.allocate_tx_batch(&mut tx_buffers, BATCH_SIZE)?;
+        while let Some(mut packet) = tx_buffers.pop() {
+            write_sequence(&mut payload_bytes, sequence);
+            packet.extend_from_slice(&payload_bytes)?;
+            batch.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), target)));
+            sequence = sequence.wrapping_add(1);
+        }
+        if !batch.is_empty() {
+            let accepted = socket.send(batch.as_mut_slice())? as u64;
+            total.fetch_add(accepted, Relaxed);
+        }
+        socket.drain_tx_completions()?;
+        next = (next + 1) % member_count;
+    }
+    Ok(())
 }
 
 fn blaster<S>(socket: &mut S, target: SocketAddr) -> Result<(), BoxError>
@@ -125,27 +222,6 @@ where
         eprintln!("blast: dropped {dropped} packets to TX back-pressure (sequence-number gaps)");
     }
     Ok(())
-}
-
-fn open_xdp_socket(device: &str, target: SocketAddrV4) -> Result<BusyPollXdpUdpSocket, BoxError> {
-    let slot = resolve_xdp_queue_slot(device, QueueId::new(0))?;
-    // Ask the kernel for an unused ephemeral port instead of deriving one
-    // from the PID: PID-mod-port-range can collide with other concurrent
-    // blasters on the same host. There is a brief race window between
-    // closing the probe socket and binding it via AF_XDP, but it is
-    // dramatically less likely to collide than PID-mod allocation.
-    let local_ip = interface_ipv4_addr(device)?;
-    let local = SocketAddrV4::new(local_ip, kernel_assigned_udp_port(local_ip)?);
-    let _ = dynamic_source_port; // retain helper for callers that still want the legacy behavior
-    let routes = RouteSnapshot::from_netlink()?;
-    let egress = routes
-        .egress_v4_for_interface(*target.ip(), slot.ifindex, slot.queue)
-        .ok_or_else(|| format!("no queue-local netlink route/ARP entry for {}", target.ip()))?;
-    Ok(XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
-        .mtu(egress.mtu as usize)
-        .route_snapshot(routes)
-        .bind_udp_port(local.port())
-        .open_busy_poll()?)
 }
 
 fn kernel_assigned_udp_port(local_ip: Ipv4Addr) -> Result<u16, BoxError> {

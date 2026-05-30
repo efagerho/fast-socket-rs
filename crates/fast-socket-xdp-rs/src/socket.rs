@@ -192,11 +192,14 @@ struct XdpUdpTxContext {
     gso_segment_size: Option<core::num::NonZeroU16>,
 }
 
+/// A UDP TX frame whose headers and Ethernet L2 prefix are written into its
+/// UMEM frame and whose descriptor is staged in `tx_descs`. The slot was
+/// already `take()`n from the caller's batch; once the batch is committed each
+/// is marked submitted. (Enqueue accepts the whole reserved batch, so no
+/// per-entry slot/context is retained for a short-accept rollback.)
 #[derive(Debug)]
 struct PreparedLiveUdpTx {
-    slot_index: usize,
     packet: XdpPacketBuf,
-    context: XdpUdpTxContext,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -275,12 +278,12 @@ impl Drop for LiveXdpState {
                 return;
             }
         };
-        if let Some(port) = self.bound_port {
-            if let Err(error) = guard.unbind_port(port) {
-                eprintln!(
-                    "fast-socket-xdp: failed to unbind UDP port {port} for queue {queue_id} during drop: {error}"
-                );
-            }
+        if let Some(port) = self.bound_port
+            && let Err(error) = guard.unbind_port(port)
+        {
+            eprintln!(
+                "fast-socket-xdp: failed to unbind UDP port {port} for queue {queue_id} during drop: {error}"
+            );
         }
         if let Err(error) = guard.unregister_socket(queue_id) {
             eprintln!(
@@ -323,9 +326,7 @@ impl LiveXdpState {
         if frame_count < 2 || !frame_count.is_power_of_two() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "XDP frame_count must be a power of two >= 2 (got {frame_count})"
-                ),
+                format!("XDP frame_count must be a power of two >= 2 (got {frame_count})"),
             ));
         }
         let rx_frames = frame_count / 2;
@@ -384,11 +385,8 @@ impl LiveXdpState {
         // are immutable for the lifetime of the socket; recomputing them
         // on every send adds ~7% to the per-call cost of the pressure
         // check for no reason.
-        let tx_frame_count = (frame_count / 2) as usize;
-        let completion_threshold = ((config.rings.completion as usize) / 2).max(1);
-        let frame_threshold = (tx_frame_count / 2).max(1);
-        let drain_threshold = completion_threshold.min(frame_threshold);
-        let drain_interval = (drain_threshold / 2).max(1);
+        let (drain_threshold, drain_interval) =
+            tx_drain_hysteresis(config.rings.completion, frame_count);
 
         Ok(OpenedLiveXdp {
             rx_pool,
@@ -412,6 +410,195 @@ impl LiveXdpState {
                 tx_wake_pending: false,
             },
         })
+    }
+
+    /// Opens `queues.len()` member sockets over **one shared UMEM**.
+    ///
+    /// Member 0 registers the UMEM (`XDP_UMEM_REG`) and binds normally; members
+    /// 1..N bind it with `XDP_SHARED_UMEM` against member 0's fd. The UMEM is
+    /// partitioned into one disjoint frame slice per member, so each member runs
+    /// the proven single-queue RX/TX path over its own frames while the
+    /// (NUMA-local) DMA region is allocated and registered exactly once. The UDP
+    /// destination port, when set, is bound once in the shared program; every
+    /// member's queue is registered into `XSKMAP[queue]`.
+    ///
+    /// `config.frame_count` is the **per-member** frame count; the UMEM holds
+    /// `frame_count * queues.len()` frames (rounded up to a power of two for the
+    /// allocator, with the slack left untouched).
+    fn open_shared_members(
+        config: &XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+    ) -> std::io::Result<Vec<OpenedLiveXdp>> {
+        assert!(!queues.is_empty(), "open_shared_members requires >=1 queue");
+        // Reject duplicate queue ids: each member binds its own AF_XDP socket to
+        // `(ifindex, queue)` and registers into `XSKMAP[queue]`. A repeated queue
+        // would clobber the earlier member's XSKMAP entry and the second bind on
+        // the same queue would later fail with EBUSY — after the UMEM and member
+        // 0 are already live. Fail fast and cheaply instead.
+        for (index, queue) in queues.iter().enumerate() {
+            if queues[..index].contains(queue) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("open_shared_members got duplicate queue id {}", queue.get()),
+                ));
+            }
+        }
+        let numa_node = resolve_umem_numa_node(config)?;
+        let program = match &config.attached_program {
+            Some(program) => {
+                if program.if_index() != config.ifindex.get() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "attached XDP program if_index {} does not match socket if_index {}",
+                            program.if_index(),
+                            config.ifindex.get()
+                        ),
+                    ));
+                }
+                program.clone()
+            }
+            None => XdpProgramHandle::load(
+                config.ifindex.get(),
+                config.attach_mode,
+                config.program_bytes,
+            )?,
+        };
+
+        let frame_size = umem_frame_size(config)?;
+        let per_member = config.frame_count;
+        if per_member < 2 || !per_member.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("XDP frame_count must be a power of two >= 2 (got {per_member})"),
+            ));
+        }
+        let member_count = queues.len();
+        let total_frames =
+            u32::try_from(per_member as u64 * member_count as u64).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "shared UMEM frame count overflows u32",
+                )
+            })?;
+        let umem_frames = total_frames.next_power_of_two();
+        let per_rx = per_member / 2;
+        let umem_headroom = config
+            .buffers
+            .rx
+            .l2_headroom()
+            .try_into()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
+        let mut umem =
+            Umem::new_on_numa_node(frame_size, umem_frames, config.huge_page_size, numa_node)?;
+
+        // Member 0 registers the UMEM; members 1..N share it. Each member's
+        // FILL ring is prefilled from its own disjoint frame slice.
+        let mut raws: Vec<RawXdpSocket> = Vec::with_capacity(member_count);
+        let prefill0: Vec<u64> = (0..per_rx).map(|i| umem.frame_offset(i)).collect();
+        let raw0 = RawXdpSocket::new_with_umem_headroom(
+            config.ifindex.get(),
+            queues[0].get(),
+            &mut umem,
+            config.rings,
+            config.mode,
+            umem_headroom,
+            prefill0,
+        )?;
+        let owner_fd = raw0.fd();
+        raws.push(raw0);
+        let umem = Rc::new(umem);
+        for (index, queue) in queues.iter().enumerate().skip(1) {
+            let base = index as u32 * per_member;
+            let prefill: Vec<u64> = (base..base + per_rx)
+                .map(|i| umem.frame_offset(i))
+                .collect();
+            let raw = RawXdpSocket::new_shared_umem(
+                config.ifindex.get(),
+                queue.get(),
+                owner_fd,
+                config.rings,
+                config.mode,
+                prefill,
+            )?;
+            raws.push(raw);
+        }
+
+        // Register every member queue into XSKMAP and bind the UDP port once.
+        // Roll back registrations if any step fails before the live states
+        // (whose Drop owns cleanup) are built.
+        {
+            let mut guard = program.lock().expect("XDP program mutex poisoned");
+            let mut registered: Vec<u32> = Vec::with_capacity(member_count);
+            for (raw, queue) in raws.iter().zip(queues.iter()) {
+                if let Err(error) = guard.register_socket(queue.get(), raw.as_fd()) {
+                    for done in &registered {
+                        let _ = guard.unregister_socket(*done);
+                    }
+                    return Err(error);
+                }
+                registered.push(queue.get());
+            }
+            if let Some(port) = config.bind_udp_port
+                && let Err(error) = guard.bind_port(port)
+            {
+                for done in &registered {
+                    let _ = guard.unregister_socket(*done);
+                }
+                return Err(error);
+            }
+        }
+
+        // TX completion-drain hysteresis is sized per member (one member's
+        // rings/frames), identical across members.
+        let (drain_threshold, drain_interval) =
+            tx_drain_hysteresis(config.rings.completion, per_member);
+
+        let mut opened = Vec::with_capacity(member_count);
+        for (index, raw) in raws.into_iter().enumerate() {
+            let base = index as u32 * per_member;
+            let first_tx_frame_addr = umem.frame_offset(base + per_rx);
+            let tx_frames: Vec<u64> = (base + per_rx..base + per_member)
+                .map(|i| umem.frame_offset(i))
+                .collect();
+            let rx_reclaim = FrameReclaim::new(Vec::with_capacity(per_rx as usize));
+            let tx_reclaim = FrameReclaim::new(tx_frames);
+            let rx_pool =
+                XdpRxPool::live(config.buffers.rx, Rc::clone(&umem), Rc::clone(&rx_reclaim));
+            let tx_pool =
+                XdpTxPool::live(config.buffers.tx, Rc::clone(&umem), Rc::clone(&tx_reclaim));
+            // Only member 0 records the bound port, so exactly one Drop unbinds
+            // it from the shared program; every member unregisters its queue.
+            let bound_port = if index == 0 {
+                config.bind_udp_port
+            } else {
+                None
+            };
+            opened.push(OpenedLiveXdp {
+                rx_pool,
+                tx_pool,
+                state: Self {
+                    raw,
+                    umem: Rc::clone(&umem),
+                    rx_reclaim,
+                    first_tx_frame_addr,
+                    program: Some(program.clone()),
+                    bound_port,
+                    numa_node,
+                    pending_fill_scratch: Vec::with_capacity(config.rings.fill as usize),
+                    rx_descs: Vec::with_capacity(config.rings.rx as usize),
+                    tx_descs: Vec::with_capacity(config.rings.tx as usize),
+                    udp_tx_scratch: Vec::with_capacity(config.rings.tx as usize),
+                    tx_in_flight: 0,
+                    tx_since_completion_drain: 0,
+                    tx_completion_drain_threshold: drain_threshold,
+                    tx_completion_drain_interval: drain_interval,
+                    tx_wake_pending: false,
+                },
+            });
+        }
+        Ok(opened)
     }
 
     fn replenish_fill(&mut self) -> std::io::Result<()> {
@@ -444,21 +631,35 @@ impl LiveXdpState {
     }
 }
 
+/// Computes the cached TX completion-drain `(threshold, interval)` hysteresis
+/// pair for one socket. `completion_ring` is the COMPLETION ring depth and
+/// `frames_per_socket` is that socket's total UMEM frame count (its TX pool is
+/// half of it). Shared by the owned-UMEM `open` and the shared-UMEM
+/// `open_shared_members` so the two cannot drift.
+fn tx_drain_hysteresis(completion_ring: u32, frames_per_socket: u32) -> (usize, usize) {
+    let tx_frame_count = (frames_per_socket / 2) as usize;
+    let completion_threshold = ((completion_ring as usize) / 2).max(1);
+    let frame_threshold = (tx_frame_count / 2).max(1);
+    let drain_threshold = completion_threshold.min(frame_threshold);
+    let drain_interval = (drain_threshold / 2).max(1);
+    (drain_threshold, drain_interval)
+}
+
 fn resolve_umem_numa_node(config: &XdpIpPacketSocketConfig) -> std::io::Result<NumaNode> {
     let iface = if_index_to_name(config.ifindex)?;
     match numa_node_for_interface(&iface) {
         Ok(node) => {
-            if let Some(configured) = config.numa_node {
-                if configured != node {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "configured NUMA node {} does not match {iface} NUMA node {}",
-                            configured.get(),
-                            node.get()
-                        ),
-                    ));
-                }
+            if let Some(configured) = config.numa_node
+                && configured != node
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "configured NUMA node {} does not match {iface} NUMA node {}",
+                        configured.get(),
+                        node.get()
+                    ),
+                ));
             }
             Ok(node)
         }
@@ -490,6 +691,31 @@ impl XdpIpPacketSocket<BusyPollDriver> {
     /// Creates a busy-poll AF_XDP IP packet socket from config.
     pub fn new_busy_poll(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
         Self::with_driver(config, BusyPollDriver::new())
+    }
+
+    /// Opens one busy-poll member socket per queue over a single shared UMEM.
+    ///
+    /// All members share one NUMA-local UMEM (member 0 registers it; the rest
+    /// bind it with `XDP_SHARED_UMEM`) and one attached program, each over a
+    /// disjoint frame slice. Returned in `queues` order; wrap in
+    /// [`XdpIpPacketAggregate`](crate::XdpIpPacketAggregate) for one logical
+    /// socket. `config.frame_count` is the per-member frame count.
+    pub fn open_shared_busy_poll(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+    ) -> std::io::Result<Vec<Self>> {
+        let opened = LiveXdpState::open_shared_members(&config, queues)?;
+        let mut sockets = Vec::with_capacity(opened.len());
+        for (member, queue) in opened.into_iter().zip(queues.iter()) {
+            let mut member_config = config.clone();
+            member_config.queue_id = *queue;
+            let mut socket = construct_state(member_config, BusyPollDriver::new());
+            socket.rx_pool = member.rx_pool;
+            socket.tx_pool = member.tx_pool;
+            socket.live = Some(member.state);
+            sockets.push(socket);
+        }
+        Ok(sockets)
     }
 }
 
@@ -1044,10 +1270,7 @@ impl<D> XdpIpPacketSocket<D> {
             .live
             .as_ref()
             .is_some_and(|live| live.raw.tx_needs_wakeup());
-        let pending_retry = self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.tx_wake_pending);
+        let pending_retry = self.live.as_ref().is_some_and(|live| live.tx_wake_pending);
         let needs_wake = pending_retry || (accepted > 0 && live_needs_wakeup);
         if needs_wake {
             let live = self
@@ -1069,10 +1292,10 @@ impl<D> XdpIpPacketSocket<D> {
         // See send_udp_inner: post-send drain is redundant with the pre-drain
         // in the next allocate/send iteration.
 
-        if accepted == prepared {
-            if let Some(kind) = deferred_error {
-                return Err(SendError { accepted, kind });
-            }
+        if accepted == prepared
+            && let Some(kind) = deferred_error
+        {
+            return Err(SendError { accepted, kind });
         }
 
         Ok(accepted)
@@ -1159,6 +1382,40 @@ impl XdpUdpSocket<BusyPollDriver, XdpQueueLocalRouter> {
         local_addr: SocketAddrV4,
     ) -> crate::config::XdpUdpSocketBuilder {
         crate::config::XdpUdpSocketBuilder::new(ifindex, queue_id, local_addr)
+    }
+
+    /// Opens one busy-poll UDP member socket per queue over a single shared
+    /// UMEM (see [`XdpIpPacketSocket::open_shared_busy_poll`]). Each member gets
+    /// its own queue-local router seeded from `config.route_snapshot`. Wrap in
+    /// [`XdpUdpAggregate`](crate::XdpUdpAggregate) for one logical socket.
+    pub fn open_shared_busy_poll(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+    ) -> std::io::Result<Vec<Self>> {
+        let snapshot = config.route_snapshot.clone();
+        Self::open_shared_busy_poll_with(config, queues, local_addr, move || {
+            XdpQueueLocalRouter::new(snapshot.clone())
+        })
+    }
+}
+
+impl<R> XdpUdpSocket<BusyPollDriver, R> {
+    /// Opens one busy-poll UDP member socket per queue over a single shared
+    /// UMEM, building each member's router with `make_router` (called once per
+    /// member). Lets callers supply a custom [`XdpUdpRouter`].
+    pub fn open_shared_busy_poll_with(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        mut make_router: impl FnMut() -> R,
+    ) -> std::io::Result<Vec<Self>> {
+        let ip_members = XdpIpPacketSocket::open_shared_busy_poll(config, queues)?;
+        let mut sockets = Vec::with_capacity(ip_members.len());
+        for ip in ip_members {
+            sockets.push(Self::from_ip_socket(ip, local_addr, make_router()));
+        }
+        Ok(sockets)
     }
 }
 
@@ -1394,7 +1651,7 @@ where
             live.udp_tx_scratch.clear();
 
             let limit = batch.len().min(tx_available);
-            for (slot_index, slot) in batch.iter_mut().enumerate().take(limit) {
+            for slot in batch.iter_mut().take(limit) {
                 let Some(tx_ref) = slot.as_ref() else {
                     deferred_error = Some(Error::InvalidBatch);
                     break;
@@ -1441,11 +1698,7 @@ where
                     len: frame.len,
                     options: 0,
                 });
-                live.udp_tx_scratch.push(PreparedLiveUdpTx {
-                    slot_index,
-                    packet,
-                    context,
-                });
+                live.udp_tx_scratch.push(PreparedLiveUdpTx { packet });
             }
 
             prepared = live.tx_descs.len();
@@ -1457,7 +1710,16 @@ where
             }
 
             accepted = live.raw.enqueue_tx_batch(&live.tx_descs[..prepared]);
-            debug_assert_eq!(accepted, prepared);
+            // `prepared` is bounded by the reserved TX ring space and nothing
+            // produces between the reservation and here (the live socket is
+            // `!Send`), so enqueue must accept the whole prepared slice. A short
+            // accept would silently drop committed descriptors and leak their
+            // frames; surface that as a hard invariant violation (matches
+            // `send_inner`).
+            assert_eq!(
+                accepted, prepared,
+                "AF_XDP TX ring accepted fewer descriptors than reserved",
+            );
             if accepted > 0 {
                 live.raw.commit_tx();
                 live.tx_in_flight = live.tx_in_flight.saturating_add(accepted);
@@ -1465,18 +1727,9 @@ where
                     live.tx_since_completion_drain.saturating_add(accepted);
             }
 
-            let unaccepted = (accepted < prepared).then(|| live.udp_tx_scratch.split_off(accepted));
             for prepared in live.udp_tx_scratch.drain(..) {
                 tx_bytes = tx_bytes.saturating_add(prepared.packet.len() as u64);
                 prepared.packet.into_submitted();
-            }
-
-            if let Some(unaccepted) = unaccepted {
-                for prepared in unaccepted {
-                    let tx = restore_xdp_udp_transmit(prepared.packet, prepared.context)
-                        .map_err(|kind| SendError { accepted, kind })?;
-                    batch[prepared.slot_index] = TxSlot::Ready(tx);
-                }
             }
 
             // Gate the doorbell on `XDP_RING_NEED_WAKEUP`: while the
@@ -1485,8 +1738,7 @@ where
             // `send_inner` for the race-window / end-of-stream notes; the
             // same reasoning applies here. Always retry a pending wake
             // left over from a prior failure.
-            let needs_wake = live.tx_wake_pending
-                || (accepted > 0 && live.raw.tx_needs_wakeup());
+            let needs_wake = live.tx_wake_pending || (accepted > 0 && live.raw.tx_needs_wakeup());
             if needs_wake {
                 match live.raw.wake_tx() {
                     Ok(()) => live.tx_wake_pending = false,
@@ -1515,10 +1767,10 @@ where
         // `send_udp_inner`); draining here would re-run the same threshold check
         // a few cycles earlier without changing which iteration actually drains.
 
-        if accepted == prepared {
-            if let Some(kind) = deferred_error {
-                return Err(SendError { accepted, kind });
-            }
+        if accepted == prepared
+            && let Some(kind) = deferred_error
+        {
+            return Err(SendError { accepted, kind });
         }
 
         Ok(accepted)
@@ -1617,8 +1869,7 @@ where
             // reject every packet because the kernel always fills in the
             // real interface address as the L3 destination.
             let local_ip = *local_addr.ip();
-            let dest_matches =
-                local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
+            let dest_matches = local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
             if !dest_matches || parsed.destination_port != local_addr.port() {
                 rx_reclaim.push(frame_addr);
                 continue;

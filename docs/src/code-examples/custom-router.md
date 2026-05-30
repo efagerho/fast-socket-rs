@@ -1,9 +1,10 @@
 # Custom Router
 
 The `custom-router` example demonstrates AF_XDP UDP construction with a
-user-provided router. It sends one fixed 64-byte UDP payload per second to
-`--target`, but it does not use the Linux route and neighbor tables for transmit
-egress. Instead, every destination resolves through a route table whose next hop
+user-provided router, built through the factory. It sends one fixed 64-byte UDP
+payload per second per queue to `--target`, but it does not use the Linux route
+and neighbor tables for transmit egress. Instead, every destination resolves
+through a route table whose next hop
 is `0.0.0.0`, and an ARP table that returns the `--mac` address for every
 next-hop lookup.
 
@@ -88,46 +89,54 @@ impl XdpUdpRouter for CustomRouter {
 
 ## Socket Setup
 
-`main` resolves queue 0 for `--device`, chooses a local IPv4 address and dynamic
-source port, builds the custom router, and passes it to the UDP-level builder
-with `.router(router)`.
+`main` builds a factory over the device, takes one worker plan, builds the
+custom router from the plan's interface, and opens the worker's aggregate with
+`open_udp_busy_poll_with_router` — the factory opener that accepts a
+caller-supplied `XdpUdpRouter` (the default openers use `XdpQueueLocalRouter`).
+The opener pins the thread to `plan.cpu()` and shares one UMEM across the
+aggregate's queues.
 
 ```rust,ignore
-let slot = resolve_xdp_queue_slot(&args.device, QueueId::new(0))?;
 let local = SocketAddrV4::new(interface_ipv4_addr(&args.device)?, dynamic_source_port());
-let mtu = interface_mtu(&slot.iface)?;
-let router = CustomRouter {
-    routes: DefaultRouteTable {
-        ifindex: slot.ifindex,
-    },
-    arp: ConstantArpTable { mac: args.mac },
-    src_mac: interface_mac(&slot.iface)?,
-    mtu,
-};
+let mtu = interface_mtu(&args.device)?;
+let src_mac = interface_mac(&args.device)?;
 
-let mut socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
+let factory = XdpFactoryBuilder::new(InterfaceSelector::Name(args.device.clone()))?
+    .threads(args.threads)
+    .port_filter(PortFilter::UdpPorts(vec![local.port()]))
     .mtu(mtu as usize)
-    .router(router)
-    .open_busy_poll()?;
+    .build()?;
+
+for plan in factory.into_worker_plans() {
+    let router = CustomRouter {
+        routes: DefaultRouteTable { ifindex: plan.ifindex() },
+        arp: ConstantArpTable { mac: args.mac },
+        src_mac,
+        mtu,
+    };
+    // Pins to plan.cpu(); one aggregate socket over this worker's queues.
+    let mut aggregate = plan.open_udp_busy_poll_with_router(local, || router)?;
+    // ... spawn a worker that sends across aggregate.members_mut() ...
+}
 ```
 
 ## Main Loop
 
-The main loop sends one packet, reports the count, and sleeps for one second
-until a shutdown signal arrives.
+Each worker loop sends one packet per member queue, then sleeps for one second
+until a shutdown signal arrives. `aggregate.members_mut()` yields the worker's
+queues; reflection/transmit on each member stays on that member's shared-UMEM
+frame slice.
 
 ```rust,ignore
 let payload = payload();
-let mut sent = 0u64;
 
 while !shutdown_requested() {
-    send_one(&mut socket, target, &payload)?;
-    sent = sent.saturating_add(1);
-    eprintln!("custom-router: sent {sent} packets");
+    for socket in aggregate.members_mut() {
+        send_one(socket, target, &payload)?;
+        socket.drain_tx_completions()?;
+    }
     thread::sleep(SEND_INTERVAL);
 }
-
-socket.drain_tx_completions()?;
 ```
 
 `send_one` uses the generic `UdpSocket` transmit path. It allocates one TX
@@ -199,20 +208,20 @@ impl XdpUdpRouter for SingleDestinationRouter {
 }
 ```
 
-Resolve once at setup using the real Linux tables and hand the precomputed
-value to every packet:
+Resolve once per worker at setup using the real Linux tables and hand the
+precomputed value to every packet (shown for a single-queue plan; with multiple
+queues per worker, resolve a per-queue egress for each of `plan.queue_ids()`):
 
 ```rust,ignore
 let routes = RouteSnapshot::from_netlink()?;
+let plan = factory.into_worker_plans().pop().expect("one worker plan");
+let queue = plan.queue_ids()[0];
 let egress = routes
-    .egress_v4_for_interface(*target.ip(), slot.ifindex, slot.queue)
+    .egress_v4_for_interface(*target.ip(), plan.ifindex(), queue)
     .ok_or("no route to target")?;
-let router = SingleDestinationRouter { egress };
 
-let mut socket = XdpUdpSocket::builder(slot.ifindex, slot.queue, local)
-    .mtu(egress.mtu as usize)
-    .router(router)
-    .open_busy_poll()?;
+let mut aggregate =
+    plan.open_udp_busy_poll_with_router(local, || SingleDestinationRouter { egress })?;
 ```
 
 ### Handful of peers
@@ -245,16 +254,17 @@ optimization is to do that work once per peer, not once per packet:
 
 ```rust,ignore
 let routes = RouteSnapshot::from_netlink()?;
+let queue = plan.queue_ids()[0];
 let peers = peer_addrs
     .into_iter()
     .map(|addr| {
         let egress = routes
-            .egress_v4_for_interface(addr, slot.ifindex, slot.queue)
+            .egress_v4_for_interface(addr, plan.ifindex(), queue)
             .ok_or_else(|| format!("no route to {addr}"))?;
         Ok((addr, egress))
     })
     .collect::<Result<Vec<_>, BoxError>>()?;
-let router = PeerCacheRouter { peers };
+let mut aggregate = plan.open_udp_busy_poll_with_router(local, || PeerCacheRouter { peers: peers.clone() })?;
 ```
 
 If the peer count grows past the point where a linear scan stops fitting in

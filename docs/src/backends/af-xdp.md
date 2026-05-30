@@ -47,6 +47,16 @@ socket has scalar helpers for one-at-a-time operations and bulk helpers for
 burst work. RX, COMPLETION, FILL, and TX paths reserve cursor ranges and copy
 descriptors or frame addresses in wrap-aware chunks.
 
+`RawXdpSocket::new` registers the UMEM and binds normally;
+`RawXdpSocket::new_shared_umem` binds a member against an already-registered
+UMEM with `XDP_SHARED_UMEM` (skipping `XDP_UMEM_REG`) — the shared-UMEM path
+used by aggregate sockets. A shared-member bind sets **only**
+`XDP_SHARED_UMEM`: it must not also set `XDP_USE_NEED_WAKEUP` or a copy/zero-copy
+mode flag (the kernel rejects that with `EINVAL`), so a member inherits the
+owner's mode and need-wakeup setting. `RawXdpSocket::configure_busy_poll`
+applies the per-fd `SO_PREFER_BUSY_POLL`, `SO_BUSY_POLL`, and
+`SO_BUSY_POLL_BUDGET` setsockopts.
+
 Live sockets split UMEM frames into RX-owned and TX-owned regions. Completion
 drain validates descriptor addresses, normalizes them to frame starts, and
 returns RX-origin frames to FILL while TX-origin frames return to the TX pool.
@@ -77,9 +87,55 @@ TX pressure crosses the configured threshold; callers can still call
 `drain_tx_completions()` explicitly.
 
 Both `XdpIpPacketSocket` and `XdpUdpSocket` implement `RawDevice`, so callers
-can read interface facts, queue affinity, queue NUMA placement, MTU, and
-packet-path counters from either socket shape. Live sockets report the resolved
-UMEM NUMA node; first-pass sockets report the configured hint when provided.
+can read interface facts, the backing NIC queues (`nic_queues()`), per-queue
+affinity, per-queue NUMA placement, MTU, and packet-path counters from either
+socket shape. `socket_id()` identifies the logical socket separately from those
+queues. Live sockets report the resolved UMEM NUMA node; first-pass sockets
+report the configured hint when provided.
+
+## Aggregate sockets and shared UMEM
+
+`XdpUdpAggregate` and `XdpIpPacketAggregate` are *logical* sockets fed by 1..N
+NIC queues. Each owns one single-queue socket per claimed queue and multiplexes
+work across them: `recv` sweeps members round-robin (RX fan-in), transmit
+spreads across members, and `drain_tx_completions` drains every member. A
+single-queue socket is the `members == 1` case.
+
+The members of one aggregate share **one UMEM**, allocated NUMA-local and
+registered once: member 0 is the owner (`RawXdpSocket::new`), members 1..N bind
+it with `RawXdpSocket::new_shared_umem`. The UMEM is partitioned into one
+disjoint frame slice per member, so each member runs the proven single-queue
+RX/TX path over its own frames while the DMA region is allocated and registered
+exactly once. Because one UMEM binds to one netdev, every member of an aggregate
+must be on the same interface (the factory enforces this).
+
+## Two-phase factory
+
+`XdpFactoryBuilder` -> `XdpFactory` -> `XdpWorkerPlan` builds aggregate sockets
+in two phases, matching the `Send` builder / `!Send` live socket split:
+
+- **Phase 1 (any thread).** `XdpFactoryBuilder::new(InterfaceSelector)` discovers
+  the interface's queue slots. `claim(QueueClaim)` chooses which queues (`All`,
+  `First(n)`, or an explicit `Queues(..)` set); `port_filter(PortFilter)` selects
+  the redirect filter (`AllIp`, or `UdpPorts(..)` bound into the program);
+  `threads(T)` sets the worker count. `claimed_queue_count()` and
+  `irq_cpu_count()` are readable after `claim` to compute `T`. `build()` attaches
+  one program per interface, fills the filter, validates that `T` divides the
+  claimed queue count, and partitions the claim-order queues into `T` contiguous
+  single-interface blocks — one `XdpWorkerPlan` (one aggregate socket) per block.
+- **Phase 2 (per worker thread).** Move one `Send` `XdpWorkerPlan` to a thread
+  and call `plan.open_udp_busy_poll(local)` /
+  `plan.open_ip_packet_busy_poll()` (or `open_udp_busy_poll_with_router` for a
+  custom `XdpUdpRouter`). Each opener pins the thread to `plan.cpu()` (the lowest
+  member IRQ CPU) before allocating, so the UMEM, rings, and scratch are
+  NUMA-local; `open_*_unpinned` variants skip pinning for custom placement.
+  `plan.numa_node()` and `plan.queue_ids()` expose the block's placement.
+
+So the worker-thread count is the single knob: `threads(1)` is one aggregate over
+every claimed queue on an interface, `threads(Q)` is one single-queue socket per
+queue, and intermediate values fan `Q/T` queues into each worker. A block that
+would span interfaces (for example `threads(1)` across a bond's two slaves) is a
+`build()` error, since one shared UMEM binds to one netdev.
 
 The embedded eBPF program is closed by default: with no UDP ports bound it
 returns `XDP_PASS` for every frame so attaching the program alone does not

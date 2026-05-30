@@ -155,7 +155,19 @@ impl NetlinkSocket {
         let mut buf = [0u8; 32768];
         let mut messages = Vec::new();
 
+        // Backstop against a peer that never terminates the dump with
+        // `NLMSG_DONE` (a malformed stream, or unexpected traffic on a shared
+        // socket): a real kernel dump needs far fewer recvs than this.
+        const MAX_RECV_CALLS: usize = 1 << 20;
+        let mut recv_calls = 0usize;
+
         loop {
+            recv_calls += 1;
+            if recv_calls > MAX_RECV_CALLS {
+                return Err(io::Error::other(
+                    "netlink dump did not terminate with NLMSG_DONE",
+                ));
+            }
             // SAFETY: buf is writable and recv does not retain it.
             let len = unsafe {
                 libc::recv(
@@ -196,7 +208,11 @@ impl NetlinkSocket {
                     libc::NLMSG_ERROR => {
                         if let Some(error) = message.error {
                             if error.error == 0 {
-                                continue;
+                                // A bare ACK (error == 0) for our request: the
+                                // kernel acknowledges and sends nothing further,
+                                // so terminate rather than looping forever
+                                // waiting for an NLMSG_DONE that won't arrive.
+                                return Ok(messages);
                             }
                             return Err(io::Error::from_raw_os_error(-error.error));
                         }

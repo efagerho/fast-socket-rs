@@ -29,7 +29,15 @@ provide a default egress. The core crate provides `CoreEgress` for route or
 neighbor handles. AF_XDP uses `XdpEgress`, which includes interface, queue, MAC
 address, ethertype, VLAN, and MTU facts.
 
-One socket value owns each `IpPacketSocket` queue. Current live backend sockets,
-including OS UDP and XDP sockets, are queue-local rather than freely shared
-across threads. Backends can use non-atomic free lists, per-queue rings, and
-worker-local routing snapshots.
+`socket_id()` returns the socket's logical identity (a `SocketId`), distinct
+from the NIC queues backing it — those are reported by
+`RawDevice::nic_queues()`. `worker_affinity()` reports the core a worker owning
+the socket should pin to (default `QueueAffinity::Any`); pass it to
+`pin_current_thread_to_ip_packet_socket()`. The AF_XDP aggregate socket
+(`XdpIpPacketAggregate`) presents one logical socket fed by several NIC queues
+over a single shared UMEM; a single-queue socket is just the
+`nic_queues().len() == 1` case.
+
+Live backend sockets, including OS UDP and XDP sockets, are queue-/worker-local
+rather than freely shared across threads. Backends can use non-atomic free
+lists, per-queue rings, and worker-local routing snapshots.

@@ -45,6 +45,18 @@ pub const MAX_BATCH_HARD_CAP: usize = 4096;
 #[cfg(target_os = "linux")]
 const RECV_CMSG_LEN: usize = 128;
 
+/// 8-byte-aligned backing storage for one message's ancillary (`cmsg`) data.
+///
+/// The kernel writes a `struct cmsghdr` into `msg_control`, which requires
+/// natural (`size_t`) alignment; a bare `[u8; N]` is only 1-aligned, so the
+/// `cmsghdr`/`CMSG_*` pointer arithmetic would be technically undefined even
+/// though the global allocator usually over-aligns. The `align(8)` wrapper
+/// makes the alignment guaranteed.
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug)]
+struct CmsgBuf([u8; RECV_CMSG_LEN]);
+
 #[cfg(all(
     unix,
     any(
@@ -282,7 +294,7 @@ pub struct OsUdpSocket {
     /// field owns the backing storage.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
-    recv_cmsgs: Box<[[u8; RECV_CMSG_LEN]]>,
+    recv_cmsgs: Box<[CmsgBuf]>,
     #[cfg(target_os = "linux")]
     tx_addrs: Box<[libc::sockaddr_storage]>,
     #[cfg(target_os = "linux")]
@@ -333,7 +345,10 @@ impl OsUdpSocket {
             queue_affinity: config.queue_affinity,
             mtu: config.mtu,
             max_batch: config.max_batch,
-            recv_buffers: (0..config.max_batch).map(|_| None).collect::<Vec<_>>().into(),
+            recv_buffers: (0..config.max_batch)
+                .map(|_| None)
+                .collect::<Vec<_>>()
+                .into(),
             #[cfg(target_os = "linux")]
             raw_fd,
             #[cfg(target_os = "linux")]
@@ -553,11 +568,7 @@ impl OsUdpSocket {
                 // just that slot to recover the real error, retrying on EINTR.
                 let result = loop {
                     let r = unsafe {
-                        libc::sendmsg(
-                            self.raw_fd,
-                            &self.tx_hdrs[sent].msg_hdr,
-                            libc::MSG_DONTWAIT,
-                        )
+                        libc::sendmsg(self.raw_fd, &self.tx_hdrs[sent].msg_hdr, libc::MSG_DONTWAIT)
                     };
                     if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                         continue;
@@ -712,18 +723,19 @@ impl OsUdpSocket {
                 continue;
             }
 
-            // The kernel always fills `msg_name` with a properly-sized
-            // AF_INET / AF_INET6 sockaddr for an AF_INET / AF_INET6 UDP
-            // socket, so `socketaddr_from_raw` can only return `None` if
-            // the kernel violated this invariant. Surface that as a hard
-            // failure instead of silently dropping the packet.
-            let source = unsafe {
+            // The kernel normally fills `msg_name` with a properly-sized
+            // AF_INET / AF_INET6 sockaddr for an AF_INET / AF_INET6 UDP socket.
+            // If it ever reports an unexpected family or short `msg_namelen`,
+            // drop that one datagram rather than aborting the worker on a
+            // network event.
+            let Some(source) = (unsafe {
                 socketaddr_from_raw(
                     (&raw const self.recv_addrs[index]).cast(),
                     hdr.msg_hdr.msg_namelen,
                 )
-            }
-            .expect("kernel filled recvmmsg sockaddr with an unexpected family");
+            }) else {
+                continue;
+            };
 
             let destination = unsafe { parse_pktinfo_destination(&hdr.msg_hdr) };
 
@@ -954,7 +966,7 @@ struct RecvSyscallState {
     addrs: Box<[libc::sockaddr_storage]>,
     iovs: Box<[libc::iovec]>,
     hdrs: Box<[libc::mmsghdr]>,
-    cmsgs: Box<[[u8; RECV_CMSG_LEN]]>,
+    cmsgs: Box<[CmsgBuf]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -969,8 +981,8 @@ fn build_recv_state(batch: usize) -> RecvSyscallState {
         .collect();
     let mut recv_hdrs: Box<[libc::mmsghdr]> =
         (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
-    let mut recv_cmsgs: Box<[[u8; RECV_CMSG_LEN]]> =
-        (0..batch).map(|_| [0u8; RECV_CMSG_LEN]).collect();
+    let mut recv_cmsgs: Box<[CmsgBuf]> =
+        (0..batch).map(|_| CmsgBuf([0u8; RECV_CMSG_LEN])).collect();
 
     for index in 0..batch {
         let cmsg_ptr = (&raw mut recv_cmsgs[index]).cast();
@@ -1009,7 +1021,13 @@ fn enable_pktinfo(socket: &StdUdpSocket) -> io::Result<()> {
     let ptr = (&raw const enabled).cast();
     // SAFETY: enabled is a stack int; setsockopt does not retain it.
     let v4 = unsafe {
-        libc::setsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_PKTINFO, ptr, len)
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            ptr,
+            len,
+        )
     };
     let v6 = unsafe {
         libc::setsockopt(

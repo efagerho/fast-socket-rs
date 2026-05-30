@@ -73,9 +73,7 @@ fn main() {
 
     let elapsed = started.elapsed();
     let ns_per_packet = elapsed.as_secs_f64() * 1e9 / PACKETS as f64;
-    println!(
-        "direct_udp_one_way: {PACKETS} packets in {elapsed:?} ({ns_per_packet:.2} ns/packet)"
-    );
+    println!("direct_udp_one_way: {PACKETS} packets in {elapsed:?} ({ns_per_packet:.2} ns/packet)");
 }
 
 fn build_batch(
@@ -93,7 +91,10 @@ fn build_batch(
             .allocate()
             .expect("tx pool grows as needed");
         packet.extend_from_slice(payload).unwrap();
-        slots.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), server_addr)));
+        slots.push(TxSlot::Ready(UdpTransmit::new(
+            packet.freeze(),
+            server_addr,
+        )));
     }
     slots
         .try_into()

@@ -447,6 +447,19 @@ impl Umem {
 
     pub(crate) fn descriptor_slice(&self, addr: u64, len: usize) -> Option<(u64, &[u8])> {
         let frame_addr = self.frame_addr_for_desc(addr)?;
+        let (start, end) = self.validated_range(addr, len)?;
+        self.backing
+            .get(start..end)
+            .map(|slice| (frame_addr, slice))
+    }
+
+    /// Validates that `(addr, len)` is a descriptor wholly inside one real UMEM
+    /// frame and returns the byte range `start..end`. Rejects addresses past the
+    /// frame table, ranges that overflow `usize`, and ranges that cross a frame
+    /// boundary. The returned range is always indexable into `backing` (a valid
+    /// frame's end never exceeds the mapping).
+    fn validated_range(&self, addr: u64, len: usize) -> Option<(usize, usize)> {
+        let frame_addr = self.frame_addr_for_desc(addr)?;
         let start = usize::try_from(addr).ok()?;
         let end = start.checked_add(len)?;
         let frame_start = usize::try_from(frame_addr).ok()?;
@@ -454,9 +467,7 @@ impl Umem {
         if start < frame_start || end > frame_end {
             return None;
         }
-        self.backing
-            .get(start..end)
-            .map(|slice| (frame_addr, slice))
+        Some((start, end))
     }
 
     pub(crate) fn contains_frame_addr(&self, frame_addr: u64) -> bool {
@@ -478,22 +489,30 @@ impl Umem {
     }
 
     /// Returns bytes at a descriptor address.
+    ///
+    /// # Panics
+    /// Panics unless `(addr, len)` is a descriptor wholly inside a single real
+    /// UMEM frame (in range and not crossing a frame boundary). Callers pass
+    /// kernel-produced descriptors that already satisfy this; the check turns a
+    /// corrupt descriptor into a clear panic rather than a silently-wrong slice
+    /// spanning two frames or reading the page-rounding slack.
     #[must_use]
     pub fn slice_at(&self, addr: u64, len: usize) -> &[u8] {
-        let start = usize::try_from(addr).expect("UMEM descriptor address fits usize");
-        let end = start
-            .checked_add(len)
-            .expect("UMEM descriptor range does not overflow usize");
+        let (start, end) = self
+            .validated_range(addr, len)
+            .expect("UMEM descriptor address/len out of frame bounds");
         &self.backing[start..end]
     }
 
     /// Returns mutable bytes at a descriptor address.
+    ///
+    /// # Panics
+    /// See [`Self::slice_at`].
     #[must_use]
     pub fn slice_at_mut(&mut self, addr: u64, len: usize) -> &mut [u8] {
-        let start = usize::try_from(addr).expect("UMEM descriptor address fits usize");
-        let end = start
-            .checked_add(len)
-            .expect("UMEM descriptor range does not overflow usize");
+        let (start, end) = self
+            .validated_range(addr, len)
+            .expect("UMEM descriptor address/len out of frame bounds");
         &mut self.backing[start..end]
     }
 }

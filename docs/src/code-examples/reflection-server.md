@@ -1,7 +1,7 @@
 # Reflection Server
 
-The reflection server demonstrates the `UdpSocket` API with one worker per NIC
-queue. `pong-server` reflects each received UDP payload back to the sender.
+The reflection server demonstrates the `UdpSocket` API across one or more worker
+threads. `pong-server` reflects each received UDP payload back to the sender.
 
 Run it with either the OS or XDP backend:
 
@@ -12,7 +12,9 @@ cargo run -p fast-socket-examples --bin pong-server -- \
   --mode os
 ```
 
-Use `--mode xdp` to run the AF_XDP-backed version.
+Use `--mode xdp` to run the AF_XDP-backed version. In XDP mode, `--threads N`
+splits the device's queues into `N` aggregate sockets (one per worker thread);
+it defaults to one thread (a single aggregate over every queue).
 
 ## Generic Loop
 
@@ -90,17 +92,20 @@ zero-copy for backends whose receive buffers can be transmitted directly.
 
 ## Queue Setup
 
-The server discovers the device's RX queues and their interrupt CPUs. It then
-creates one worker per queue and pins the worker to that CPU.
+In OS mode, the server discovers the device's RX queues and their interrupt
+CPUs, then creates one worker per queue pinned to that CPU. Each worker creates
+a UDP socket bound to the same local address with `SO_REUSEPORT`, sets
+`SO_INCOMING_CPU` to the queue CPU, and binds the socket to the device with
+`SO_BINDTODEVICE`. This demonstrates how the OS backend can express queue
+affinity while still using `UdpSocket`.
 
-In OS mode, each worker creates a UDP socket bound to the same local address
-with `SO_REUSEPORT`. It also sets `SO_INCOMING_CPU` to the queue CPU and binds
-the socket to the requested device with `SO_BINDTODEVICE`. This demonstrates
-how the OS backend can express queue affinity while still using `UdpSocket`.
-
-In XDP mode, each worker opens one AF_XDP UDP socket for its queue and attaches
-or reuses the interface-level XDP program. Each socket is still handed to the
-same generic loop; only construction differs.
+In XDP mode, construction goes through the factory (see the
+[XDP Factory](xdp-factory.md) example): `XdpFactoryBuilder` attaches the program
+and partitions the device's queues into `--threads` aggregate sockets. Each
+worker thread opens one `XdpUdpAggregate` with `plan.open_udp_busy_poll` (which
+pins to `plan.cpu()`) and pongs across its member queues round-robin —
+reflection on each member stays on the queue the frame arrived on. Only
+construction differs; the per-socket reflect uses the same generic helpers.
 
 For `pong-server`, `--target` names the expected peer endpoint. The server binds
 the device IP with `target.port()`. The XDP setup uses `target.ip()` to preflight
