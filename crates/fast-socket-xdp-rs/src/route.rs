@@ -11,12 +11,17 @@ use fast_socket_rs::{
 };
 
 use crate::egress::XdpEgress;
+use crate::egress::XdpResolvedEgress;
 use crate::netlink::{netlink_get_links, netlink_get_neighbors, netlink_get_routes};
 
 /// Immutable route and neighbor snapshot.
+///
+/// IPv4 gateway routes also carry precomputed AF_XDP egress data, including
+/// L2 header bytes, rebuilt when route, neighbor, or interface facts change.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteSnapshot {
     routes_v4: Vec<Ipv4Route>,
+    precomputed_v4: Vec<PrecomputedIpv4Egress>,
     neighbors_v4: FxHashMap<(IfIndex, Ipv4Addr), LinkAddr>,
     interfaces: FxHashMap<IfIndex, InterfaceInfo>,
 }
@@ -51,6 +56,32 @@ pub struct InterfaceInfo {
     pub mtu: u32,
     /// Preferred queue for this interface.
     pub queue: QueueId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrecomputedIpv4Egress {
+    route: Ipv4RouteKey,
+    ifindex: IfIndex,
+    resolved: XdpResolvedEgress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv4RouteKey {
+    destination: Ipv4Addr,
+    prefix_len: u8,
+    ifindex: IfIndex,
+    gateway: Option<Ipv4Addr>,
+}
+
+impl From<Ipv4Route> for Ipv4RouteKey {
+    fn from(route: Ipv4Route) -> Self {
+        Self {
+            destination: route.destination,
+            prefix_len: route.prefix_len,
+            ifindex: route.ifindex,
+            gateway: route.gateway,
+        }
+    }
 }
 
 impl RouteSnapshot {
@@ -143,6 +174,7 @@ impl RouteSnapshot {
     pub fn upsert_route_v4(&mut self, route: Ipv4Route) {
         self.upsert_route_v4_no_sort(route);
         self.sort_routes_v4();
+        self.rebuild_precomputed_v4();
     }
 
     /// Adds or replaces many IPv4 routes, sorting the route table only once
@@ -160,6 +192,7 @@ impl RouteSnapshot {
         }
         if any {
             self.sort_routes_v4();
+            self.rebuild_precomputed_v4();
         }
     }
 
@@ -188,11 +221,13 @@ impl RouteSnapshot {
     /// Adds or replaces an IPv4 neighbor entry.
     pub fn upsert_neighbor_v4(&mut self, ifindex: IfIndex, ip: Ipv4Addr, mac: LinkAddr) {
         self.neighbors_v4.insert((ifindex, ip), mac);
+        self.rebuild_precomputed_v4();
     }
 
     /// Adds or replaces interface facts.
     pub fn upsert_interface(&mut self, interface: InterfaceInfo) {
         self.interfaces.insert(interface.ifindex, interface);
+        self.rebuild_precomputed_v4();
     }
 
     /// Resolves an IPv4 route.
@@ -233,7 +268,26 @@ impl RouteSnapshot {
         ifindex: IfIndex,
         queue: QueueId,
     ) -> Option<XdpEgress> {
+        self.resolved_v4_for_interface(dst, ifindex, queue)
+            .map(|resolved| resolved.egress())
+    }
+
+    pub(crate) fn resolved_v4_for_interface(
+        &self,
+        dst: Ipv4Addr,
+        ifindex: IfIndex,
+        queue: QueueId,
+    ) -> Option<XdpResolvedEgress> {
         let route = self.lookup_route_v4(dst)?;
+
+        if route.gateway.is_some() {
+            return self
+                .precomputed_v4
+                .iter()
+                .find(|entry| entry.ifindex == ifindex && entry.route == route.into())
+                .map(|entry| entry.resolved.with_queue(queue));
+        }
+
         let interface = self.interfaces.get(&ifindex).copied()?;
         if route.ifindex != ifindex && interface.master_ifindex != Some(route.ifindex) {
             return None;
@@ -245,13 +299,13 @@ impl RouteSnapshot {
             .get(&(ifindex, next_hop))
             .or_else(|| self.neighbors_v4.get(&(route.ifindex, next_hop)))
             .copied()?;
-        Some(XdpEgress::ipv4(
+        Some(XdpResolvedEgress::from_egress(XdpEgress::ipv4(
             ifindex,
             queue,
             dst_mac,
             interface.mac,
             route.mtu.min(interface.mtu),
-        ))
+        )))
     }
 
     fn lookup_route_v4(&self, dst: Ipv4Addr) -> Option<Ipv4Route> {
@@ -260,6 +314,53 @@ impl RouteSnapshot {
             .iter()
             .copied()
             .find(|route| prefix_matches(dst, route.destination, route.prefix_len))
+    }
+
+    fn rebuild_precomputed_v4(&mut self) {
+        self.precomputed_v4.clear();
+        for route in &self.routes_v4 {
+            let Some(next_hop) = route.gateway else {
+                continue;
+            };
+
+            for interface in self.interfaces.values().copied() {
+                if route.ifindex != interface.ifindex
+                    && interface.master_ifindex != Some(route.ifindex)
+                {
+                    continue;
+                }
+                let Some(dst_mac) = self
+                    .neighbors_v4
+                    .get(&(interface.ifindex, next_hop))
+                    .or_else(|| self.neighbors_v4.get(&(route.ifindex, next_hop)))
+                    .copied()
+                else {
+                    continue;
+                };
+
+                let egress = XdpEgress::ipv4(
+                    interface.ifindex,
+                    interface.queue,
+                    dst_mac,
+                    interface.mac,
+                    route.mtu.min(interface.mtu),
+                );
+                self.precomputed_v4.push(PrecomputedIpv4Egress {
+                    route: (*route).into(),
+                    ifindex: interface.ifindex,
+                    resolved: XdpResolvedEgress::from_egress(egress),
+                });
+            }
+        }
+        self.precomputed_v4.sort_by(|left, right| {
+            left.route
+                .destination
+                .cmp(&right.route.destination)
+                .then(left.route.prefix_len.cmp(&right.route.prefix_len))
+                .then(left.route.ifindex.cmp(&right.route.ifindex))
+                .then(left.route.gateway.cmp(&right.route.gateway))
+                .then(left.ifindex.cmp(&right.ifindex))
+        });
     }
 }
 
@@ -347,6 +448,16 @@ impl XdpLocalRoutes {
         queue: QueueId,
     ) -> Option<XdpEgress> {
         self.snapshot.egress_v4_for_interface(dst, ifindex, queue)
+    }
+
+    #[inline]
+    pub(crate) fn resolve_v4_resolved_for_interface(
+        &self,
+        dst: Ipv4Addr,
+        ifindex: IfIndex,
+        queue: QueueId,
+    ) -> Option<XdpResolvedEgress> {
+        self.snapshot.resolved_v4_for_interface(dst, ifindex, queue)
     }
 }
 
@@ -445,6 +556,47 @@ mod tests {
         assert_eq!(egress.queue, QueueId::new(7));
         assert_eq!(egress.src_mac, mac(1));
         assert_eq!(egress.dst_mac, mac(9));
+    }
+
+    #[test]
+    fn route_snapshot_precomputes_gateway_l2_header_and_updates_on_neighbor_change() {
+        let mut snapshot = RouteSnapshot::new();
+        snapshot.upsert_interface(InterfaceInfo {
+            ifindex: IfIndex::new(2),
+            master_ifindex: None,
+            mac: mac(1),
+            mtu: 1500,
+            queue: QueueId::new(0),
+        });
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(0, 0, 0, 0),
+            prefix_len: 0,
+            ifindex: IfIndex::new(2),
+            gateway: Some(Ipv4Addr::new(192, 0, 2, 99)),
+            priority: 100,
+            mtu: 1500,
+        });
+        snapshot.upsert_neighbor_v4(IfIndex::new(2), Ipv4Addr::new(192, 0, 2, 99), mac(9));
+
+        let first = snapshot
+            .resolved_v4_for_interface(
+                Ipv4Addr::new(198, 51, 100, 10),
+                IfIndex::new(2),
+                QueueId::new(7),
+            )
+            .expect("gateway route resolves");
+        assert_eq!(&first.l2_header()[..6], &mac(9).octets());
+
+        snapshot.upsert_neighbor_v4(IfIndex::new(2), Ipv4Addr::new(192, 0, 2, 99), mac(10));
+        let updated = snapshot
+            .resolved_v4_for_interface(
+                Ipv4Addr::new(198, 51, 100, 10),
+                IfIndex::new(2),
+                QueueId::new(7),
+            )
+            .expect("gateway route resolves after neighbor update");
+        assert_eq!(&updated.l2_header()[..6], &mac(10).octets());
+        assert_eq!(updated.egress().queue, QueueId::new(7));
     }
 
     #[test]

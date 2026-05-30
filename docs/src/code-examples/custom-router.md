@@ -177,17 +177,21 @@ where
 
 ## Caching Egress for Bursts and Small Peer Sets
 
-The default `XdpQueueLocalRouter` scans the IPv4 route table and performs
-one or two `HashMap` lookups with SipHash for every packet. In a sustained
-single-destination blast that work accounts for roughly 8% of the per-thread
-CPU budget. Any server that sends many packets in a row to the same
-destination, or that communicates with only a small set of peers, can spend
-that CPU on application work instead by using a custom router as a
-memoization layer.
+The default `XdpQueueLocalRouter` resolves each packet through a queue-local
+route snapshot. Gateway routes already carry precomputed `XdpResolvedEgress`,
+including materialized L2 header bytes, so the default router avoids rebuilding
+Ethernet headers on the UDP hot path. It still performs the route match and
+selects the matching precomputed entry for each packet. Any server that sends
+many packets in a row to the same destination, or that communicates with only a
+small set of peers, can move that remaining lookup work into flow setup by
+using a custom router as a memoization layer.
 
 The pattern is always the same: resolve egress *once* using the real route
-snapshot when a peer becomes known, store the precomputed `XdpEgress`, and
-serve it from the router on every packet.
+snapshot when a peer becomes known, store the precomputed `XdpResolvedEgress`,
+and serve it from the router on every packet. A router that only implements
+`resolve_udp_egress` stays compatible, but it will rebuild the L2 bytes through
+the trait's default adapter. Override `resolve_udp_egress_resolved` when the
+router owns a resolved value.
 
 ### Single destination
 
@@ -198,11 +202,19 @@ agent reporting to one telemetry endpoint), the router is one field read:
 ```rust,ignore
 #[derive(Clone, Copy, Debug)]
 struct SingleDestinationRouter {
-    egress: XdpEgress,
+    egress: XdpResolvedEgress,
 }
 
 impl XdpUdpRouter for SingleDestinationRouter {
     fn resolve_udp_egress(&self, _dst: Ipv4Addr, _context: XdpRouteContext) -> Option<XdpEgress> {
+        Some(self.egress.egress())
+    }
+
+    fn resolve_udp_egress_resolved(
+        &self,
+        _dst: Ipv4Addr,
+        _context: XdpRouteContext,
+    ) -> Option<XdpResolvedEgress> {
         Some(self.egress)
     }
 }
@@ -218,6 +230,7 @@ let plan = factory.into_worker_plans().pop().expect("one worker plan");
 let queue = plan.queue_ids()[0];
 let egress = routes
     .egress_v4_for_interface(*target.ip(), plan.ifindex(), queue)
+    .map(XdpResolvedEgress::from_egress)
     .ok_or("no route to target")?;
 
 let mut aggregate =
@@ -229,18 +242,27 @@ let mut aggregate =
 When the destination set is small but not singleton (a game server pushing
 state updates to a few dozen clients, an L4 load balancer fanning out to a
 known backend pool, a QUIC server with a bounded active-connection count),
-a tiny `Vec` of `(Ipv4Addr, XdpEgress)` entries beats every hashed lookup:
+a tiny `Vec` of `(Ipv4Addr, XdpResolvedEgress)` entries beats every hashed lookup:
 the entries fit in L1, the compare is one `u32` equality, and branch
 prediction is perfect after the first iteration.
 
 ```rust,ignore
 #[derive(Clone, Debug)]
 struct PeerCacheRouter {
-    peers: Vec<(Ipv4Addr, XdpEgress)>,
+    peers: Vec<(Ipv4Addr, XdpResolvedEgress)>,
 }
 
 impl XdpUdpRouter for PeerCacheRouter {
-    fn resolve_udp_egress(&self, dst: Ipv4Addr, _context: XdpRouteContext) -> Option<XdpEgress> {
+    fn resolve_udp_egress(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<XdpEgress> {
+        self.resolve_udp_egress_resolved(dst, context)
+            .map(|egress| egress.egress())
+    }
+
+    fn resolve_udp_egress_resolved(
+        &self,
+        dst: Ipv4Addr,
+        _context: XdpRouteContext,
+    ) -> Option<XdpResolvedEgress> {
         self.peers
             .iter()
             .find(|(ip, _)| *ip == dst)
@@ -260,6 +282,7 @@ let peers = peer_addrs
     .map(|addr| {
         let egress = routes
             .egress_v4_for_interface(addr, plan.ifindex(), queue)
+            .map(XdpResolvedEgress::from_egress)
             .ok_or_else(|| format!("no route to {addr}"))?;
         Ok((addr, egress))
     })
@@ -268,7 +291,7 @@ let mut aggregate = plan.open_udp_busy_poll_with_router(local, || PeerCacheRoute
 ```
 
 If the peer count grows past the point where a linear scan stops fitting in
-L1, replace the `Vec` with a `HashMap<Ipv4Addr, XdpEgress>` built on a
+L1, replace the `Vec` with a `HashMap<Ipv4Addr, XdpResolvedEgress>` built on a
 faster hasher than the standard library default (for example
 `rustc_hash::FxHashMap`). The application still owns when entries are added
 and evicted, so the hot path stays predictable.
@@ -278,10 +301,11 @@ and evicted, so the hot path stays predictable.
 Both routers avoid the work the default router does per packet:
 
 * No longest-prefix-match scan over the IPv4 route table.
-* No `HashMap<(IfIndex, Ipv4Addr), LinkAddr>` lookup, which would otherwise
-  hash an 8-byte composite key with SipHash on every send.
-* No `HashMap<IfIndex, InterfaceInfo>` lookup for the source MAC and MTU,
-  since both are baked into the precomputed `XdpEgress`.
+* No scan over the snapshot's precomputed gateway egress entries.
+* No per-packet L2 materialization, because the router returns
+  `XdpResolvedEgress` directly.
+* For direct routes, no neighbor or interface lookup, since source MAC,
+  destination MAC, MTU, and L2 bytes are baked into the cached value.
 
 What remains in the send path is a struct copy (for the single-destination
 case) or a short equality scan (for the peer cache). On the blast workload

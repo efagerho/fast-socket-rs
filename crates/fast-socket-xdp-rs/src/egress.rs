@@ -8,6 +8,10 @@ pub const ETHERTYPE_IPV4: u16 = 0x0800;
 /// Ethernet ethertype for IPv6.
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 
+pub(crate) const ETHERNET_HEADER_LEN: usize = 14;
+pub(crate) const VLAN_HEADER_LEN: usize = 18;
+pub(crate) const VLAN_ETHERTYPE: u16 = 0x8100;
+
 /// Fully resolved egress data consumed by AF_XDP transmit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct XdpEgress {
@@ -68,3 +72,87 @@ impl XdpEgress {
 }
 
 impl IpPacketEgress for XdpEgress {}
+
+/// AF_XDP egress with materialized L2 header bytes.
+///
+/// UDP routers can return this when route, neighbor, and interface facts are
+/// stable enough to build the Ethernet header outside the send hot path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct XdpResolvedEgress {
+    egress: XdpEgress,
+    l2_header: [u8; VLAN_HEADER_LEN],
+    l2_len: usize,
+}
+
+impl XdpResolvedEgress {
+    /// Builds a resolved egress by materializing the Ethernet or VLAN header.
+    #[must_use]
+    pub fn from_egress(egress: XdpEgress) -> Self {
+        let (l2_header, l2_len) = build_ethernet_header(egress);
+        Self {
+            egress,
+            l2_header,
+            l2_len,
+        }
+    }
+
+    /// Returns the underlying egress handle.
+    #[must_use]
+    pub const fn egress(&self) -> XdpEgress {
+        self.egress
+    }
+
+    /// Returns the materialized Ethernet header bytes.
+    #[must_use]
+    pub fn l2_header(&self) -> &[u8] {
+        &self.l2_header[..self.l2_len]
+    }
+
+    pub(crate) const fn l2_header_array(&self) -> [u8; VLAN_HEADER_LEN] {
+        self.l2_header
+    }
+
+    pub(crate) const fn l2_len(&self) -> usize {
+        self.l2_len
+    }
+
+    pub(crate) const fn mtu(&self) -> u32 {
+        self.egress.mtu
+    }
+
+    pub(crate) fn with_queue(mut self, queue: QueueId) -> Self {
+        self.egress.queue = queue;
+        self
+    }
+}
+
+pub(crate) fn ethernet_header_len(egress: XdpEgress) -> usize {
+    if egress.vlan.is_some() {
+        VLAN_HEADER_LEN
+    } else {
+        ETHERNET_HEADER_LEN
+    }
+}
+
+/// Materializes the L2 header bytes for a resolved egress into a small buffer.
+pub(crate) fn build_ethernet_header(egress: XdpEgress) -> ([u8; VLAN_HEADER_LEN], usize) {
+    let l2_len = ethernet_header_len(egress);
+    let mut header = [0u8; VLAN_HEADER_LEN];
+    write_ethernet_header(&mut header[..l2_len], egress);
+    (header, l2_len)
+}
+
+pub(crate) fn write_ethernet_header(header: &mut [u8], egress: XdpEgress) {
+    debug_assert_eq!(header.len(), ethernet_header_len(egress));
+    let dst_mac = egress.dst_mac.octets();
+    let src_mac = egress.src_mac.octets();
+    header[0..6].copy_from_slice(&dst_mac);
+    header[6..12].copy_from_slice(&src_mac);
+    if let Some(vlan) = egress.vlan {
+        header[12..14].copy_from_slice(&VLAN_ETHERTYPE.to_be_bytes());
+        header[14..16].copy_from_slice(&vlan.to_be_bytes());
+        header[16..18].copy_from_slice(&egress.ethertype.to_be_bytes());
+    } else {
+        header[12..14].copy_from_slice(&egress.ethertype.to_be_bytes());
+    }
+}

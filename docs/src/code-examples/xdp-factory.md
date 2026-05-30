@@ -47,6 +47,7 @@ its member queues:
 use fast_socket_xdp_rs::{InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder};
 
 let routes = RouteSnapshot::from_netlink()?;
+// The snapshot includes precomputed L2 headers for IPv4 gateway routes.
 
 // Phase 1: discover queues, attach the program, partition into `threads` plans.
 let factory = XdpFactoryBuilder::new(InterfaceSelector::Name("eth0".into()))?

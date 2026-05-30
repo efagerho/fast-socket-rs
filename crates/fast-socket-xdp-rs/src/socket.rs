@@ -19,7 +19,10 @@ use fast_socket_rs::{
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
 use crate::config::XdpIpPacketSocketConfig;
-use crate::egress::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, XdpEgress};
+use crate::egress::{
+    ETHERNET_HEADER_LEN, ETHERTYPE_IPV4, ETHERTYPE_IPV6, VLAN_ETHERTYPE, VLAN_HEADER_LEN,
+    XdpEgress, XdpResolvedEgress, ethernet_header_len, write_ethernet_header,
+};
 use crate::interface::{if_index_to_name, numa_node_for_interface};
 use crate::program::XdpProgramHandle;
 use crate::raw_socket::RawXdpSocket;
@@ -27,9 +30,6 @@ use crate::ring::XdpDesc;
 use crate::route::{RouteSnapshot, XdpLocalRoutes};
 use crate::umem::Umem;
 
-const ETHERNET_HEADER_LEN: usize = 14;
-const VLAN_HEADER_LEN: usize = 18;
-const VLAN_ETHERTYPE: u16 = 0x8100;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const IPV4_FRAGMENT_MASK: u16 = 0x3fff;
@@ -116,6 +116,20 @@ pub struct XdpUdpSocket<D = BusyPollDriver, R = XdpQueueLocalRouter> {
 pub trait XdpUdpRouter {
     /// Resolves one IPv4 UDP destination for an AF_XDP queue.
     fn resolve_udp_egress(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<XdpEgress>;
+
+    /// Resolves one IPv4 UDP destination and may return prebuilt L2 bytes.
+    ///
+    /// The default implementation materializes the header from
+    /// [`Self::resolve_udp_egress`]. Routers that cache destinations should
+    /// override this method to avoid rebuilding L2 bytes on every send.
+    fn resolve_udp_egress_resolved(
+        &self,
+        dst: Ipv4Addr,
+        context: XdpRouteContext,
+    ) -> Option<XdpResolvedEgress> {
+        self.resolve_udp_egress(dst, context)
+            .map(XdpResolvedEgress::from_egress)
+    }
 }
 
 /// Per-queue facts available to UDP egress routers.
@@ -172,6 +186,15 @@ impl XdpUdpRouter for XdpQueueLocalRouter {
     fn resolve_udp_egress(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<XdpEgress> {
         self.routes
             .resolve_v4_for_interface(dst, context.ifindex, context.queue)
+    }
+
+    fn resolve_udp_egress_resolved(
+        &self,
+        dst: Ipv4Addr,
+        context: XdpRouteContext,
+    ) -> Option<XdpResolvedEgress> {
+        self.routes
+            .resolve_v4_resolved_for_interface(dst, context.ifindex, context.queue)
     }
 }
 
@@ -1504,8 +1527,8 @@ impl UdpEgressContext {
         let SocketAddr::V4(destination) = destination else {
             return Err(Error::InvalidPacket);
         };
-        let egress = router
-            .resolve_udp_egress(
+        let resolved = router
+            .resolve_udp_egress_resolved(
                 *destination.ip(),
                 XdpRouteContext {
                     ifindex: self.ifindex,
@@ -1514,13 +1537,13 @@ impl UdpEgressContext {
                 },
             )
             .ok_or(Error::NoEgressRoute)?;
-        let (l2_header, l2_len) = build_ethernet_header(egress);
+        let egress = resolved.egress();
 
         validate_xdp_udp_egress(self.ifindex, self.queue_id, egress)?;
         Ok(ResolvedUdpEgress {
-            l2_header,
-            l2_len,
-            ip_mtu: self.mtu.min(egress.mtu as usize),
+            l2_header: resolved.l2_header_array(),
+            l2_len: resolved.l2_len(),
+            ip_mtu: self.mtu.min(resolved.mtu() as usize),
         })
     }
 }
@@ -2670,27 +2693,6 @@ fn valid_tx_datagram(packet: &[u8], ethertype: u16) -> bool {
     }
 }
 
-fn ethernet_header_len(egress: XdpEgress) -> usize {
-    if egress.vlan.is_some() {
-        VLAN_HEADER_LEN
-    } else {
-        ETHERNET_HEADER_LEN
-    }
-}
-
-/// Materializes the L2 header bytes for a resolved egress into a small
-/// stack buffer and returns the populated length. Despite the call site name
-/// this helper does **not** cache anything between calls; each invocation
-/// rebuilds the bytes from `egress`. Pre-existing call sites used the older
-/// name `cached_ethernet_header`, which falsely implied state — kept here as
-/// a free function so the build pays only register-spill cost.
-fn build_ethernet_header(egress: XdpEgress) -> ([u8; VLAN_HEADER_LEN], usize) {
-    let l2_len = ethernet_header_len(egress);
-    let mut header = [0u8; VLAN_HEADER_LEN];
-    write_ethernet_header(&mut header[..l2_len], egress);
-    (header, l2_len)
-}
-
 #[cfg(test)]
 fn prepend_ethernet_header(buffer: &mut XdpPacketBufMut, egress: XdpEgress) {
     let mut header = [0u8; VLAN_HEADER_LEN];
@@ -2703,21 +2705,6 @@ fn prepend_l2_header(buffer: &mut XdpPacketBufMut, header: &[u8]) {
     buffer
         .prepend(header)
         .expect("send prevalidated sufficient L2 headroom");
-}
-
-fn write_ethernet_header(header: &mut [u8], egress: XdpEgress) {
-    debug_assert_eq!(header.len(), ethernet_header_len(egress));
-    let dst_mac = egress.dst_mac.octets();
-    let src_mac = egress.src_mac.octets();
-    header[0..6].copy_from_slice(&dst_mac);
-    header[6..12].copy_from_slice(&src_mac);
-    if let Some(vlan) = egress.vlan {
-        header[12..14].copy_from_slice(&VLAN_ETHERTYPE.to_be_bytes());
-        header[14..16].copy_from_slice(&vlan.to_be_bytes());
-        header[16..18].copy_from_slice(&egress.ethertype.to_be_bytes());
-    } else {
-        header[12..14].copy_from_slice(&egress.ethertype.to_be_bytes());
-    }
 }
 
 /// Derives the AF_XDP UMEM frame size from the configured RX/TX buffer
