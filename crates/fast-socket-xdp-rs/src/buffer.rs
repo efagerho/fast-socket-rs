@@ -407,20 +407,40 @@ impl XdpTxPool {
             let reclaim_ptr = NonNull::from(live.reclaim.as_ref());
             let frame_size = live.umem.frame_size() as usize;
             let layout = self.layout;
+            let data_offset = layout.data_offset();
             out.reserve(max);
-            return live.reclaim.pop_many_with(max, |frame_addr| {
-                out.push(XdpPacketBufMut::from_storage(
-                    XdpStorage::Umem {
-                        umem: umem_ptr,
-                        frame_addr,
-                        frame_size,
-                        reclaim: Some(reclaim_ptr),
-                    },
-                    layout,
-                    layout.data_offset(),
-                    layout.data_offset(),
-                ));
+
+            let start_len = out.len();
+            let out_ptr = out.as_mut_ptr();
+            let mut written = 0usize;
+            let allocated = live.reclaim.pop_many_with(max, |frame_addr| {
+                // SAFETY: `reserve(max)` guarantees at least `max` spare
+                // slots after `start_len`, and `pop_many_with` invokes this
+                // closure at most `max` times. We set the vector length once
+                // after all initialized tail elements have been written.
+                unsafe {
+                    out_ptr
+                        .add(start_len + written)
+                        .write(XdpPacketBufMut::from_storage(
+                            XdpStorage::Umem {
+                                umem: umem_ptr,
+                                frame_addr,
+                                frame_size,
+                                reclaim: Some(reclaim_ptr),
+                            },
+                            layout,
+                            data_offset,
+                            data_offset,
+                        ));
+                }
+                written += 1;
             });
+            debug_assert_eq!(allocated, written);
+            // SAFETY: exactly `written` tail elements were initialized above.
+            unsafe {
+                out.set_len(start_len + written);
+            }
+            return written;
         }
 
         let start_len = out.len();
