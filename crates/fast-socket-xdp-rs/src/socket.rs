@@ -8,13 +8,15 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Duration;
 
+#[cfg(test)]
+use fast_socket_rs::OwnedPacketBuffer;
 use fast_socket_rs::{
     BufferPool, BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind,
     EgressResolver, Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
-    IpPacketTransmit, IpVersion, NumaNode, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
-    PollDriver, QueueAffinity, QueueId, RawDevice, RawDeviceStats, ReadinessDriver,
-    ReadinessSource, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
-    UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
+    IpPacketTransmit, IpVersion, NumaNode, PacketBuffer, PacketBufferMut, PollDriver,
+    QueueAffinity, QueueId, RawDevice, RawDeviceStats, ReadinessDriver, ReadinessSource, RecvBatch,
+    SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit,
+    V4Only, WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -207,22 +209,13 @@ where
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct XdpUdpTxContext {
     destination: SocketAddr,
     source_ip: Option<IpAddr>,
     ecn: Option<fast_socket_rs::EcnCodepoint>,
     gso_segment_size: Option<core::num::NonZeroU16>,
-}
-
-/// A UDP TX frame whose headers and Ethernet L2 prefix are written into its
-/// UMEM frame and whose descriptor is staged in `tx_descs`. The slot was
-/// already `take()`n from the caller's batch; once the batch is committed each
-/// is marked submitted. (Enqueue accepts the whole reserved batch, so no
-/// per-entry slot/context is retained for a short-accept rollback.)
-#[derive(Debug)]
-struct PreparedLiveUdpTx {
-    packet: XdpPacketBuf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,7 +244,6 @@ struct LiveXdpState {
     pending_fill_scratch: Vec<u64>,
     rx_descs: Vec<XdpDesc>,
     tx_descs: Vec<XdpDesc>,
-    udp_tx_scratch: Vec<PreparedLiveUdpTx>,
     tx_in_flight: usize,
     tx_since_completion_drain: usize,
     /// Cached `min(rings.completion/2, frame_count/4)` from socket construction.
@@ -425,7 +417,6 @@ impl LiveXdpState {
                 pending_fill_scratch: Vec::with_capacity(config.rings.fill as usize),
                 rx_descs: Vec::with_capacity(config.rings.rx as usize),
                 tx_descs: Vec::with_capacity(config.rings.tx as usize),
-                udp_tx_scratch: Vec::with_capacity(config.rings.tx as usize),
                 tx_in_flight: 0,
                 tx_since_completion_drain: 0,
                 tx_completion_drain_threshold: drain_threshold,
@@ -612,7 +603,6 @@ impl LiveXdpState {
                     pending_fill_scratch: Vec::with_capacity(config.rings.fill as usize),
                     rx_descs: Vec::with_capacity(config.rings.rx as usize),
                     tx_descs: Vec::with_capacity(config.rings.tx as usize),
-                    udp_tx_scratch: Vec::with_capacity(config.rings.tx as usize),
                     tx_in_flight: 0,
                     tx_since_completion_drain: 0,
                     tx_completion_drain_threshold: drain_threshold,
@@ -1671,15 +1661,14 @@ where
                 .as_mut()
                 .expect("send_udp_inner called only for live socket");
             live.tx_descs.clear();
-            live.udp_tx_scratch.clear();
 
             let limit = batch.len().min(tx_available);
             for slot in batch.iter_mut().take(limit) {
-                let Some(tx_ref) = slot.as_ref() else {
+                let Some(tx) = slot.as_mut() else {
                     deferred_error = Some(Error::InvalidBatch);
                     break;
                 };
-                let resolved = match egress_context.resolve(router, tx_ref.destination) {
+                let resolved = match egress_context.resolve(router, tx.destination) {
                     Ok(resolved) => resolved,
                     Err(kind) => {
                         deferred_error = Some(kind);
@@ -1687,41 +1676,30 @@ where
                     }
                 };
 
-                let Some(tx) = slot.take() else {
-                    deferred_error = Some(Error::InvalidBatch);
+                if let Err(kind) =
+                    prepare_xdp_udp_transmit_in_place(local_addr, ttl, resolved.ip_mtu, tx)
+                {
+                    deferred_error = Some(kind);
                     break;
-                };
-                let (mut packet, context) =
-                    match build_xdp_udp_transmit(local_addr, ttl, resolved.ip_mtu, tx) {
-                        Ok(converted) => converted,
-                        Err(error) => {
-                            *slot = TxSlot::Ready(*error.tx);
-                            deferred_error = Some(error.error);
-                            break;
-                        }
-                    };
+                }
 
-                let Some(frame) = packet.prepare_l2(&resolved.l2_header[..resolved.l2_len]) else {
-                    match restore_xdp_udp_transmit(packet, context) {
-                        Ok(tx) => {
-                            *slot = TxSlot::Ready(tx);
-                        }
-                        Err(kind) => {
-                            deferred_error = Some(kind);
-                            break;
-                        }
+                let Some(frame) = tx.packet.prepare_l2(&resolved.l2_header[..resolved.l2_len])
+                else {
+                    if let Err(kind) = restore_prepared_xdp_udp_transmit_in_place(tx) {
+                        deferred_error = Some(kind);
+                        break;
                     }
                     deferred_error =
                         Some(Error::Device(DeviceError::new(DeviceErrorKind::Backend)));
                     break;
                 };
 
+                tx_bytes = tx_bytes.saturating_add(tx.packet.len() as u64);
                 live.tx_descs.push(XdpDesc {
                     addr: frame.desc_addr,
                     len: frame.len,
                     options: 0,
                 });
-                live.udp_tx_scratch.push(PreparedLiveUdpTx { packet });
             }
 
             prepared = live.tx_descs.len();
@@ -1750,9 +1728,12 @@ where
                     live.tx_since_completion_drain.saturating_add(accepted);
             }
 
-            for prepared in live.udp_tx_scratch.drain(..) {
-                tx_bytes = tx_bytes.saturating_add(prepared.packet.len() as u64);
-                prepared.packet.into_submitted();
+            for slot in batch.iter_mut().take(accepted) {
+                match slot {
+                    TxSlot::Ready(tx) => tx.packet.mark_submitted(),
+                    TxSlot::Taken => unreachable!("accepted UDP TX slot was already taken"),
+                }
+                *slot = TxSlot::Taken;
             }
 
             // Gate the doorbell on `XDP_RING_NEED_WAKEUP`: while the
@@ -2182,6 +2163,7 @@ where
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct BuildXdpUdpTransmitError {
     tx: Box<UdpTransmit<XdpPacketBuf>>,
@@ -2270,6 +2252,66 @@ fn validate_xdp_ip_transmit(
     Ok(())
 }
 
+fn prepare_xdp_udp_transmit_in_place(
+    local_addr: SocketAddrV4,
+    ttl: u8,
+    ip_mtu: usize,
+    tx: &mut UdpTransmit<XdpPacketBuf>,
+) -> Result<(), Error> {
+    let destination = match tx.destination {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => return Err(Error::InvalidPacket),
+    };
+
+    let source_ip = match tx.source_ip {
+        Some(IpAddr::V4(addr)) => addr,
+        Some(IpAddr::V6(_)) => return Err(Error::InvalidPacket),
+        None => *local_addr.ip(),
+    };
+
+    let payload_len = tx.packet.len();
+    let Some(max_payload) = ip_mtu.checked_sub(IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) else {
+        return Err(Error::InvalidPacket);
+    };
+    if payload_len > max_payload {
+        return Err(Error::OversizeForMtu);
+    }
+
+    let udp_len = payload_len + UDP_HEADER_LEN;
+    let total_len = udp_len + IPV4_MIN_HEADER_LEN;
+    if total_len > u16::MAX as usize {
+        return Err(Error::OversizeForMtu);
+    }
+
+    let mut headers = [0u8; IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN];
+    write_ipv4_udp_headers(
+        &mut headers,
+        Ipv4UdpHeaderFields {
+            source_port: local_addr.port(),
+            destination_port: destination.port(),
+            source: source_ip,
+            destination: *destination.ip(),
+            total_len: total_len as u16,
+            udp_len: udp_len as u16,
+            ttl,
+            ecn: tx.ecn,
+        },
+    );
+
+    tx.packet
+        .prepend(&headers)
+        .map_err(|_| Error::InvalidPacket)
+}
+
+fn restore_prepared_xdp_udp_transmit_in_place(
+    tx: &mut UdpTransmit<XdpPacketBuf>,
+) -> Result<(), Error> {
+    tx.packet
+        .trim_prefix(IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN)
+        .map_err(|_| Error::InvalidPacket)
+}
+
+#[cfg(test)]
 fn build_xdp_udp_transmit(
     local_addr: SocketAddrV4,
     ttl: u8,
@@ -2339,6 +2381,7 @@ fn build_xdp_udp_transmit(
     Ok((packet.freeze(), context))
 }
 
+#[cfg(test)]
 fn build_xdp_udp_error(tx: UdpTransmit<XdpPacketBuf>, error: Error) -> BuildXdpUdpTransmitError {
     BuildXdpUdpTransmitError {
         tx: Box::new(tx),
@@ -2346,6 +2389,7 @@ fn build_xdp_udp_error(tx: UdpTransmit<XdpPacketBuf>, error: Error) -> BuildXdpU
     }
 }
 
+#[cfg(test)]
 fn restore_xdp_udp_transmit(
     packet: XdpPacketBuf,
     context: XdpUdpTxContext,
@@ -2357,6 +2401,7 @@ fn restore_xdp_udp_transmit(
     Ok(tx_from_xdp_udp_context(packet.freeze(), context))
 }
 
+#[cfg(test)]
 fn tx_from_xdp_udp_context(
     packet: XdpPacketBuf,
     context: XdpUdpTxContext,

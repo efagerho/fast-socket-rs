@@ -635,6 +635,17 @@ impl XdpStorage {
         }
     }
 
+    fn disarm_reclaim(&mut self) {
+        match self {
+            Self::Heap { reclaim, .. } => {
+                let _ = reclaim.take();
+            }
+            Self::Umem { reclaim, .. } => {
+                let _ = reclaim.take();
+            }
+        }
+    }
+
     fn is_umem(&self) -> bool {
         matches!(self, Self::Umem { .. })
     }
@@ -801,6 +812,20 @@ impl XdpPacketBuf {
         })
     }
 
+    pub(crate) fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
+        prepend_to_inner(&mut self.inner, bytes)
+    }
+
+    pub(crate) fn trim_prefix(&mut self, len: usize) -> Result<(), BufferAccessError> {
+        trim_prefix_from_inner(&mut self.inner, len)
+    }
+
+    pub(crate) fn mark_submitted(&mut self) {
+        if let Some(storage) = self.inner.storage.as_mut() {
+            storage.disarm_reclaim();
+        }
+    }
+
     /// Marks this buffer as handed to the kernel's TX ring, disarming the
     /// `Drop` reclaim.
     ///
@@ -812,16 +837,7 @@ impl XdpPacketBuf {
     /// heap path is scaffolding where leaking a pooled buffer per submit is
     /// acceptable.
     pub(crate) fn into_submitted(mut self) {
-        if let Some(storage) = self.inner.storage.as_mut() {
-            match storage {
-                XdpStorage::Heap { reclaim, .. } => {
-                    let _ = reclaim.take();
-                }
-                XdpStorage::Umem { reclaim, .. } => {
-                    let _ = reclaim.take();
-                }
-            }
-        }
+        self.mark_submitted();
     }
 }
 
@@ -918,28 +934,7 @@ impl PacketBufferMut for XdpPacketBufMut {
     type Frozen = XdpPacketBuf;
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        if bytes.len() > self.headroom() {
-            return Err(ReserveError::InsufficientHeadroom {
-                available: self.headroom(),
-                requested: bytes.len(),
-            });
-        }
-        let storage = self
-            .inner
-            .storage
-            .as_mut()
-            .expect("buffer storage is present");
-        let new_start = self.inner.start - bytes.len();
-        // SAFETY: bounds checked above; new_start..old start lies inside the frame.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                storage.mut_ptr().add(new_start),
-                bytes.len(),
-            );
-        }
-        self.inner.start = new_start;
-        Ok(())
+        prepend_to_inner(&mut self.inner, bytes)
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
@@ -967,15 +962,7 @@ impl PacketBufferMut for XdpPacketBufMut {
     }
 
     fn trim_prefix(&mut self, len: usize) -> Result<(), BufferAccessError> {
-        if len > self.len() {
-            return Err(BufferAccessError::OutOfBounds {
-                offset: 0,
-                len,
-                packet_len: self.len(),
-            });
-        }
-        self.inner.start += len;
-        Ok(())
+        trim_prefix_from_inner(&mut self.inner, len)
     }
 
     fn trim_suffix(&mut self, len: usize) -> Result<(), BufferAccessError> {
@@ -1001,6 +988,47 @@ impl OwnedPacketBuffer for XdpPacketBuf {
     fn into_mut(self) -> Self::Mutable {
         XdpPacketBufMut { inner: self.inner }
     }
+}
+
+fn prepend_to_inner(inner: &mut XdpPacketBufInner, bytes: &[u8]) -> Result<(), ReserveError> {
+    let headroom = inner
+        .start
+        .checked_sub(inner.layout.l2_headroom())
+        .expect("packet start >= l2_headroom by layout invariant");
+    if bytes.len() > headroom {
+        return Err(ReserveError::InsufficientHeadroom {
+            available: headroom,
+            requested: bytes.len(),
+        });
+    }
+    let storage = inner.storage.as_mut().expect("buffer storage is present");
+    let new_start = inner.start - bytes.len();
+    // SAFETY: bounds checked above; new_start..old start lies inside the frame.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            storage.mut_ptr().add(new_start),
+            bytes.len(),
+        );
+    }
+    inner.start = new_start;
+    Ok(())
+}
+
+fn trim_prefix_from_inner(
+    inner: &mut XdpPacketBufInner,
+    len: usize,
+) -> Result<(), BufferAccessError> {
+    let packet_len = inner.end - inner.start;
+    if len > packet_len {
+        return Err(BufferAccessError::OutOfBounds {
+            offset: 0,
+            len,
+            packet_len,
+        });
+    }
+    inner.start += len;
+    Ok(())
 }
 
 fn read_contiguous(buffer: &[u8], offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
