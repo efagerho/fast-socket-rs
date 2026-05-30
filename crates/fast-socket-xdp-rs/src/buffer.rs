@@ -627,9 +627,9 @@ impl XdpStorage {
     }
 }
 
-/// Mutable AF_XDP packet buffer.
+/// Owned AF_XDP packet buffer state shared by mutable and frozen handles.
 #[derive(Debug)]
-pub struct XdpPacketBufMut {
+struct XdpPacketBufInner {
     storage: Option<XdpStorage>,
     layout: BufferLayout,
     start: usize,
@@ -637,14 +637,26 @@ pub struct XdpPacketBufMut {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+impl Drop for XdpPacketBufInner {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.as_mut() {
+            storage.reclaim();
+        }
+    }
+}
+
+/// Mutable AF_XDP packet buffer.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct XdpPacketBufMut {
+    inner: XdpPacketBufInner,
+}
+
 /// Frozen AF_XDP packet buffer.
 #[derive(Debug)]
+#[repr(transparent)]
 pub struct XdpPacketBuf {
-    storage: Option<XdpStorage>,
-    layout: BufferLayout,
-    start: usize,
-    end: usize,
-    _not_sync: PhantomData<Cell<()>>,
+    inner: XdpPacketBufInner,
 }
 
 // SAFETY: XDP buffers carry raw pointers into socket/pool-owned reclaim state
@@ -659,31 +671,17 @@ unsafe impl Send for XdpPacketBufMut {}
 // the same backing frame into the immutable handle.
 unsafe impl Send for XdpPacketBuf {}
 
-impl Drop for XdpPacketBufMut {
-    fn drop(&mut self) {
-        if let Some(storage) = self.storage.as_mut() {
-            storage.reclaim();
-        }
-    }
-}
-
-impl Drop for XdpPacketBuf {
-    fn drop(&mut self) {
-        if let Some(storage) = self.storage.as_mut() {
-            storage.reclaim();
-        }
-    }
-}
-
 impl XdpPacketBufMut {
     fn from_storage(storage: XdpStorage, layout: BufferLayout, start: usize, end: usize) -> Self {
         debug_assert!(end <= storage.len());
         Self {
-            storage: Some(storage),
-            layout,
-            start,
-            end,
-            _not_sync: PhantomData,
+            inner: XdpPacketBufInner {
+                storage: Some(storage),
+                layout,
+                start,
+                end,
+                _not_sync: PhantomData,
+            },
         }
     }
 
@@ -700,9 +698,18 @@ impl XdpPacketBufMut {
     /// writes.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        let storage = self.storage.as_ref().expect("buffer storage is present");
+        let storage = self
+            .inner
+            .storage
+            .as_ref()
+            .expect("buffer storage is present");
         // SAFETY: start/end are maintained inside the backing frame.
-        unsafe { slice::from_raw_parts(storage.ptr().add(self.start), self.end - self.start) }
+        unsafe {
+            slice::from_raw_parts(
+                storage.ptr().add(self.inner.start),
+                self.inner.end - self.inner.start,
+            )
+        }
     }
 
     /// Returns packet bytes as a mutable contiguous slice.
@@ -710,11 +717,18 @@ impl XdpPacketBufMut {
     /// See [`Self::as_slice`] for the AF_XDP memory-ordering rationale.
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let storage = self.storage.as_mut().expect("buffer storage is present");
+        let storage = self
+            .inner
+            .storage
+            .as_mut()
+            .expect("buffer storage is present");
         // SAFETY: start/end are maintained inside the backing frame, and &mut
         // self gives unique access to the packet bytes.
         unsafe {
-            slice::from_raw_parts_mut(storage.mut_ptr().add(self.start), self.end - self.start)
+            slice::from_raw_parts_mut(
+                storage.mut_ptr().add(self.inner.start),
+                self.inner.end - self.inner.start,
+            )
         }
     }
 }
@@ -726,18 +740,27 @@ impl XdpPacketBuf {
     /// rationale shared by both frozen and mutable buffer types.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        let storage = self.storage.as_ref().expect("buffer storage is present");
+        let storage = self
+            .inner
+            .storage
+            .as_ref()
+            .expect("buffer storage is present");
         // SAFETY: start/end are maintained inside the backing frame.
-        unsafe { slice::from_raw_parts(storage.ptr().add(self.start), self.end - self.start) }
+        unsafe {
+            slice::from_raw_parts(
+                storage.ptr().add(self.inner.start),
+                self.inner.end - self.inner.start,
+            )
+        }
     }
 
     pub(crate) fn prepare_l2(&mut self, header: &[u8]) -> Option<XdpTxFrame> {
         let packet_len = self.len();
-        let storage = self.storage.as_mut()?;
-        if !storage.is_umem() || header.len() > self.start {
+        let storage = self.inner.storage.as_mut()?;
+        if !storage.is_umem() || header.len() > self.inner.start {
             return None;
         }
-        let l2_start = self.start - header.len();
+        let l2_start = self.inner.start - header.len();
         let len = header.len() + packet_len;
         if l2_start + len > storage.len() {
             return None;
@@ -769,7 +792,7 @@ impl XdpPacketBuf {
     /// heap path is scaffolding where leaking a pooled buffer per submit is
     /// acceptable.
     pub(crate) fn into_submitted(mut self) {
-        if let Some(storage) = self.storage.as_mut() {
+        if let Some(storage) = self.inner.storage.as_mut() {
             match storage {
                 XdpStorage::Heap { reclaim, .. } => {
                     let _ = reclaim.take();
@@ -795,25 +818,27 @@ impl PacketBuffer for XdpPacketBufMut {
     type Segments<'a> = XdpSegments<'a>;
 
     fn len(&self) -> usize {
-        self.end - self.start
+        self.inner.end - self.inner.start
     }
 
     fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
+        self.inner
+            .start
+            .checked_sub(self.inner.layout.l2_headroom())
             .expect("packet start >= l2_headroom by layout invariant")
     }
 
     fn tailroom(&self) -> usize {
-        self.storage
+        self.inner
+            .storage
             .as_ref()
             .expect("buffer storage is present")
             .len()
-            .saturating_sub(self.end)
+            .saturating_sub(self.inner.end)
     }
 
     fn layout(&self) -> &BufferLayout {
-        &self.layout
+        &self.inner.layout
     }
 
     fn segments(&self) -> Self::Segments<'_> {
@@ -833,25 +858,27 @@ impl PacketBuffer for XdpPacketBuf {
     type Segments<'a> = XdpSegments<'a>;
 
     fn len(&self) -> usize {
-        self.end - self.start
+        self.inner.end - self.inner.start
     }
 
     fn headroom(&self) -> usize {
-        self.start
-            .checked_sub(self.layout.l2_headroom())
+        self.inner
+            .start
+            .checked_sub(self.inner.layout.l2_headroom())
             .expect("packet start >= l2_headroom by layout invariant")
     }
 
     fn tailroom(&self) -> usize {
-        self.storage
+        self.inner
+            .storage
             .as_ref()
             .expect("buffer storage is present")
             .len()
-            .saturating_sub(self.end)
+            .saturating_sub(self.inner.end)
     }
 
     fn layout(&self) -> &BufferLayout {
-        &self.layout
+        &self.inner.layout
     }
 
     fn segments(&self) -> Self::Segments<'_> {
@@ -877,9 +904,13 @@ impl PacketBufferMut for XdpPacketBufMut {
                 requested: bytes.len(),
             });
         }
-        let storage = self.storage.as_mut().expect("buffer storage is present");
-        let new_start = self.start - bytes.len();
-        // SAFETY: bounds checked above; new_start..self.start lies inside the frame.
+        let storage = self
+            .inner
+            .storage
+            .as_mut()
+            .expect("buffer storage is present");
+        let new_start = self.inner.start - bytes.len();
+        // SAFETY: bounds checked above; new_start..old start lies inside the frame.
         unsafe {
             ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -887,7 +918,7 @@ impl PacketBufferMut for XdpPacketBufMut {
                 bytes.len(),
             );
         }
-        self.start = new_start;
+        self.inner.start = new_start;
         Ok(())
     }
 
@@ -898,12 +929,20 @@ impl PacketBufferMut for XdpPacketBufMut {
                 requested: bytes.len(),
             });
         }
-        let storage = self.storage.as_mut().expect("buffer storage is present");
+        let storage = self
+            .inner
+            .storage
+            .as_mut()
+            .expect("buffer storage is present");
         // SAFETY: tailroom prevalidation guarantees destination fits.
         unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), storage.mut_ptr().add(self.end), bytes.len());
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                storage.mut_ptr().add(self.inner.end),
+                bytes.len(),
+            );
         }
-        self.end += bytes.len();
+        self.inner.end += bytes.len();
         Ok(())
     }
 
@@ -915,7 +954,7 @@ impl PacketBufferMut for XdpPacketBufMut {
                 packet_len: self.len(),
             });
         }
-        self.start += len;
+        self.inner.start += len;
         Ok(())
     }
 
@@ -927,32 +966,20 @@ impl PacketBufferMut for XdpPacketBufMut {
                 packet_len: self.len(),
             });
         }
-        self.end -= len;
+        self.inner.end -= len;
         Ok(())
     }
 
-    fn freeze(mut self) -> Self::Frozen {
-        XdpPacketBuf {
-            storage: self.storage.take(),
-            layout: self.layout,
-            start: self.start,
-            end: self.end,
-            _not_sync: PhantomData,
-        }
+    fn freeze(self) -> Self::Frozen {
+        XdpPacketBuf { inner: self.inner }
     }
 }
 
 impl OwnedPacketBuffer for XdpPacketBuf {
     type Mutable = XdpPacketBufMut;
 
-    fn into_mut(mut self) -> Self::Mutable {
-        XdpPacketBufMut {
-            storage: self.storage.take(),
-            layout: self.layout,
-            start: self.start,
-            end: self.end,
-            _not_sync: PhantomData,
-        }
+    fn into_mut(self) -> Self::Mutable {
+        XdpPacketBufMut { inner: self.inner }
     }
 }
 
