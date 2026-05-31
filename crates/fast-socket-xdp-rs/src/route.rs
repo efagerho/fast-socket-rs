@@ -5,10 +5,12 @@ use std::collections::VecDeque;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use fast_socket_rs::{
     EgressResolver, IfIndex, LinkAddr, NeighborTable, QueueId, RouteHop, RouteTable, V4Only,
 };
+use poptrie::Ipv4Poptrie;
 
 use crate::egress::XdpEgress;
 use crate::egress::XdpResolvedEgress;
@@ -18,13 +20,58 @@ use crate::netlink::{netlink_get_links, netlink_get_neighbors, netlink_get_route
 ///
 /// IPv4 gateway routes also carry precomputed AF_XDP egress data, including
 /// L2 header bytes, rebuilt when route, neighbor, or interface facts change.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct RouteSnapshot {
     routes_v4: Vec<Ipv4Route>,
-    precomputed_v4: Vec<PrecomputedIpv4Egress>,
+    /// Longest-prefix-match index mapping a destination to an index into
+    /// `routes_v4`. Rebuilt only when routes change; `None` when there are no
+    /// routes. Held behind an `Arc` so cloning a snapshot per queue shares the
+    /// (potentially large) index instead of duplicating it.
+    route_index_v4: Option<Arc<Ipv4Poptrie<u32>>>,
+    /// Folded egress index: for each egress interface, the resolved egress of
+    /// every route, indexed by the **same route index the poptrie returns**.
+    /// This collapses destination → route → egress into one poptrie lookup plus
+    /// a dense array index, replacing a second per-packet composite-key hashmap
+    /// probe. Arc-shared so snapshot clones stay cheap; rebuilt when routes,
+    /// neighbors, or interfaces change.
+    egress_index_v4: Arc<FxHashMap<IfIndex, InterfaceEgress>>,
     neighbors_v4: FxHashMap<(IfIndex, Ipv4Addr), LinkAddr>,
     interfaces: FxHashMap<IfIndex, InterfaceInfo>,
 }
+
+/// Per-interface folded egress: `slots[route_index]` resolves a route (the
+/// index the poptrie returns for a destination) to its egress on this
+/// interface, with no second hashmap probe.
+#[derive(Clone, Debug)]
+struct InterfaceEgress {
+    /// One entry per route, in `routes_v4` order: [`EGRESS_NONE`] when the
+    /// route does not egress this interface, [`EGRESS_ON_LINK`] for a direct
+    /// route (the next hop is the destination, so its neighbor MAC is resolved
+    /// per packet), otherwise an index into `egresses`.
+    slots: Box<[u32]>,
+    /// Distinct fully-resolved gateway egresses (prebuilt L2 header),
+    /// deduplicated. The socket's queue is stamped per send via `with_queue`.
+    egresses: Box<[XdpResolvedEgress]>,
+}
+
+/// `slots` sentinel: the route does not egress this interface.
+const EGRESS_NONE: u32 = u32::MAX;
+/// `slots` sentinel: direct (on-link) route — the next hop is the destination,
+/// so its neighbor MAC is resolved per packet rather than prebuilt.
+const EGRESS_ON_LINK: u32 = u32::MAX - 1;
+
+impl PartialEq for RouteSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // `route_index_v4` and `egress_index_v4` are pure functions of the
+        // source fields below, so comparing the inputs is sufficient — and
+        // avoids comparing the large derived indexes.
+        self.routes_v4 == other.routes_v4
+            && self.neighbors_v4 == other.neighbors_v4
+            && self.interfaces == other.interfaces
+    }
+}
+
+impl Eq for RouteSnapshot {}
 
 /// IPv4 route entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,32 +103,6 @@ pub struct InterfaceInfo {
     pub mtu: u32,
     /// Preferred queue for this interface.
     pub queue: QueueId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PrecomputedIpv4Egress {
-    route: Ipv4RouteKey,
-    ifindex: IfIndex,
-    resolved: XdpResolvedEgress,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Ipv4RouteKey {
-    destination: Ipv4Addr,
-    prefix_len: u8,
-    ifindex: IfIndex,
-    gateway: Option<Ipv4Addr>,
-}
-
-impl From<Ipv4Route> for Ipv4RouteKey {
-    fn from(route: Ipv4Route) -> Self {
-        Self {
-            destination: route.destination,
-            prefix_len: route.prefix_len,
-            ifindex: route.ifindex,
-            gateway: route.gateway,
-        }
-    }
 }
 
 impl RouteSnapshot {
@@ -174,7 +195,8 @@ impl RouteSnapshot {
     pub fn upsert_route_v4(&mut self, route: Ipv4Route) {
         self.upsert_route_v4_no_sort(route);
         self.sort_routes_v4();
-        self.rebuild_precomputed_v4();
+        self.rebuild_route_index_v4();
+        self.rebuild_egress_index_v4();
     }
 
     /// Adds or replaces many IPv4 routes, sorting the route table only once
@@ -192,7 +214,8 @@ impl RouteSnapshot {
         }
         if any {
             self.sort_routes_v4();
-            self.rebuild_precomputed_v4();
+            self.rebuild_route_index_v4();
+            self.rebuild_egress_index_v4();
         }
     }
 
@@ -221,13 +244,13 @@ impl RouteSnapshot {
     /// Adds or replaces an IPv4 neighbor entry.
     pub fn upsert_neighbor_v4(&mut self, ifindex: IfIndex, ip: Ipv4Addr, mac: LinkAddr) {
         self.neighbors_v4.insert((ifindex, ip), mac);
-        self.rebuild_precomputed_v4();
+        self.rebuild_egress_index_v4();
     }
 
     /// Adds or replaces interface facts.
     pub fn upsert_interface(&mut self, interface: InterfaceInfo) {
         self.interfaces.insert(interface.ifindex, interface);
-        self.rebuild_precomputed_v4();
+        self.rebuild_egress_index_v4();
     }
 
     /// Resolves an IPv4 route.
@@ -278,89 +301,152 @@ impl RouteSnapshot {
         ifindex: IfIndex,
         queue: QueueId,
     ) -> Option<XdpResolvedEgress> {
-        let route = self.lookup_route_v4(dst)?;
-
-        if route.gateway.is_some() {
-            return self
-                .precomputed_v4
-                .iter()
-                .find(|entry| entry.ifindex == ifindex && entry.route == route.into())
-                .map(|entry| entry.resolved.with_queue(queue));
+        // One poptrie lookup yields the route index; the per-interface `slots`
+        // array resolves it to an egress with a dense index — no second
+        // composite-key hashmap probe on the send path.
+        let route_index = self.lookup_route_index_v4(dst)?;
+        let interface_egress = self.egress_index_v4.get(&ifindex)?;
+        match *interface_egress.slots.get(route_index as usize)? {
+            EGRESS_NONE => None,
+            EGRESS_ON_LINK => {
+                // Direct route: resolve the destination's own neighbor MAC.
+                let route = self.routes_v4.get(route_index as usize).copied()?;
+                let interface = self.interfaces.get(&ifindex).copied()?;
+                let dst_mac = self
+                    .neighbors_v4
+                    .get(&(ifindex, dst))
+                    .or_else(|| self.neighbors_v4.get(&(route.ifindex, dst)))
+                    .copied()?;
+                Some(XdpResolvedEgress::from_egress(XdpEgress::ipv4(
+                    ifindex,
+                    queue,
+                    dst_mac,
+                    interface.mac,
+                    route.mtu.min(interface.mtu),
+                )))
+            }
+            gateway_slot => {
+                Some(interface_egress.egresses[gateway_slot as usize].with_queue(queue))
+            }
         }
+    }
 
-        let interface = self.interfaces.get(&ifindex).copied()?;
-        if route.ifindex != ifindex && interface.master_ifindex != Some(route.ifindex) {
-            return None;
-        }
-
-        let next_hop = route.gateway.unwrap_or(dst);
-        let dst_mac = self
-            .neighbors_v4
-            .get(&(ifindex, next_hop))
-            .or_else(|| self.neighbors_v4.get(&(route.ifindex, next_hop)))
-            .copied()?;
-        Some(XdpResolvedEgress::from_egress(XdpEgress::ipv4(
-            ifindex,
-            queue,
-            dst_mac,
-            interface.mac,
-            route.mtu.min(interface.mtu),
-        )))
+    /// Returns the index into `routes_v4` of the longest-prefix match, via the
+    /// poptrie. This index is what `egress_index_v4`'s per-interface `slots`
+    /// are keyed on, so the send path resolves egress with a single lookup.
+    fn lookup_route_index_v4(&self, dst: Ipv4Addr) -> Option<u32> {
+        self.route_index_v4.as_ref()?.lookup(u32::from(dst)).copied()
     }
 
     fn lookup_route_v4(&self, dst: Ipv4Addr) -> Option<Ipv4Route> {
-        let dst = u32::from(dst);
-        self.routes_v4
-            .iter()
-            .copied()
-            .find(|route| prefix_matches(dst, route.destination, route.prefix_len))
+        let index = self.lookup_route_index_v4(dst)?;
+        self.routes_v4.get(index as usize).copied()
     }
 
-    fn rebuild_precomputed_v4(&mut self) {
-        self.precomputed_v4.clear();
-        for route in &self.routes_v4 {
-            let Some(next_hop) = route.gateway else {
-                continue;
-            };
+    /// Rebuilds the longest-prefix-match index. Call after `routes_v4` changes
+    /// (and after it has been sorted); not needed for neighbor/interface
+    /// updates, which leave the route set untouched.
+    fn rebuild_route_index_v4(&mut self) {
+        if self.routes_v4.is_empty() {
+            self.route_index_v4 = None;
+            return;
+        }
+        let mut builder = Ipv4Poptrie::builder();
+        // `routes_v4` is sorted longest-prefix-first, then lowest-priority-first.
+        // Inserting in reverse means that for an identical (destination,
+        // prefix_len) the entry the old linear scan would have returned (the
+        // first in sorted order — longest prefix, lowest priority) is inserted
+        // last and therefore wins. Longest-prefix-match across *different*
+        // prefix lengths is handled by the trie structure itself.
+        for (index, route) in self.routes_v4.iter().enumerate().rev() {
+            builder.insert(
+                u32::from(route.destination),
+                route.prefix_len.min(32),
+                index as u32,
+            );
+        }
+        self.route_index_v4 = Some(Arc::new(builder.build()));
+    }
 
-            for interface in self.interfaces.values().copied() {
+    /// Rebuilds the folded per-interface egress index. Must run after
+    /// `rebuild_route_index_v4` on route changes (the `slots` are keyed by the
+    /// poptrie's route index) and also on neighbor/interface changes (which
+    /// change resolved MACs without changing route indices).
+    ///
+    /// Each egress interface gets a dense `slots` array (one entry per route).
+    /// An interface with no egressable route is omitted, so a host that routes
+    /// everything through one NIC pays for a single dense array, not one per
+    /// interface.
+    fn rebuild_egress_index_v4(&mut self) {
+        let route_count = self.routes_v4.len();
+        if route_count == 0 {
+            self.egress_index_v4 = Arc::new(FxHashMap::default());
+            return;
+        }
+
+        let mut index: FxHashMap<IfIndex, InterfaceEgress> = FxHashMap::default();
+        for interface in self.interfaces.values().copied() {
+            let mut slots = vec![EGRESS_NONE; route_count];
+            let mut egresses: Vec<XdpResolvedEgress> = Vec::new();
+            let mut dedup: FxHashMap<XdpResolvedEgress, u32> = FxHashMap::default();
+            let mut egressable = false;
+
+            for (route_index, route) in self.routes_v4.iter().enumerate() {
+                // Does this route egress through `interface` directly, or via it
+                // as the bond master of an enslaved `interface`?
                 if route.ifindex != interface.ifindex
                     && interface.master_ifindex != Some(route.ifindex)
                 {
                     continue;
                 }
-                let Some(dst_mac) = self
-                    .neighbors_v4
-                    .get(&(interface.ifindex, next_hop))
-                    .or_else(|| self.neighbors_v4.get(&(route.ifindex, next_hop)))
-                    .copied()
-                else {
-                    continue;
-                };
 
-                let egress = XdpEgress::ipv4(
+                match route.gateway {
+                    Some(gateway) => {
+                        // Gateway route: the next hop (the gateway) is fixed for
+                        // the whole prefix, so its egress is prebuilt once here.
+                        let Some(dst_mac) = self
+                            .neighbors_v4
+                            .get(&(interface.ifindex, gateway))
+                            .or_else(|| self.neighbors_v4.get(&(route.ifindex, gateway)))
+                            .copied()
+                        else {
+                            continue; // gateway MAC unknown -> leaves EGRESS_NONE
+                        };
+                        let resolved = XdpResolvedEgress::from_egress(XdpEgress::ipv4(
+                            interface.ifindex,
+                            interface.queue,
+                            dst_mac,
+                            interface.mac,
+                            route.mtu.min(interface.mtu),
+                        ));
+                        let slot = *dedup.entry(resolved).or_insert_with(|| {
+                            let slot = egresses.len() as u32;
+                            egresses.push(resolved);
+                            slot
+                        });
+                        slots[route_index] = slot;
+                        egressable = true;
+                    }
+                    None => {
+                        // Direct route: next hop is the destination, so the
+                        // neighbor MAC varies per packet -> resolve at send time.
+                        slots[route_index] = EGRESS_ON_LINK;
+                        egressable = true;
+                    }
+                }
+            }
+
+            if egressable {
+                index.insert(
                     interface.ifindex,
-                    interface.queue,
-                    dst_mac,
-                    interface.mac,
-                    route.mtu.min(interface.mtu),
+                    InterfaceEgress {
+                        slots: slots.into_boxed_slice(),
+                        egresses: egresses.into_boxed_slice(),
+                    },
                 );
-                self.precomputed_v4.push(PrecomputedIpv4Egress {
-                    route: (*route).into(),
-                    ifindex: interface.ifindex,
-                    resolved: XdpResolvedEgress::from_egress(egress),
-                });
             }
         }
-        self.precomputed_v4.sort_by(|left, right| {
-            left.route
-                .destination
-                .cmp(&right.route.destination)
-                .then(left.route.prefix_len.cmp(&right.route.prefix_len))
-                .then(left.route.ifindex.cmp(&right.route.ifindex))
-                .then(left.route.gateway.cmp(&right.route.gateway))
-                .then(left.ifindex.cmp(&right.ifindex))
-        });
+        self.egress_index_v4 = Arc::new(index);
     }
 }
 
@@ -471,15 +557,6 @@ impl EgressResolver<V4Only, XdpEgress> for XdpLocalRoutes {
     fn resolve_egress(&self, dst: Ipv4Addr) -> Option<XdpEgress> {
         self.resolve_v4(dst)
     }
-}
-
-fn prefix_matches(dst: u32, network: Ipv4Addr, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let prefix_len = prefix_len.min(32);
-    let mask = u32::MAX << (32 - prefix_len);
-    (dst & mask) == (u32::from(network) & mask)
 }
 
 #[cfg(test)]
@@ -597,6 +674,54 @@ mod tests {
             .expect("gateway route resolves after neighbor update");
         assert_eq!(&updated.l2_header()[..6], &mac(10).octets());
         assert_eq!(updated.egress().queue, QueueId::new(7));
+    }
+
+    #[test]
+    fn route_snapshot_selects_longest_prefix_then_lowest_priority() {
+        // Exercises the poptrie-backed `lookup_route_v4`: longest prefix wins
+        // across lengths, and among routes sharing an exact prefix the lowest
+        // priority wins (matching the old sorted linear-scan behavior).
+        let mut snapshot = RouteSnapshot::new();
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(10, 0, 0, 0),
+            prefix_len: 8,
+            ifindex: IfIndex::new(2),
+            gateway: None,
+            priority: 100,
+            mtu: 1500,
+        });
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(10, 1, 2, 0),
+            prefix_len: 24,
+            ifindex: IfIndex::new(3),
+            gateway: None,
+            priority: 100,
+            mtu: 1500,
+        });
+        // Same /24 prefix, different interface, lower priority — should win.
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(10, 1, 2, 0),
+            prefix_len: 24,
+            ifindex: IfIndex::new(9),
+            gateway: None,
+            priority: 50,
+            mtu: 1500,
+        });
+
+        let hop = snapshot
+            .route_v4(Ipv4Addr::new(10, 1, 2, 200))
+            .expect("longest prefix match");
+        assert_eq!(hop.ifindex, IfIndex::new(9), "lowest priority /24 wins");
+
+        let hop = snapshot
+            .route_v4(Ipv4Addr::new(10, 9, 9, 9))
+            .expect("falls back to the covering /8");
+        assert_eq!(hop.ifindex, IfIndex::new(2));
+
+        assert!(
+            snapshot.route_v4(Ipv4Addr::new(11, 0, 0, 1)).is_none(),
+            "no route outside the /8"
+        );
     }
 
     #[test]

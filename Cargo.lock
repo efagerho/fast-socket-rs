@@ -354,6 +354,7 @@ dependencies = [
  "fast-socket-rs",
  "fast-socket-xdp-ebpf",
  "libc",
+ "poptrie",
  "rustc-hash",
 ]
 

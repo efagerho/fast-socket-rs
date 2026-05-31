@@ -13,7 +13,7 @@ pub(crate) const VLAN_HEADER_LEN: usize = 18;
 pub(crate) const VLAN_ETHERTYPE: u16 = 0x8100;
 
 /// Fully resolved egress data consumed by AF_XDP transmit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct XdpEgress {
     /// Outgoing interface index.
     pub ifindex: IfIndex,
@@ -77,7 +77,7 @@ impl IpPacketEgress for XdpEgress {}
 ///
 /// UDP routers can return this when route, neighbor, and interface facts are
 /// stable enough to build the Ethernet header outside the send hot path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct XdpResolvedEgress {
     egress: XdpEgress,
     l2_header: [u8; VLAN_HEADER_LEN],
