@@ -24,10 +24,22 @@ pub mod interface;
 pub mod netlink;
 #[cfg(target_os = "linux")]
 pub mod program;
+// Low-level AF_XDP primitives are crate-internal: they expose raw pointers and
+// panic-capable accessors and are not part of the stable surface. The high-level
+// types are built on them via `crate::` paths; power users can reach the raw
+// building blocks through the `unstable-internals`-gated `internals` module.
+//
+// Parts of each module's API (single-item ring cursors, index-based UMEM
+// accessors, the shared-UMEM constructor, …) are used only by tests and by the
+// `internals` surface, not by the crate's own data path, so they read as dead
+// code when that surface is compiled out. Allow it in exactly that config; with
+// the feature on these are reachable public API and the lint is inert.
 #[cfg(target_os = "linux")]
-pub mod raw_socket;
+#[cfg_attr(not(feature = "unstable-internals"), allow(dead_code))]
+pub(crate) mod raw_socket;
 #[cfg(target_os = "linux")]
-pub mod ring;
+#[cfg_attr(not(feature = "unstable-internals"), allow(dead_code))]
+pub(crate) mod ring;
 #[cfg(target_os = "linux")]
 pub mod route;
 #[cfg(target_os = "linux")]
@@ -35,7 +47,8 @@ pub mod route_monitor;
 #[cfg(target_os = "linux")]
 pub mod socket;
 #[cfg(target_os = "linux")]
-pub mod umem;
+#[cfg_attr(not(feature = "unstable-internals"), allow(dead_code))]
+pub(crate) mod umem;
 
 #[cfg(target_os = "linux")]
 pub use aggregate::{XdpIpPacketAggregate, XdpUdpAggregate};
@@ -60,8 +73,11 @@ pub use program::{
     AttachMode, BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, MAX_BOUND_PORTS, MAX_QUEUES, XdpProgram,
     XdpProgramHandle, embedded_program_bytes, get_or_load, xdp_program_bytes,
 };
+// `RingSizes`/`XdpMode` are part of the configuration surface (see
+// `XdpIpPacketSocketConfig`), so they stay public; the raw socket itself does
+// not — it lives behind `internals`.
 #[cfg(target_os = "linux")]
-pub use raw_socket::{RawXdpSocket, RingSizes, XdpMode};
+pub use raw_socket::{RingSizes, XdpMode};
 #[cfg(target_os = "linux")]
 pub use route::{RouteSnapshot, XdpLocalRoutes};
 #[cfg(target_os = "linux")]
@@ -72,5 +88,17 @@ pub use socket::{
     ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalRouter,
     XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
 };
-#[cfg(target_os = "linux")]
-pub use umem::{AllocError, PageAlignedMemory, Umem};
+/// Unstable low-level AF_XDP building blocks.
+///
+/// **Not covered by semver — opt in via the `unstable-internals` feature.**
+/// These are the raw socket, UMEM, and descriptor-ring primitives the
+/// high-level sockets are built from. They hand out raw pointers and have
+/// accessors that panic on misuse (for example `Umem::slice_at`), so they are
+/// kept off the default public surface. Reach for them only when building a
+/// custom AF_XDP data path, and expect breaking changes between releases.
+#[cfg(all(target_os = "linux", feature = "unstable-internals"))]
+pub mod internals {
+    pub use crate::raw_socket::RawXdpSocket;
+    pub use crate::ring::{RingConsumer, RingMmap, RingProducer, RingRange, XdpDesc, mmap_ring};
+    pub use crate::umem::{AllocError, PageAlignedMemory, Umem};
+}

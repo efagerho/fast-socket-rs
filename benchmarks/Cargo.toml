@@ -7,5 +7,7 @@ edition.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 fast-socket-rs = { path = "../crates/fast-socket-rs" }
 fast-socket-os-rs = { path = "../crates/fast-socket-os-rs" }
-fast-socket-xdp-rs = { path = "../crates/fast-socket-xdp-rs" }
+# `unstable-internals` exposes the raw AF_XDP socket/UMEM primitives the
+# `xdp-shared-umem-probe` hardware probe drives directly.
+fast-socket-xdp-rs = { path = "../crates/fast-socket-xdp-rs", features = ["unstable-internals"] }
 libc = "0.2"
