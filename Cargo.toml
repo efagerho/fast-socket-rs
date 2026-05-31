@@ -4,6 +4,7 @@ members = [
     "crates/fast-socket-os-rs",
     "crates/fast-socket-xdp-rs",
     "crates/fast-socket-xdp-ebpf",
+    "crates/poptrie",
     "benchmarks",
     "examples",
 ]
