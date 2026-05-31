@@ -19,6 +19,15 @@
 //! leave those raw pointers dangling. Cross-thread buffer drops are supported by
 //! pushing returned frames into a bounded MPSC remote reclaim queue that the
 //! owner thread drains before reusing frames.
+//!
+//! **This contract is not enforced by the type system: `recv`/`allocate` hand
+//! out owned, `'static`, [`Send`] buffers, so safe code *can* drop the owning
+//! socket first and then touch (or even just drop) a surviving buffer — which
+//! is undefined behavior.** Debug builds catch exactly this: every buffer holds
+//! an owner-generation token (see the [`owner_epoch`] submodule) that is checked
+//! on each byte access and on reclaim, so the misuse panics with a clear message
+//! instead of silently reading or writing freed memory. The token and all its
+//! checks compile to nothing in release builds.
 
 use std::cell::{Cell, UnsafeCell};
 use std::fmt;
@@ -38,6 +47,130 @@ use fast_socket_rs::{
 };
 
 use crate::umem::Umem;
+
+use self::owner_epoch::{BufferEpoch, OwnerEpoch};
+
+/// "Is the owning socket/pool still alive?" tracking for the raw pointers each
+/// live buffer holds.
+///
+/// XDP buffers are [`Send`] and store raw `NonNull` pointers into socket/pool-
+/// owned UMEM and reclaim state (see the module-level lifetime contract). If the
+/// owning socket/pool is dropped while a buffer is still alive, those pointers
+/// dangle and any later use — reading the bytes, *or even the buffer's own
+/// `Drop`* — is undefined behavior.
+///
+/// When the guard is active it makes that misuse loud instead of silent: an
+/// owner takes a unique generation, shares it (behind an `Arc`, so it survives
+/// the owner), and stamps it dead on drop; every buffer captures the generation
+/// at creation and asserts it still matches before each access and on reclaim.
+///
+/// The guard is active in debug builds **or** when the `buffer-guard` crate
+/// feature is enabled (e.g. for a hardened release / canary build). Otherwise
+/// every type here is a zero-sized no-op: the checks compile away and embedding
+/// the epoch adds no bytes to any struct (enforced by the `const` size assertion
+/// below).
+#[cfg(any(debug_assertions, feature = "buffer-guard"))]
+mod owner_epoch {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+    /// Stored into the shared cell when the owner drops. Real generations start
+    /// at 1, so a buffer that reads 0 knows its owner is gone.
+    const DEAD: u64 = 0;
+
+    /// Liveness epoch held by an owner (a reclaim pool); marks the shared cell
+    /// dead on drop.
+    #[derive(Debug)]
+    pub(super) struct OwnerEpoch {
+        shared: Arc<AtomicU64>,
+        generation: u64,
+    }
+
+    impl OwnerEpoch {
+        pub(super) fn new() -> Self {
+            let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+            Self {
+                shared: Arc::new(AtomicU64::new(generation)),
+                generation,
+            }
+        }
+
+        /// Returns a token for a buffer this owner hands out.
+        pub(super) fn token(&self) -> BufferEpoch {
+            BufferEpoch {
+                shared: Arc::clone(&self.shared),
+                generation: self.generation,
+            }
+        }
+    }
+
+    impl Drop for OwnerEpoch {
+        fn drop(&mut self) {
+            self.shared.store(DEAD, Ordering::Release);
+        }
+    }
+
+    /// Liveness token captured by a buffer at creation; checked on access and
+    /// on reclaim.
+    #[derive(Clone, Debug)]
+    pub(super) struct BufferEpoch {
+        shared: Arc<AtomicU64>,
+        generation: u64,
+    }
+
+    impl BufferEpoch {
+        #[inline]
+        pub(super) fn assert_owner_alive(&self) {
+            assert_eq!(
+                self.shared.load(Ordering::Acquire),
+                self.generation,
+                "XDP packet buffer used after its owning socket/pool was dropped: the \
+                 socket/pool must outlive every buffer it hands out (see the `buffer` module \
+                 lifetime contract). The buffer holds raw pointers into socket-owned UMEM and \
+                 reclaim state that are now dangling.",
+            );
+        }
+    }
+}
+
+/// Zero-sized no-op variant used when the buffer guard is disabled. Every method
+/// is a no-op and both types are zero-sized, so embedding them costs nothing.
+#[cfg(not(any(debug_assertions, feature = "buffer-guard")))]
+mod owner_epoch {
+    #[derive(Debug)]
+    pub(super) struct OwnerEpoch;
+
+    impl OwnerEpoch {
+        #[inline]
+        pub(super) fn new() -> Self {
+            Self
+        }
+
+        #[inline]
+        pub(super) fn token(&self) -> BufferEpoch {
+            BufferEpoch
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(super) struct BufferEpoch;
+
+    impl BufferEpoch {
+        #[inline]
+        pub(super) fn assert_owner_alive(&self) {}
+    }
+}
+
+/// With the guard disabled, the epoch types must be zero-sized so embedding them
+/// adds no bytes to `FrameReclaim`/`HeapReclaim`/`XdpStorage`. Enforced at
+/// compile time: a future field that breaks this fails the build rather than
+/// silently growing the hot-path buffer structs.
+#[cfg(not(any(debug_assertions, feature = "buffer-guard")))]
+const _: () = {
+    assert!(core::mem::size_of::<OwnerEpoch>() == 0);
+    assert!(core::mem::size_of::<BufferEpoch>() == 0);
+};
 
 /// Iterator over XDP packet segments.
 #[derive(Clone, Debug)]
@@ -77,6 +210,7 @@ struct HeapReclaim {
     owner: ThreadId,
     free: UnsafeCell<Vec<Box<[u8]>>>,
     remote: MpscQueue<Box<[u8]>>,
+    epoch: OwnerEpoch,
 }
 
 #[derive(Debug)]
@@ -84,6 +218,7 @@ pub(crate) struct FrameReclaim {
     owner: ThreadId,
     free: UnsafeCell<Vec<u64>>,
     remote: MpscQueue<u64>,
+    epoch: OwnerEpoch,
 }
 
 // SAFETY: the `free` vectors are accessed only by the owner thread. Buffers
@@ -106,7 +241,14 @@ impl HeapReclaim {
             owner: thread::current().id(),
             free: UnsafeCell::new(free),
             remote: MpscQueue::new(count),
+            epoch: OwnerEpoch::new(),
         })
+    }
+
+    /// Returns a liveness token for a buffer backed by this pool. Debug builds
+    /// use it to detect use-after-pool-drop; release builds compile it away.
+    fn buffer_epoch(&self) -> BufferEpoch {
+        self.epoch.token()
     }
 
     fn pop(&self) -> Option<Box<[u8]>> {
@@ -139,7 +281,14 @@ impl FrameReclaim {
             owner: thread::current().id(),
             free: UnsafeCell::new(frames),
             remote: MpscQueue::new(remote_capacity),
+            epoch: OwnerEpoch::new(),
         })
+    }
+
+    /// Returns a liveness token for a buffer backed by this pool. Debug builds
+    /// use it to detect use-after-pool-drop; release builds compile it away.
+    fn buffer_epoch(&self) -> BufferEpoch {
+        self.epoch.token()
     }
 
     fn pop(&self) -> Option<u64> {
@@ -343,6 +492,7 @@ impl XdpRxPool {
                 frame_addr,
                 frame_size: live.umem.frame_size() as usize,
                 reclaim: Some(reclaim_ptr),
+                epoch: live.reclaim.buffer_epoch(),
             },
             self.layout,
             start,
@@ -408,6 +558,9 @@ impl XdpTxPool {
             let frame_size = live.umem.frame_size() as usize;
             let layout = self.layout;
             let data_offset = layout.data_offset();
+            // Taken once; cloned per frame inside the closure (a no-op clone in
+            // release builds, where `BufferEpoch` is zero-sized).
+            let epoch = live.reclaim.buffer_epoch();
             out.reserve(max);
 
             let start_len = out.len();
@@ -427,6 +580,7 @@ impl XdpTxPool {
                                 frame_addr,
                                 frame_size,
                                 reclaim: Some(reclaim_ptr),
+                                epoch: epoch.clone(),
                             },
                             layout,
                             data_offset,
@@ -470,12 +624,20 @@ impl BufferPool for XdpRxPool {
         &self.layout
     }
 
+    /// Allocates one receive buffer.
+    ///
+    /// The returned buffer borrows this pool's frame storage through raw
+    /// pointers (see [`XdpPacketBufMut`]'s lifetime contract): **this pool and
+    /// its owning socket must outlive the buffer**, even if it is moved to
+    /// another thread. Debug builds panic on violation; release builds do not
+    /// check.
     fn allocate(&mut self) -> Option<Self::Buffer> {
         let frame = self.heap.pop()?;
         Some(XdpPacketBufMut::from_storage(
             XdpStorage::Heap {
                 frame,
                 reclaim: Some(NonNull::from(self.heap.as_ref())),
+                epoch: self.heap.buffer_epoch(),
             },
             self.layout,
             self.layout.data_offset(),
@@ -491,6 +653,13 @@ impl BufferPool for XdpTxPool {
         &self.layout
     }
 
+    /// Allocates one transmit buffer.
+    ///
+    /// The returned buffer borrows this pool's UMEM/frame storage through raw
+    /// pointers (see [`XdpPacketBufMut`]'s lifetime contract): **this pool and
+    /// its owning socket must outlive the buffer**, even if it is moved to
+    /// another thread. Debug builds panic on violation; release builds do not
+    /// check.
     fn allocate(&mut self) -> Option<Self::Buffer> {
         if let Some(live) = &self.live {
             let frame_addr = live.reclaim.pop()?;
@@ -503,6 +672,7 @@ impl BufferPool for XdpTxPool {
                     frame_addr,
                     frame_size: live.umem.frame_size() as usize,
                     reclaim: Some(reclaim_ptr),
+                    epoch: live.reclaim.buffer_epoch(),
                 },
                 self.layout,
                 self.layout.data_offset(),
@@ -515,6 +685,7 @@ impl BufferPool for XdpTxPool {
             XdpStorage::Heap {
                 frame,
                 reclaim: Some(NonNull::from(self.heap.as_ref())),
+                epoch: self.heap.buffer_epoch(),
             },
             self.layout,
             self.layout.data_offset(),
@@ -527,6 +698,8 @@ enum XdpStorage {
     Heap {
         frame: Box<[u8]>,
         reclaim: Option<NonNull<HeapReclaim>>,
+        /// Debug-only liveness token for the owning pool (see [`owner_epoch`]).
+        epoch: BufferEpoch,
     },
     Umem {
         // SAFETY invariant: `umem` and `reclaim` point at allocations owned by
@@ -548,6 +721,11 @@ enum XdpStorage {
         frame_addr: u64,
         frame_size: usize,
         reclaim: Option<NonNull<FrameReclaim>>,
+        /// Debug-only liveness token for the owning socket/pool (see
+        /// [`owner_epoch`]). Checked before every UMEM deref and on reclaim so
+        /// "socket dropped while this buffer was alive" panics instead of
+        /// silently reading/writing freed memory.
+        epoch: BufferEpoch,
     },
 }
 
@@ -572,7 +750,17 @@ impl fmt::Debug for XdpStorage {
 }
 
 impl XdpStorage {
+    /// Returns the debug liveness token shared by both variants.
+    fn epoch(&self) -> &BufferEpoch {
+        match self {
+            Self::Heap { epoch, .. } | Self::Umem { epoch, .. } => epoch,
+        }
+    }
+
     fn ptr(&self) -> *const u8 {
+        // Debug builds trip a clear assert here if the owning socket/pool was
+        // already dropped; release builds compile this to nothing.
+        self.epoch().assert_owner_alive();
         match self {
             Self::Heap { frame, .. } => frame.as_ptr(),
             Self::Umem {
@@ -588,6 +776,8 @@ impl XdpStorage {
     }
 
     fn mut_ptr(&mut self) -> *mut u8 {
+        // See `ptr`: debug-only use-after-owner-drop guard.
+        self.epoch().assert_owner_alive();
         match self {
             Self::Heap { frame, .. } => frame.as_mut_ptr(),
             Self::Umem {
@@ -609,8 +799,12 @@ impl XdpStorage {
     }
 
     fn reclaim(&mut self) {
+        // The reclaim push dereferences the owner's reclaim pool; in debug
+        // builds this fires a clear assert if that owner was already dropped
+        // (otherwise a silent dangling-pointer write). Release: compiled away.
+        self.epoch().assert_owner_alive();
         match self {
-            Self::Heap { frame, reclaim } => {
+            Self::Heap { frame, reclaim, .. } => {
                 if let Some(reclaim) = reclaim.take() {
                     let empty = Vec::new().into_boxed_slice();
                     let frame = mem::replace(frame, empty);
@@ -677,6 +871,15 @@ impl Drop for XdpPacketBufInner {
 }
 
 /// Mutable AF_XDP packet buffer.
+///
+/// # Lifetime contract
+///
+/// A live buffer borrows socket/pool-owned UMEM through raw pointers but is an
+/// owned, [`Send`] value with no lifetime tying it to its socket. **The socket
+/// and pools that produced this buffer must outlive it** (including after it is
+/// moved to another thread); dropping them first and then using — or dropping —
+/// this buffer is undefined behavior. Debug builds turn that misuse into a clear
+/// panic (see the module-level docs); release builds do not check it.
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct XdpPacketBufMut {
@@ -684,6 +887,9 @@ pub struct XdpPacketBufMut {
 }
 
 /// Frozen AF_XDP packet buffer.
+///
+/// Carries the same [lifetime contract](XdpPacketBufMut#lifetime-contract) as
+/// [`XdpPacketBufMut`]: the owning socket/pool must outlive the buffer.
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct XdpPacketBuf {
@@ -694,7 +900,8 @@ pub struct XdpPacketBuf {
 // and UMEM. They may be moved to worker threads for filling or dropped there;
 // remote drops enter bounded MPSC reclaim queues. The socket and pools that
 // created a buffer must outlive it, as documented in the module-level lifetime
-// contract. The `Cell` marker keeps buffers `!Sync`, so packet memory is not
+// contract (and enforced in debug builds by the per-buffer owner-generation
+// token). The `Cell` marker keeps buffers `!Sync`, so packet memory is not
 // shared by reference across threads.
 unsafe impl Send for XdpPacketBufMut {}
 
@@ -1063,7 +1270,6 @@ mod tests {
             .with_l2_headroom(64)
             .with_alignment(NonZeroUsize::new(2048).unwrap())
             .with_fixed_chunk(2048, 2048)
-            .unwrap()
     }
 
     fn umem() -> Rc<Umem> {
@@ -1229,5 +1435,38 @@ mod tests {
         let mut reclaimed = Vec::new();
         reclaim.drain_into(&mut reclaimed);
         assert_eq!(reclaimed, vec![0]);
+    }
+
+    /// Dropping the owning pool/UMEM while a live buffer is still alive is the
+    /// documented UB case. When the guard is active (debug builds or the
+    /// `buffer-guard` feature), the owner-generation check must turn a subsequent
+    /// buffer access into a clear panic rather than a dangling read. With the
+    /// guard disabled there is no check, so this test only runs when guarded.
+    #[cfg(any(debug_assertions, feature = "buffer-guard"))]
+    #[test]
+    fn use_after_owner_drop_panics_when_guarded() {
+        let reclaim = FrameReclaim::new(vec![0]);
+        let pool = XdpRxPool::live(layout(), umem(), Rc::clone(&reclaim));
+        let packet = pool
+            .wrap_rx_frame(0, layout().data_offset(), 16)
+            .expect("rx frame wraps");
+
+        // Tear down every owner of the UMEM/reclaim out from under the buffer.
+        drop(pool);
+        drop(reclaim);
+
+        // Touching the buffer now would read freed UMEM in release; the debug
+        // guard must catch it instead.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = packet.as_slice();
+        }));
+        assert!(
+            result.is_err(),
+            "use-after-owner-drop must be detected in debug builds"
+        );
+
+        // The buffer is still alive; its own `Drop` would (correctly) assert
+        // too, so forget it to avoid a double panic aborting the test.
+        std::mem::forget(packet);
     }
 }

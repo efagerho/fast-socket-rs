@@ -323,6 +323,25 @@ impl OsUdpSocket {
                 ),
             ));
         }
+        // The receive buffer's payload capacity is the `iov_len` handed to the
+        // kernel, so a datagram larger than it is reported `MSG_TRUNC` and
+        // dropped as `Error::Truncated`. If that capacity is smaller than the
+        // MTU the socket accepts, every datagram in `(payload_capacity, mtu]`
+        // truncates and `recv` fails *permanently* with no way for the caller
+        // to recover. Reject the mismatch at construction instead of letting it
+        // surface as a confusing run-time `Truncated` storm.
+        let rx_capacity = config.rx_buffer_layout.payload_capacity();
+        if rx_capacity < config.mtu {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "OsUdpSocketConfig rx buffer payload capacity ({rx_capacity}) is smaller \
+                     than the socket MTU ({}); received datagrams up to the MTU would always \
+                     be truncated",
+                    config.mtu
+                ),
+            ));
+        }
         configure_queue_affinity(&socket, config.queue_affinity)?;
         #[cfg(target_os = "linux")]
         enable_pktinfo(&socket)?;
@@ -1410,6 +1429,9 @@ mod tests {
     #[test]
     fn os_udp_socket_exposes_separate_receive_and_transmit_pools() {
         let mut socket = OsUdpSocketBuilder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            // MTU kept within the 128-byte rx payload capacity so the layout is
+            // internally consistent (see the rx-capacity check in `from_std`).
+            .mtu(128)
             .rx_buffer_layout(BufferLayout::with_headroom_and_tailroom(128, 4, 8))
             .tx_buffer_layout(BufferLayout::with_headroom_and_tailroom(512, 64, 16))
             .bind()

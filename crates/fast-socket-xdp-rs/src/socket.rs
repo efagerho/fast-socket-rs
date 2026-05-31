@@ -82,6 +82,15 @@ impl ReadinessSource for XdpReadinessSource {
 /// AF_XDP IP packet socket state.
 #[derive(Debug)]
 pub struct XdpIpPacketSocket<D = BusyPollDriver> {
+    // DROP ORDER IS LOAD-BEARING: these two buffer queues hold `XdpPacketBuf`s
+    // that borrow `rx_pool`/`tx_pool`/`live` (UMEM + reclaim) through raw
+    // pointers and reclaim into them on drop. Struct fields drop in declaration
+    // order, so the queues MUST be declared before the pools and `live`; dropping
+    // a pool first would free the reclaim state out from under a buffer still
+    // queued here (a use-after-free, caught in debug by the buffer owner-epoch
+    // guard). Do not reorder these below the pools.
+    pending_rx: VecDeque<IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>>,
+    pending_tx_frames: VecDeque<XdpPacketBuf>,
     config: XdpIpPacketSocketConfig,
     /// Single backing NIC queue, stored so [`RawDevice::nic_queues`] can return
     /// a slice. Always one element for this single-queue socket; aggregate
@@ -92,8 +101,6 @@ pub struct XdpIpPacketSocket<D = BusyPollDriver> {
     driver: D,
     routes: XdpLocalRoutes,
     live: Option<LiveXdpState>,
-    pending_rx: VecDeque<IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>>,
-    pending_tx_frames: VecDeque<XdpPacketBuf>,
     stats: RawDeviceStats,
     _not_send: PhantomData<Rc<()>>,
 }
@@ -1985,6 +1992,13 @@ where
         self.send_udp_inner(batch)
     }
 
+    /// Receives UDP datagrams into `out`.
+    ///
+    /// The delivered buffers borrow this socket's UMEM through raw pointers:
+    /// **this socket must outlive every received buffer** (including any moved
+    /// to another thread). Dropping the socket while a received buffer is still
+    /// alive is undefined behavior — debug builds panic on later use, release
+    /// builds do not check. See [`XdpPacketBufMut`](crate::buffer::XdpPacketBufMut).
     fn recv(
         &mut self,
         out: &mut RecvBatch<UdpReceive<fast_socket_rs::UdpRxBuffer<Self>, Self::RecvMeta>>,
@@ -2059,6 +2073,13 @@ where
         self.send_inner(batch)
     }
 
+    /// Receives complete IP datagrams into `out`.
+    ///
+    /// The delivered buffers borrow this socket's UMEM through raw pointers:
+    /// **this socket must outlive every received buffer** (including any moved
+    /// to another thread). Dropping the socket while a received buffer is still
+    /// alive is undefined behavior — debug builds panic on later use, release
+    /// builds do not check. See [`XdpPacketBufMut`](crate::buffer::XdpPacketBufMut).
     fn recv(
         &mut self,
         out: &mut RecvBatch<IpPacketReceive<XdpPacketBufMut, Self::RecvMeta>>,
@@ -2944,7 +2965,6 @@ mod tests {
             .with_l2_headroom(64)
             .with_alignment(NonZeroUsize::new(2048).unwrap())
             .with_fixed_chunk(2048, 2048)
-            .unwrap()
     }
 
     #[test]

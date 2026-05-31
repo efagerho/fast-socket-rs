@@ -26,7 +26,7 @@ pub use affinity::{
 };
 pub use batch::{RecvBatch, SendError, TxSlot};
 pub use buffer::{
-    BufferAccessError, BufferCapabilities, BufferLayout, BufferLayoutError, BufferPool,
+    BufferAccessError, BufferCapabilities, BufferLayout, BufferPool,
     HeapBufferPool, OwnedPacketBuffer, PacketBuf, PacketBufMut, PacketBuffer, PacketBufferMut,
     QueueBufferConfig, ReserveError, ScatterGather, Segment, Segments,
 };

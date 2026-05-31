@@ -170,30 +170,30 @@ impl BufferLayout {
     /// storage, and other fixed-size packet memory. `chunk_size` must fit the
     /// configured L2 headroom, public headroom, payload capacity, and tailroom.
     /// `stride` must be at least as large as the chunk size.
-    pub fn with_fixed_chunk(
-        mut self,
-        chunk_size: usize,
-        stride: usize,
-    ) -> Result<Self, BufferLayoutError> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is smaller than the layout minimum, or if `stride`
+    /// is smaller than `chunk_size`. Consistent with the other `BufferLayout`
+    /// builder methods ([`Self::with_alignment`], [`Self::with_max_segments`],
+    /// [`Self::with_l2_headroom`]), an invalid layout is a construction-time
+    /// programmer error and panics rather than returning a `Result`.
+    #[must_use]
+    pub fn with_fixed_chunk(mut self, chunk_size: usize, stride: usize) -> Self {
         let minimum = self.minimum_chunk_size();
-        if chunk_size < minimum {
-            return Err(BufferLayoutError::ChunkTooSmall {
-                minimum,
-                requested: chunk_size,
-            });
-        }
-
-        if stride < chunk_size {
-            return Err(BufferLayoutError::StrideTooSmall {
-                chunk_size,
-                requested: stride,
-            });
-        }
+        assert!(
+            chunk_size >= minimum,
+            "with_fixed_chunk chunk_size {chunk_size} is smaller than the layout minimum {minimum}",
+        );
+        assert!(
+            stride >= chunk_size,
+            "with_fixed_chunk stride {stride} is smaller than the chunk size {chunk_size}",
+        );
 
         self.chunk_size = chunk_size;
         self.stride = stride;
         self.chunk_fixed = true;
-        Ok(self)
+        self
     }
 
     /// Usable packet payload/datagram capacity.
@@ -260,46 +260,6 @@ impl BufferLayout {
         self.data_offset + self.payload_capacity + self.tailroom
     }
 }
-
-/// Error returned when constructing an invalid [`BufferLayout`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum BufferLayoutError {
-    /// The requested chunk size cannot hold the configured packet layout.
-    ChunkTooSmall {
-        /// Minimum required chunk size.
-        minimum: usize,
-        /// Requested chunk size.
-        requested: usize,
-    },
-    /// The requested stride is smaller than the fixed chunk size.
-    StrideTooSmall {
-        /// Fixed chunk size.
-        chunk_size: usize,
-        /// Requested stride.
-        requested: usize,
-    },
-}
-
-impl fmt::Display for BufferLayoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ChunkTooSmall { minimum, requested } => write!(
-                f,
-                "buffer chunk too small: requested {requested}, minimum {minimum}"
-            ),
-            Self::StrideTooSmall {
-                chunk_size,
-                requested,
-            } => write!(
-                f,
-                "buffer stride too small: requested {requested}, chunk size {chunk_size}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BufferLayoutError {}
 
 /// Per-queue buffer layout and descriptor-depth configuration.
 #[derive(Clone, Copy, Debug)]
@@ -930,19 +890,19 @@ mod tests {
     fn fixed_chunk_layout_validates_bypass_facts() {
         let layout = BufferLayout::with_headroom_and_tailroom(128, 32, 16)
             .with_l2_headroom(14)
-            .with_fixed_chunk(256, 512)
-            .unwrap();
+            .with_fixed_chunk(256, 512);
 
         assert_eq!(layout.chunk_size(), 256);
         assert_eq!(layout.stride(), 512);
         assert_eq!(layout.data_offset(), 46);
+    }
 
-        assert!(matches!(
-            BufferLayout::with_headroom_and_tailroom(128, 32, 16)
-                .with_l2_headroom(14)
-                .with_fixed_chunk(64, 64),
-            Err(BufferLayoutError::ChunkTooSmall { .. })
-        ));
+    #[test]
+    #[should_panic(expected = "smaller than the layout minimum")]
+    fn fixed_chunk_too_small_panics() {
+        let _ = BufferLayout::with_headroom_and_tailroom(128, 32, 16)
+            .with_l2_headroom(14)
+            .with_fixed_chunk(64, 64);
     }
 
     #[test]
@@ -950,7 +910,6 @@ mod tests {
         // Set fixed chunk first, then add a small l2 headroom that still fits.
         let layout = BufferLayout::with_headroom_and_tailroom(128, 32, 16)
             .with_fixed_chunk(256, 512)
-            .unwrap()
             .with_l2_headroom(14);
 
         assert_eq!(layout.chunk_size(), 256);
@@ -965,7 +924,6 @@ mod tests {
         // layout. A 20-byte l2 headroom pushes minimum_chunk_size past 192.
         let _ = BufferLayout::with_headroom_and_tailroom(128, 32, 16)
             .with_fixed_chunk(192, 192)
-            .unwrap()
             .with_l2_headroom(20);
     }
 }

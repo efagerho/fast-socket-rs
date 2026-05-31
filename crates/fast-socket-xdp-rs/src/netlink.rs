@@ -11,6 +11,9 @@ use std::slice;
 use fast_socket_rs::{IfIndex, LinkAddr};
 
 const NETLINK_RCVBUF_SIZE: i32 = 1 << 16;
+/// Receive timeout for netlink dump sockets. A correct kernel dump completes in
+/// milliseconds; this only fires when a peer stops responding mid-dump.
+const NETLINK_RECV_TIMEOUT_SECS: libc::time_t = 5;
 const NLMSG_ALIGNTO: usize = 4;
 const NLA_ALIGNTO: usize = 4;
 const NLA_HDR_LEN: usize = align_to(mem::size_of::<libc::nlattr>(), NLA_ALIGNTO);
@@ -99,6 +102,32 @@ impl NetlinkSocket {
             )
         };
 
+        // Bound every blocking `recv` with a receive timeout. Without this a
+        // dump whose peer never sends `NLMSG_DONE` (a wedged or buggy netlink
+        // peer) blocks the calling thread forever — and dumps run on the route
+        // monitor thread (`route_monitor::start_netlink`), so a hang there is
+        // silent and unrecoverable. With `SO_RCVTIMEO` a stalled dump surfaces
+        // as a `TimedOut` error from `recv` instead. The `MAX_RECV_CALLS`
+        // backstop only catches a peer that keeps *returning* unterminated
+        // datagrams; this catches one that stops responding mid-dump.
+        let timeout = libc::timeval {
+            tv_sec: NETLINK_RECV_TIMEOUT_SECS,
+            tv_usec: 0,
+        };
+        // SAFETY: timeout points to a valid timeval for the duration of setsockopt.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&timeout as *const libc::timeval).cast(),
+                mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         Ok(Self { fd })
     }
 
@@ -178,7 +207,21 @@ impl NetlinkSocket {
                 )
             };
             if len < 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    // Interrupted by a signal before any data arrived: retry.
+                    Some(libc::EINTR) => continue,
+                    // `SO_RCVTIMEO` elapsed (EWOULDBLOCK == EAGAIN on Linux):
+                    // the dump stalled. Surface a clear timeout instead of
+                    // blocking forever.
+                    Some(libc::EAGAIN) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "netlink dump stalled: no message received before the receive timeout",
+                        ));
+                    }
+                    _ => return Err(error),
+                }
             }
             if len == 0 {
                 return Err(io::Error::other(

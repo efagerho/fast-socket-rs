@@ -53,13 +53,11 @@ impl Default for XdpIpPacketSocketConfig {
         let rx = BufferLayout::with_headroom_and_tailroom(2048, 0, 0)
             .with_l2_headroom(64)
             .with_alignment(align)
-            .with_fixed_chunk(4096, 4096)
-            .expect("default XDP rx layout is valid");
+            .with_fixed_chunk(4096, 4096);
         let tx = BufferLayout::with_headroom_and_tailroom(2048, 64, 0)
             .with_l2_headroom(64)
             .with_alignment(align)
-            .with_fixed_chunk(4096, 4096)
-            .expect("default XDP tx layout is valid");
+            .with_fixed_chunk(4096, 4096);
         Self {
             // Placeholder ifindex (loopback). Every entry point that exposes
             // `Default` lives behind a builder that overwrites this with the
