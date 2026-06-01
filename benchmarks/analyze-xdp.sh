@@ -19,8 +19,8 @@ usage: benchmarks/analyze-xdp.sh [--mode blast|ping]
        [--symbols sym1,sym2,...] [--skip cycles,l1miss,ldlat,c2c]
 
 Defaults match profile-xdp.sh. Override with env vars:
-  PROFILE_SECONDS=30, DURATION_MS, PAYLOAD_LEN, IFACE, QUEUE_MODE,
-  QUEUE, LOCAL, TARGET, RATE, STATS_IFACES, ETHTOOL, PERF, PERF_SUDO,
+  PROFILE_SECONDS=30, DURATION_MS, PAYLOAD_LEN, IFACE, THREADS,
+  LOCAL, TARGET, RATE, STATS_IFACES, ETHTOOL, PERF, PERF_SUDO,
   PERF_FREQ, CALL_GRAPH, PERF_DELAY_MS, OUT_BASE.
 
 --symbols selects functions for per-mode `perf annotate --stdio` output.
@@ -73,8 +73,7 @@ PROFILE_SECONDS="${PROFILE_SECONDS:-30}"
 DURATION_MS="${DURATION_MS:-$((PROFILE_SECONDS * 1000))}"
 PAYLOAD_LEN="${PAYLOAD_LEN:-64}"
 IFACE="${IFACE:-bond0}"
-QUEUE_MODE="${QUEUE_MODE:-all}"
-QUEUE="${QUEUE:-0}"
+THREADS="${THREADS:-4}"
 LOCAL="${LOCAL:-213.239.141.12:52000}"
 TARGET="${TARGET:-213.239.141.11:41000}"
 RATE="${RATE:-1000}"
@@ -138,11 +137,7 @@ sender_args=(
 )
 
 if [[ "$MODE" == "blast" ]]; then
-  if [[ "$QUEUE_MODE" == "all" ]]; then
-    sender_args+=(--all-queues)
-  else
-    sender_args+=(--queue "$QUEUE")
-  fi
+  sender_args+=(--threads "$THREADS")
 else
   sender_args+=(--rate "$RATE")
 fi

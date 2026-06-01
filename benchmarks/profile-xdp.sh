@@ -12,8 +12,7 @@ Defaults:
   DURATION_MS=           sender duration in milliseconds
   PAYLOAD_LEN=64         UDP payload size
   IFACE=bond0            interface passed to xdp-sender
-  QUEUE_MODE=all         blast queue mode: all or one
-  QUEUE=0                queue used when QUEUE_MODE=one
+  THREADS=4              worker threads; all NIC queues split into THREADS blocks
   LOCAL=213.239.141.12:52000
   TARGET=213.239.141.11:41000
   STATS_IFACES=$IFACE    interfaces captured with ethtool -S before/after
@@ -53,8 +52,7 @@ PROFILE_SECONDS="${PROFILE_SECONDS:-10}"
 DURATION_MS="${DURATION_MS:-$((PROFILE_SECONDS * 1000))}"
 PAYLOAD_LEN="${PAYLOAD_LEN:-64}"
 IFACE="${IFACE:-bond0}"
-QUEUE_MODE="${QUEUE_MODE:-all}"
-QUEUE="${QUEUE:-0}"
+THREADS="${THREADS:-4}"
 LOCAL="${LOCAL:-213.239.141.12:52000}"
 TARGET="${TARGET:-213.239.141.11:41000}"
 STATS_IFACES="${STATS_IFACES:-$IFACE}"
@@ -89,14 +87,6 @@ if [[ "$RUN_UID" != "0" ]]; then
   fi
 fi
 
-case "$QUEUE_MODE" in
-  all|one) ;;
-  *)
-    echo "QUEUE_MODE must be one of: all, one" >&2
-    exit 2
-    ;;
-esac
-
 mkdir -p "$OUT_DIR"
 
 if [[ "${FORCE_FRAME_POINTERS:-1}" == "1" ]]; then
@@ -125,10 +115,7 @@ write_run_env() {
     echo "local=$LOCAL"
     echo "payload_len=$PAYLOAD_LEN"
     echo "duration_ms=$DURATION_MS"
-    echo "queue_mode=$QUEUE_MODE"
-    if [[ "$QUEUE_MODE" == "one" ]]; then
-      echo "queue=$QUEUE"
-    fi
+    echo "threads=$THREADS"
     echo "perf_freq=$PERF_FREQ"
     echo "call_graph=$CALL_GRAPH"
     echo "stats_ifaces=$STATS_IFACES"
@@ -248,13 +235,8 @@ sender_args=(
   --dest "$TARGET"
   --payload-len "$PAYLOAD_LEN"
   --duration-ms "$DURATION_MS"
+  --threads "$THREADS"
 )
-
-if [[ "$QUEUE_MODE" == "all" ]]; then
-  sender_args+=(--all-queues)
-else
-  sender_args+=(--queue "$QUEUE")
-fi
 
 write_run_env
 
