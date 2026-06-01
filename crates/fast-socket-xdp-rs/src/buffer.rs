@@ -414,7 +414,7 @@ fn current_thread_id() -> ThreadId {
 /// Receive pool for AF_XDP IP packet sockets.
 #[derive(Debug)]
 pub struct XdpRxPool {
-    layout: BufferLayout,
+    ctx: Rc<XdpBufCtx>,
     heap: Rc<HeapReclaim>,
     live: Option<XdpLivePool>,
 }
@@ -422,7 +422,7 @@ pub struct XdpRxPool {
 /// Transmit pool for AF_XDP IP packet sockets.
 #[derive(Debug)]
 pub struct XdpTxPool {
-    layout: BufferLayout,
+    ctx: Rc<XdpBufCtx>,
     heap: Rc<HeapReclaim>,
     live: Option<XdpLivePool>,
 }
@@ -449,17 +449,37 @@ impl XdpRxPool {
     /// Creates a receive pool with `count` recycled heap frames.
     #[must_use]
     pub fn with_heap_capacity(layout: BufferLayout, count: usize) -> Self {
-        Self {
+        let heap = HeapReclaim::new(layout, count);
+        // The `Rc<HeapReclaim>` keeps this allocation alive for the lifetime of
+        // the pool, so the captured `NonNull` is stable. Buffers hold a raw
+        // pointer to the `XdpBufCtx`, which is itself kept alive by the pool's
+        // `Rc<XdpBufCtx>`; see the module-level lifetime contract.
+        let ctx = Rc::new(XdpBufCtx {
             layout,
-            heap: HeapReclaim::new(layout, count),
+            reclaim: XdpReclaimCtx::Heap(NonNull::from(heap.as_ref())),
+        });
+        Self {
+            ctx,
+            heap,
             live: None,
         }
     }
 
     pub(crate) fn live(layout: BufferLayout, umem: Rc<Umem>, reclaim: Rc<FrameReclaim>) -> Self {
-        Self {
+        let heap = HeapReclaim::new(layout, 0);
+        // The pool-owned `Rc`s keep the UMEM/reclaim allocations alive for the
+        // lifetime of the pool, so the captured `NonNull`s are stable.
+        let ctx = Rc::new(XdpBufCtx {
             layout,
-            heap: HeapReclaim::new(layout, 0),
+            reclaim: XdpReclaimCtx::Umem {
+                umem: NonNull::from(umem.as_ref()),
+                reclaim: NonNull::from(reclaim.as_ref()),
+                frame_size: umem.frame_size() as usize,
+            },
+        });
+        Self {
+            ctx,
+            heap,
             live: Some(XdpLivePool { umem, reclaim }),
         }
     }
@@ -478,23 +498,16 @@ impl XdpRxPool {
         }
         let desc_offset = (desc_addr - frame_addr) as usize;
         let start = desc_offset.checked_add(packet_offset)?;
-        if start < self.layout.l2_headroom() || start.checked_add(len)? > frame_size as usize {
+        if start < self.ctx.layout.l2_headroom() || start.checked_add(len)? > frame_size as usize {
             return None;
         }
         // The pool-owned `Rc`s keep these allocations alive. Returned buffers
         // may cross threads, but the socket/pool must outlive them all; see the
         // module-level lifetime contract.
-        let umem_ptr = NonNull::from(live.umem.as_ref());
-        let reclaim_ptr = NonNull::from(live.reclaim.as_ref());
         Some(XdpPacketBufMut::from_storage(
-            XdpStorage::Umem {
-                umem: umem_ptr,
-                frame_addr,
-                frame_size: live.umem.frame_size() as usize,
-                reclaim: Some(reclaim_ptr),
-                epoch: live.reclaim.buffer_epoch(),
-            },
-            self.layout,
+            XdpStorage::Umem { frame_addr },
+            NonNull::from(self.ctx.as_ref()),
+            live.reclaim.buffer_epoch(),
             start,
             start + len,
         ))
@@ -511,17 +524,36 @@ impl XdpTxPool {
     /// Creates a transmit pool with `count` recycled heap frames.
     #[must_use]
     pub fn with_heap_capacity(layout: BufferLayout, count: usize) -> Self {
-        Self {
+        let heap = HeapReclaim::new(layout, count);
+        // The `Rc<HeapReclaim>` keeps this allocation alive for the lifetime of
+        // the pool, so the captured `NonNull` is stable. See the module-level
+        // lifetime contract.
+        let ctx = Rc::new(XdpBufCtx {
             layout,
-            heap: HeapReclaim::new(layout, count),
+            reclaim: XdpReclaimCtx::Heap(NonNull::from(heap.as_ref())),
+        });
+        Self {
+            ctx,
+            heap,
             live: None,
         }
     }
 
     pub(crate) fn live(layout: BufferLayout, umem: Rc<Umem>, reclaim: Rc<FrameReclaim>) -> Self {
-        Self {
+        let heap = HeapReclaim::new(layout, 0);
+        // The pool-owned `Rc`s keep the UMEM/reclaim allocations alive for the
+        // lifetime of the pool, so the captured `NonNull`s are stable.
+        let ctx = Rc::new(XdpBufCtx {
             layout,
-            heap: HeapReclaim::new(layout, 0),
+            reclaim: XdpReclaimCtx::Umem {
+                umem: NonNull::from(umem.as_ref()),
+                reclaim: NonNull::from(reclaim.as_ref()),
+                frame_size: umem.frame_size() as usize,
+            },
+        });
+        Self {
+            ctx,
+            heap,
             live: Some(XdpLivePool { umem, reclaim }),
         }
     }
@@ -553,11 +585,8 @@ impl XdpTxPool {
             // The pool-owned `Rc`s keep these allocations alive. Returned
             // buffers may cross threads, but the socket/pool must outlive them
             // all; see the module-level lifetime contract.
-            let umem_ptr = NonNull::from(live.umem.as_ref());
-            let reclaim_ptr = NonNull::from(live.reclaim.as_ref());
-            let frame_size = live.umem.frame_size() as usize;
-            let layout = self.layout;
-            let data_offset = layout.data_offset();
+            let ctx_ptr = NonNull::from(self.ctx.as_ref());
+            let data_offset = self.ctx.layout.data_offset();
             // Taken once; cloned per frame inside the closure (a no-op clone in
             // release builds, where `BufferEpoch` is zero-sized).
             let epoch = live.reclaim.buffer_epoch();
@@ -575,14 +604,9 @@ impl XdpTxPool {
                     out_ptr
                         .add(start_len + written)
                         .write(XdpPacketBufMut::from_storage(
-                            XdpStorage::Umem {
-                                umem: umem_ptr,
-                                frame_addr,
-                                frame_size,
-                                reclaim: Some(reclaim_ptr),
-                                epoch: epoch.clone(),
-                            },
-                            layout,
+                            XdpStorage::Umem { frame_addr },
+                            ctx_ptr,
+                            epoch.clone(),
                             data_offset,
                             data_offset,
                         ));
@@ -621,7 +645,7 @@ impl BufferPool for XdpRxPool {
     type Buffer = XdpPacketBufMut;
 
     fn layout(&self) -> &BufferLayout {
-        &self.layout
+        &self.ctx.layout
     }
 
     /// Allocates one receive buffer.
@@ -633,15 +657,13 @@ impl BufferPool for XdpRxPool {
     /// check.
     fn allocate(&mut self) -> Option<Self::Buffer> {
         let frame = self.heap.pop()?;
+        let data_offset = self.ctx.layout.data_offset();
         Some(XdpPacketBufMut::from_storage(
-            XdpStorage::Heap {
-                frame,
-                reclaim: Some(NonNull::from(self.heap.as_ref())),
-                epoch: self.heap.buffer_epoch(),
-            },
-            self.layout,
-            self.layout.data_offset(),
-            self.layout.data_offset(),
+            XdpStorage::Heap { frame },
+            NonNull::from(self.ctx.as_ref()),
+            self.heap.buffer_epoch(),
+            data_offset,
+            data_offset,
         ))
     }
 }
@@ -650,7 +672,7 @@ impl BufferPool for XdpTxPool {
     type Buffer = XdpPacketBufMut;
 
     fn layout(&self) -> &BufferLayout {
-        &self.layout
+        &self.ctx.layout
     }
 
     /// Allocates one transmit buffer.
@@ -664,190 +686,98 @@ impl BufferPool for XdpTxPool {
         if let Some(live) = &self.live {
             let frame_addr = live.reclaim.pop()?;
             // See allocate_many: the socket/pool must outlive all buffers.
-            let umem_ptr = NonNull::from(live.umem.as_ref());
-            let reclaim_ptr = NonNull::from(live.reclaim.as_ref());
+            let data_offset = self.ctx.layout.data_offset();
             return Some(XdpPacketBufMut::from_storage(
-                XdpStorage::Umem {
-                    umem: umem_ptr,
-                    frame_addr,
-                    frame_size: live.umem.frame_size() as usize,
-                    reclaim: Some(reclaim_ptr),
-                    epoch: live.reclaim.buffer_epoch(),
-                },
-                self.layout,
-                self.layout.data_offset(),
-                self.layout.data_offset(),
+                XdpStorage::Umem { frame_addr },
+                NonNull::from(self.ctx.as_ref()),
+                live.reclaim.buffer_epoch(),
+                data_offset,
+                data_offset,
             ));
         }
 
         let frame = self.heap.pop()?;
+        let data_offset = self.ctx.layout.data_offset();
         Some(XdpPacketBufMut::from_storage(
-            XdpStorage::Heap {
-                frame,
-                reclaim: Some(NonNull::from(self.heap.as_ref())),
-                epoch: self.heap.buffer_epoch(),
-            },
-            self.layout,
-            self.layout.data_offset(),
-            self.layout.data_offset(),
+            XdpStorage::Heap { frame },
+            NonNull::from(self.ctx.as_ref()),
+            self.heap.buffer_epoch(),
+            data_offset,
+            data_offset,
         ))
     }
 }
 
-enum XdpStorage {
-    Heap {
-        frame: Box<[u8]>,
-        reclaim: Option<NonNull<HeapReclaim>>,
-        /// Debug-only liveness token for the owning pool (see [`owner_epoch`]).
-        epoch: BufferEpoch,
-    },
+/// Per-pool constant state shared by every buffer that pool hands out.
+///
+/// One of these lives behind the pool's `Rc<XdpBufCtx>`; each buffer holds a raw
+/// `NonNull<XdpBufCtx>` into it instead of duplicating the layout and reclaim
+/// pointers per buffer. The pool/socket that owns the `Rc` must outlive every
+/// buffer (see the module-level lifetime contract); the buffer's debug epoch
+/// token guards against use-after-owner-drop exactly as the raw UMEM/reclaim
+/// pointers did before.
+#[derive(Debug)]
+struct XdpBufCtx {
+    layout: BufferLayout,
+    reclaim: XdpReclaimCtx,
+}
+
+enum XdpReclaimCtx {
+    // SAFETY invariant: this pointer references the pool-owned `HeapReclaim`
+    // allocation. The pool's `Rc<HeapReclaim>` keeps it alive for the lifetime
+    // of every buffer (see the module-level lifetime contract).
+    Heap(NonNull<HeapReclaim>),
+    // SAFETY invariant: `umem` and `reclaim` point at allocations owned by the
+    // socket/pool that handed the buffer out. Buffers are `Send` and may be
+    // filled or dropped on worker threads, so the owner socket/pool must
+    // outlive every outstanding buffer. Cross-thread drops push into the
+    // reclaim object's remote MPSC queue; owner-thread drops use its local free
+    // list.
+    //
+    // Review item **S4** (UMEM lifetime is enforced only by docs) is
+    // intentionally left as-is: switching the owning side to `Arc<Umem>` and
+    // `Arc<FrameReclaim>` would either force every recv/send into an atomic
+    // ref-count cycle on the steady-state hot path or leak the UMEM until the
+    // last in-flight buffer drains. The current contract — "do not drop the
+    // owning socket while there are outstanding buffers" — matches how every
+    // backend in this workspace already uses the type.
     Umem {
-        // SAFETY invariant: `umem` and `reclaim` point at allocations owned by
-        // the socket/pool that handed this storage out. Buffers are `Send` and
-        // may be filled or dropped on worker threads, so the owner socket/pool
-        // must outlive every outstanding buffer. Cross-thread drops push into
-        // the reclaim object's remote MPSC queue; owner-thread drops use its
-        // local free list.
-        //
-        // Review item **S4** (UMEM lifetime is enforced only by docs) is
-        // intentionally left as-is: switching the owning side to `Arc<Umem>`
-        // and `Arc<FrameReclaim>` would either force every recv/send into an
-        // atomic ref-count cycle on the steady-state hot path or leak the
-        // UMEM until the last in-flight buffer drains. The current contract
-        // — "do not drop the owning socket while there are outstanding
-        // buffers" — matches how every backend in this workspace already
-        // uses the type.
         umem: NonNull<Umem>,
-        frame_addr: u64,
+        reclaim: NonNull<FrameReclaim>,
         frame_size: usize,
-        reclaim: Option<NonNull<FrameReclaim>>,
-        /// Debug-only liveness token for the owning socket/pool (see
-        /// [`owner_epoch`]). Checked before every UMEM deref and on reclaim so
-        /// "socket dropped while this buffer was alive" panics instead of
-        /// silently reading/writing freed memory.
-        epoch: BufferEpoch,
     },
 }
 
-impl fmt::Debug for XdpStorage {
+impl fmt::Debug for XdpReclaimCtx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Heap { frame, .. } => f
-                .debug_struct("Heap")
-                .field("len", &frame.len())
-                .finish_non_exhaustive(),
-            Self::Umem {
-                frame_addr,
-                frame_size,
-                ..
-            } => f
+            Self::Heap(_) => f.debug_struct("Heap").finish_non_exhaustive(),
+            Self::Umem { frame_size, .. } => f
                 .debug_struct("Umem")
-                .field("frame_addr", frame_addr)
                 .field("frame_size", frame_size)
                 .finish_non_exhaustive(),
         }
     }
 }
 
-impl XdpStorage {
-    /// Returns the debug liveness token shared by both variants.
-    fn epoch(&self) -> &BufferEpoch {
-        match self {
-            Self::Heap { epoch, .. } | Self::Umem { epoch, .. } => epoch,
-        }
-    }
+/// Per-buffer frame data. All per-pool constant state lives in [`XdpBufCtx`];
+/// this carries only what differs between buffers.
+enum XdpStorage {
+    Heap { frame: Box<[u8]> },
+    Umem { frame_addr: u64 },
+}
 
-    fn ptr(&self) -> *const u8 {
-        // Debug builds trip a clear assert here if the owning socket/pool was
-        // already dropped; release builds compile this to nothing.
-        self.epoch().assert_owner_alive();
+impl fmt::Debug for XdpStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Heap { frame, .. } => frame.as_ptr(),
-            Self::Umem {
-                umem, frame_addr, ..
-            } => {
-                // SAFETY: the socket/pool keeps the UMEM allocation alive for
-                // the lifetime of this storage (see XdpStorage::Umem
-                // invariant), and `frame_addr` is produced from its frame
-                // table.
-                unsafe { umem.as_ref().as_ptr().add(*frame_addr as usize) }
-            }
-        }
-    }
-
-    fn mut_ptr(&mut self) -> *mut u8 {
-        // See `ptr`: debug-only use-after-owner-drop guard.
-        self.epoch().assert_owner_alive();
-        match self {
-            Self::Heap { frame, .. } => frame.as_mut_ptr(),
-            Self::Umem {
-                umem, frame_addr, ..
-            } => {
-                // SAFETY: same UMEM-liveness invariant as `ptr`. Even when the
-                // buffer moves to another thread, Rust ownership gives that
-                // thread exclusive access to this packet frame.
-                unsafe { (umem.as_ref().as_ptr() as *mut u8).add(*frame_addr as usize) }
-            }
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Heap { frame, .. } => frame.len(),
-            Self::Umem { frame_size, .. } => *frame_size,
-        }
-    }
-
-    fn reclaim(&mut self) {
-        // The reclaim push dereferences the owner's reclaim pool; in debug
-        // builds this fires a clear assert if that owner was already dropped
-        // (otherwise a silent dangling-pointer write). Release: compiled away.
-        self.epoch().assert_owner_alive();
-        match self {
-            Self::Heap { frame, reclaim, .. } => {
-                if let Some(reclaim) = reclaim.take() {
-                    let empty = Vec::new().into_boxed_slice();
-                    let frame = mem::replace(frame, empty);
-                    // SAFETY: same socket/pool-outlives-buffer invariant as
-                    // live UMEM storage.
-                    unsafe { reclaim.as_ref() }.push(frame);
-                }
-            }
-            Self::Umem {
-                frame_addr,
-                reclaim,
-                ..
-            } => {
-                if let Some(reclaim) = reclaim.take() {
-                    // SAFETY: the socket/pool keeps the FrameReclaim
-                    // allocation alive for the lifetime of this storage (see
-                    // XdpStorage::Umem invariant). Remote-thread drops use the
-                    // reclaim object's bounded MPSC queue.
-                    unsafe { reclaim.as_ref() }.push(*frame_addr);
-                }
-            }
-        }
-    }
-
-    fn disarm_reclaim(&mut self) {
-        match self {
-            Self::Heap { reclaim, .. } => {
-                let _ = reclaim.take();
-            }
-            Self::Umem { reclaim, .. } => {
-                let _ = reclaim.take();
-            }
-        }
-    }
-
-    fn is_umem(&self) -> bool {
-        matches!(self, Self::Umem { .. })
-    }
-
-    fn frame_addr(&self) -> Option<u64> {
-        match self {
-            Self::Umem { frame_addr, .. } => Some(*frame_addr),
-            Self::Heap { .. } => None,
+            Self::Heap { frame } => f
+                .debug_struct("Heap")
+                .field("len", &frame.len())
+                .finish_non_exhaustive(),
+            Self::Umem { frame_addr } => f
+                .debug_struct("Umem")
+                .field("frame_addr", frame_addr)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -856,16 +786,166 @@ impl XdpStorage {
 #[derive(Debug)]
 struct XdpPacketBufInner {
     storage: Option<XdpStorage>,
-    layout: BufferLayout,
+    // SAFETY invariant: raw pointer into pool-owned `Rc<XdpBufCtx>` memory; the
+    // pool/socket must outlive this buffer (module-level lifetime contract).
+    // The `epoch` token guards against use-after-owner-drop in debug builds.
+    ctx: NonNull<XdpBufCtx>,
+    /// Debug-only liveness token for the owning socket/pool (see
+    /// [`owner_epoch`]). Checked before every `ctx`/UMEM deref and on reclaim so
+    /// "socket dropped while this buffer was alive" panics instead of silently
+    /// reading/writing freed memory.
+    epoch: BufferEpoch,
+    armed: bool,
     start: usize,
     end: usize,
     _not_sync: PhantomData<Cell<()>>,
 }
 
+impl XdpPacketBufInner {
+    /// Returns the shared per-pool context.
+    ///
+    /// Asserts owner liveness because `ctx` is a raw pointer into pool-owned
+    /// memory (same contract as the old umem/reclaim pointers); debug builds
+    /// trip a clear assert here if the owning socket/pool was already dropped,
+    /// release builds compile this to nothing.
+    #[inline]
+    fn ctx(&self) -> &XdpBufCtx {
+        self.epoch.assert_owner_alive();
+        // SAFETY: the pool/socket keeps the `Rc<XdpBufCtx>` alive for the
+        // lifetime of this buffer (module-level lifetime contract).
+        unsafe { self.ctx.as_ref() }
+    }
+
+    fn ptr(&self) -> *const u8 {
+        match self.storage.as_ref().expect("buffer storage is present") {
+            XdpStorage::Heap { frame } => {
+                // Heap frames are owned inline; still assert owner liveness for
+                // a uniform contract across both storage kinds.
+                self.epoch.assert_owner_alive();
+                frame.as_ptr()
+            }
+            XdpStorage::Umem { frame_addr } => {
+                let frame_addr = *frame_addr;
+                match &self.ctx().reclaim {
+                    XdpReclaimCtx::Umem { umem, .. } => {
+                        // SAFETY: the socket/pool keeps the UMEM allocation
+                        // alive for the lifetime of this buffer (see
+                        // XdpReclaimCtx::Umem invariant), and `frame_addr` is
+                        // produced from its frame table.
+                        unsafe { umem.as_ref().as_ptr().add(frame_addr as usize) }
+                    }
+                    XdpReclaimCtx::Heap(_) => {
+                        unreachable!("Umem storage always pairs with Umem reclaim context")
+                    }
+                }
+            }
+        }
+    }
+
+    fn mut_ptr(&mut self) -> *mut u8 {
+        // For Umem storage we need `ctx()` (which asserts); for Heap we assert
+        // explicitly. Resolve the UMEM base pointer first to avoid borrowing
+        // `self` mutably while `ctx()` borrows it immutably.
+        match self.storage.as_ref().expect("buffer storage is present") {
+            XdpStorage::Umem { frame_addr } => {
+                let frame_addr = *frame_addr;
+                match &self.ctx().reclaim {
+                    XdpReclaimCtx::Umem { umem, .. } => {
+                        // SAFETY: same UMEM-liveness invariant as `ptr`. Even
+                        // when the buffer moves to another thread, Rust
+                        // ownership gives that thread exclusive access to this
+                        // packet frame.
+                        unsafe { (umem.as_ref().as_ptr() as *mut u8).add(frame_addr as usize) }
+                    }
+                    XdpReclaimCtx::Heap(_) => {
+                        unreachable!("Umem storage always pairs with Umem reclaim context")
+                    }
+                }
+            }
+            XdpStorage::Heap { .. } => {
+                self.epoch.assert_owner_alive();
+                match self.storage.as_mut().expect("buffer storage is present") {
+                    XdpStorage::Heap { frame } => frame.as_mut_ptr(),
+                    XdpStorage::Umem { .. } => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn frame_capacity(&self) -> usize {
+        match self.storage.as_ref().expect("buffer storage is present") {
+            XdpStorage::Heap { frame } => frame.len(),
+            XdpStorage::Umem { .. } => match &self.ctx().reclaim {
+                XdpReclaimCtx::Umem { frame_size, .. } => *frame_size,
+                XdpReclaimCtx::Heap(_) => {
+                    unreachable!("Umem storage always pairs with Umem reclaim context")
+                }
+            },
+        }
+    }
+
+    fn frame_addr(&self) -> Option<u64> {
+        match self.storage.as_ref().expect("buffer storage is present") {
+            XdpStorage::Umem { frame_addr } => Some(*frame_addr),
+            XdpStorage::Heap { .. } => None,
+        }
+    }
+
+    fn is_umem(&self) -> bool {
+        matches!(
+            self.storage.as_ref().expect("buffer storage is present"),
+            XdpStorage::Umem { .. }
+        )
+    }
+
+    fn reclaim(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The reclaim push dereferences the owner's reclaim pool; in debug
+        // builds this fires a clear assert if that owner was already dropped
+        // (otherwise a silent dangling-pointer write). Release: compiled away.
+        self.epoch.assert_owner_alive();
+        // SAFETY: owner liveness asserted above; pool keeps the ctx alive.
+        let ctx = unsafe { self.ctx.as_ref() };
+        match self.storage.as_mut().expect("buffer storage is present") {
+            XdpStorage::Heap { frame } => match &ctx.reclaim {
+                XdpReclaimCtx::Heap(reclaim) => {
+                    let empty = Vec::new().into_boxed_slice();
+                    let frame = mem::replace(frame, empty);
+                    // SAFETY: same socket/pool-outlives-buffer invariant as
+                    // live UMEM storage.
+                    unsafe { reclaim.as_ref() }.push(frame);
+                }
+                XdpReclaimCtx::Umem { .. } => {
+                    unreachable!("Heap storage always pairs with Heap reclaim context")
+                }
+            },
+            XdpStorage::Umem { frame_addr } => match &ctx.reclaim {
+                XdpReclaimCtx::Umem { reclaim, .. } => {
+                    // SAFETY: the socket/pool keeps the FrameReclaim allocation
+                    // alive for the lifetime of this buffer (see
+                    // XdpReclaimCtx::Umem invariant). Remote-thread drops use
+                    // the reclaim object's bounded MPSC queue.
+                    unsafe { reclaim.as_ref() }.push(*frame_addr);
+                }
+                XdpReclaimCtx::Heap(_) => {
+                    unreachable!("Umem storage always pairs with Umem reclaim context")
+                }
+            },
+        }
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
 impl Drop for XdpPacketBufInner {
     fn drop(&mut self) {
-        if let Some(storage) = self.storage.as_mut() {
-            storage.reclaim();
+        if self.armed && self.storage.is_some() {
+            self.reclaim();
         }
     }
 }
@@ -910,17 +990,24 @@ unsafe impl Send for XdpPacketBufMut {}
 unsafe impl Send for XdpPacketBuf {}
 
 impl XdpPacketBufMut {
-    fn from_storage(storage: XdpStorage, layout: BufferLayout, start: usize, end: usize) -> Self {
-        debug_assert!(end <= storage.len());
-        Self {
-            inner: XdpPacketBufInner {
-                storage: Some(storage),
-                layout,
-                start,
-                end,
-                _not_sync: PhantomData,
-            },
-        }
+    fn from_storage(
+        storage: XdpStorage,
+        ctx: NonNull<XdpBufCtx>,
+        epoch: BufferEpoch,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let inner = XdpPacketBufInner {
+            storage: Some(storage),
+            ctx,
+            epoch,
+            armed: true,
+            start,
+            end,
+            _not_sync: PhantomData,
+        };
+        debug_assert!(end <= inner.frame_capacity());
+        Self { inner }
     }
 
     /// Returns packet bytes as a contiguous slice.
@@ -936,18 +1023,10 @@ impl XdpPacketBufMut {
     /// writes.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        let storage = self
-            .inner
-            .storage
-            .as_ref()
-            .expect("buffer storage is present");
+        let len = self.inner.end - self.inner.start;
+        let ptr = self.inner.ptr();
         // SAFETY: start/end are maintained inside the backing frame.
-        unsafe {
-            slice::from_raw_parts(
-                storage.ptr().add(self.inner.start),
-                self.inner.end - self.inner.start,
-            )
-        }
+        unsafe { slice::from_raw_parts(ptr.add(self.inner.start), len) }
     }
 
     /// Returns packet bytes as a mutable contiguous slice.
@@ -955,19 +1034,12 @@ impl XdpPacketBufMut {
     /// See [`Self::as_slice`] for the AF_XDP memory-ordering rationale.
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let storage = self
-            .inner
-            .storage
-            .as_mut()
-            .expect("buffer storage is present");
+        let start = self.inner.start;
+        let len = self.inner.end - start;
+        let ptr = self.inner.mut_ptr();
         // SAFETY: start/end are maintained inside the backing frame, and &mut
         // self gives unique access to the packet bytes.
-        unsafe {
-            slice::from_raw_parts_mut(
-                storage.mut_ptr().add(self.inner.start),
-                self.inner.end - self.inner.start,
-            )
-        }
+        unsafe { slice::from_raw_parts_mut(ptr.add(start), len) }
     }
 }
 
@@ -978,40 +1050,28 @@ impl XdpPacketBuf {
     /// rationale shared by both frozen and mutable buffer types.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        let storage = self
-            .inner
-            .storage
-            .as_ref()
-            .expect("buffer storage is present");
+        let len = self.inner.end - self.inner.start;
+        let ptr = self.inner.ptr();
         // SAFETY: start/end are maintained inside the backing frame.
-        unsafe {
-            slice::from_raw_parts(
-                storage.ptr().add(self.inner.start),
-                self.inner.end - self.inner.start,
-            )
-        }
+        unsafe { slice::from_raw_parts(ptr.add(self.inner.start), len) }
     }
 
     pub(crate) fn prepare_l2(&mut self, header: &[u8]) -> Option<XdpTxFrame> {
         let packet_len = self.len();
-        let storage = self.inner.storage.as_mut()?;
-        if !storage.is_umem() || header.len() > self.inner.start {
+        if self.inner.storage.is_none() || !self.inner.is_umem() || header.len() > self.inner.start {
             return None;
         }
         let l2_start = self.inner.start - header.len();
         let len = header.len() + packet_len;
-        if l2_start + len > storage.len() {
+        if l2_start + len > self.inner.frame_capacity() {
             return None;
         }
+        let dst = self.inner.mut_ptr();
         // SAFETY: l2_start was checked to be inside this frame.
         unsafe {
-            ptr::copy_nonoverlapping(
-                header.as_ptr(),
-                storage.mut_ptr().add(l2_start),
-                header.len(),
-            );
+            ptr::copy_nonoverlapping(header.as_ptr(), dst.add(l2_start), header.len());
         }
-        let frame_addr = storage.frame_addr()?;
+        let frame_addr = self.inner.frame_addr()?;
         let desc_addr = frame_addr + l2_start as u64;
         Some(XdpTxFrame {
             desc_addr,
@@ -1028,9 +1088,7 @@ impl XdpPacketBuf {
     }
 
     pub(crate) fn mark_submitted(&mut self) {
-        if let Some(storage) = self.inner.storage.as_mut() {
-            storage.disarm_reclaim();
-        }
+        self.inner.disarm();
     }
 
     /// Marks this buffer as handed to the kernel's TX ring, disarming the
@@ -1067,21 +1125,16 @@ impl PacketBuffer for XdpPacketBufMut {
     fn headroom(&self) -> usize {
         self.inner
             .start
-            .checked_sub(self.inner.layout.l2_headroom())
+            .checked_sub(self.inner.ctx().layout.l2_headroom())
             .expect("packet start >= l2_headroom by layout invariant")
     }
 
     fn tailroom(&self) -> usize {
-        self.inner
-            .storage
-            .as_ref()
-            .expect("buffer storage is present")
-            .len()
-            .saturating_sub(self.inner.end)
+        self.inner.frame_capacity().saturating_sub(self.inner.end)
     }
 
     fn layout(&self) -> &BufferLayout {
-        &self.inner.layout
+        &self.inner.ctx().layout
     }
 
     fn segments(&self) -> Self::Segments<'_> {
@@ -1107,21 +1160,16 @@ impl PacketBuffer for XdpPacketBuf {
     fn headroom(&self) -> usize {
         self.inner
             .start
-            .checked_sub(self.inner.layout.l2_headroom())
+            .checked_sub(self.inner.ctx().layout.l2_headroom())
             .expect("packet start >= l2_headroom by layout invariant")
     }
 
     fn tailroom(&self) -> usize {
-        self.inner
-            .storage
-            .as_ref()
-            .expect("buffer storage is present")
-            .len()
-            .saturating_sub(self.inner.end)
+        self.inner.frame_capacity().saturating_sub(self.inner.end)
     }
 
     fn layout(&self) -> &BufferLayout {
-        &self.inner.layout
+        &self.inner.ctx().layout
     }
 
     fn segments(&self) -> Self::Segments<'_> {
@@ -1151,18 +1199,11 @@ impl PacketBufferMut for XdpPacketBufMut {
                 requested: bytes.len(),
             });
         }
-        let storage = self
-            .inner
-            .storage
-            .as_mut()
-            .expect("buffer storage is present");
+        let end = self.inner.end;
+        let dst = self.inner.mut_ptr();
         // SAFETY: tailroom prevalidation guarantees destination fits.
         unsafe {
-            ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                storage.mut_ptr().add(self.inner.end),
-                bytes.len(),
-            );
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(end), bytes.len());
         }
         self.inner.end += bytes.len();
         Ok(())
@@ -1200,7 +1241,7 @@ impl OwnedPacketBuffer for XdpPacketBuf {
 fn prepend_to_inner(inner: &mut XdpPacketBufInner, bytes: &[u8]) -> Result<(), ReserveError> {
     let headroom = inner
         .start
-        .checked_sub(inner.layout.l2_headroom())
+        .checked_sub(inner.ctx().layout.l2_headroom())
         .expect("packet start >= l2_headroom by layout invariant");
     if bytes.len() > headroom {
         return Err(ReserveError::InsufficientHeadroom {
@@ -1208,15 +1249,11 @@ fn prepend_to_inner(inner: &mut XdpPacketBufInner, bytes: &[u8]) -> Result<(), R
             requested: bytes.len(),
         });
     }
-    let storage = inner.storage.as_mut().expect("buffer storage is present");
     let new_start = inner.start - bytes.len();
+    let dst = inner.mut_ptr();
     // SAFETY: bounds checked above; new_start..old start lies inside the frame.
     unsafe {
-        ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            storage.mut_ptr().add(new_start),
-            bytes.len(),
-        );
+        ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(new_start), bytes.len());
     }
     inner.start = new_start;
     Ok(())
