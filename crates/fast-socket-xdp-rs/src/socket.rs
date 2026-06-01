@@ -22,8 +22,8 @@ use fast_socket_rs::{
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
 use crate::config::XdpIpPacketSocketConfig;
 use crate::egress::{
-    ETHERNET_HEADER_LEN, ETHERTYPE_IPV4, ETHERTYPE_IPV6, VLAN_ETHERTYPE, VLAN_HEADER_LEN,
-    XdpEgress, XdpResolvedEgress, ethernet_header_len, write_ethernet_header,
+    ETHERNET_HEADER_LEN, ETHERTYPE_IPV4, ETHERTYPE_IPV6, ResolvedL2, VLAN_ETHERTYPE,
+    VLAN_HEADER_LEN, XdpEgress, XdpResolvedEgress, ethernet_header_len, write_ethernet_header,
 };
 use crate::interface::{if_index_to_name, numa_node_for_interface};
 use crate::program::XdpProgramHandle;
@@ -139,6 +139,31 @@ pub trait XdpUdpRouter {
         self.resolve_udp_egress(dst, context)
             .map(XdpResolvedEgress::from_egress)
     }
+
+    /// Resolves a destination to just the L2 header and effective MTU on the
+    /// transmit hot path, borrowing a prebuilt header when the router can.
+    ///
+    /// The default builds an inline header from
+    /// [`Self::resolve_udp_egress_resolved`] and rejects any egress that does
+    /// not match `context` (wrong interface/queue) or is not IPv4. Routers
+    /// backed by a queue-local snapshot override this to return the prebuilt
+    /// header **by reference** with no per-packet copy, queue stamp, or
+    /// revalidation.
+    fn resolve_udp_l2(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<ResolvedL2<'_>> {
+        let resolved = self.resolve_udp_egress_resolved(dst, context)?;
+        let egress = resolved.egress();
+        if egress.ifindex != context.ifindex
+            || egress.queue != context.queue
+            || egress.ethertype != ETHERTYPE_IPV4
+        {
+            return None;
+        }
+        Some(ResolvedL2::Inline {
+            l2_header: resolved.l2_header_array(),
+            l2_len: resolved.l2_len(),
+            ip_mtu: context.mtu.min(resolved.mtu() as usize),
+        })
+    }
 }
 
 /// Per-queue facts available to UDP egress routers.
@@ -205,6 +230,16 @@ impl XdpUdpRouter for XdpQueueLocalRouter {
         self.routes
             .resolve_v4_resolved_for_interface(dst, context.ifindex, context.queue)
     }
+
+    #[inline]
+    fn resolve_udp_l2(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<ResolvedL2<'_>> {
+        // The egress stored for `context.ifindex` is already correct for this
+        // socket, so we skip the queue stamp + revalidation and borrow the
+        // prebuilt header directly.
+        self.routes
+            .snapshot()
+            .resolve_l2_for_interface(dst, context.ifindex, context.mtu)
+    }
 }
 
 impl<T> XdpUdpRouter for T
@@ -225,6 +260,10 @@ struct XdpUdpTxContext {
     gso_segment_size: Option<core::num::NonZeroU16>,
 }
 
+// Test-only scaffolding for the heap-backed `send_udp_test` path. The live
+// transmit path (`send_udp_inner`) resolves egress via `XdpUdpRouter::resolve_udp_l2`,
+// which borrows the prebuilt header instead of copying a full egress.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct UdpEgressContext {
     ifindex: IfIndex,
@@ -232,6 +271,7 @@ struct UdpEgressContext {
     mtu: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct ResolvedUdpEgress {
     l2_header: [u8; VLAN_HEADER_LEN],
@@ -1508,6 +1548,7 @@ impl<D> XdpUdpSocket<D, XdpQueueLocalRouter> {
     }
 }
 
+#[cfg(test)]
 impl UdpEgressContext {
     fn from_ip_socket<D>(socket: &XdpIpPacketSocket<D>) -> Self {
         Self {
@@ -1624,7 +1665,12 @@ where
     ) -> Result<usize, SendError> {
         let local_addr = self.local_addr;
         let ttl = self.ttl;
-        let egress_context = UdpEgressContext::from_ip_socket(&self.ip);
+        // Fixed for this socket; built once per batch rather than per packet.
+        let route_context = XdpRouteContext {
+            ifindex: self.ip.config.ifindex,
+            queue: self.ip.config.queue_id,
+            mtu: self.ip.config.mtu,
+        };
 
         if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
@@ -1675,22 +1721,24 @@ where
                     deferred_error = Some(Error::InvalidBatch);
                     break;
                 };
-                let resolved = match egress_context.resolve(router, tx.destination) {
-                    Ok(resolved) => resolved,
-                    Err(kind) => {
-                        deferred_error = Some(kind);
-                        break;
-                    }
+                let SocketAddr::V4(destination) = tx.destination else {
+                    deferred_error = Some(Error::InvalidPacket);
+                    break;
+                };
+                let Some(resolved) = router.resolve_udp_l2(*destination.ip(), route_context)
+                else {
+                    deferred_error = Some(Error::NoEgressRoute);
+                    break;
                 };
 
                 if let Err(kind) =
-                    prepare_xdp_udp_transmit_in_place(local_addr, ttl, resolved.ip_mtu, tx)
+                    prepare_xdp_udp_transmit_in_place(local_addr, ttl, resolved.ip_mtu(), tx)
                 {
                     deferred_error = Some(kind);
                     break;
                 }
 
-                let Some(frame) = tx.packet.prepare_l2(&resolved.l2_header[..resolved.l2_len])
+                let Some(frame) = tx.packet.prepare_l2(resolved.l2_header())
                 else {
                     if let Err(kind) = restore_prepared_xdp_udp_transmit_in_place(tx) {
                         deferred_error = Some(kind);
@@ -2234,6 +2282,7 @@ struct Ipv4UdpHeaderFields {
     ecn: Option<fast_socket_rs::EcnCodepoint>,
 }
 
+#[cfg(test)]
 fn validate_xdp_udp_egress(
     ifindex: IfIndex,
     queue_id: QueueId,

@@ -12,8 +12,7 @@ use fast_socket_rs::{
 };
 use poptrie::Ipv4Poptrie;
 
-use crate::egress::XdpEgress;
-use crate::egress::XdpResolvedEgress;
+use crate::egress::{ResolvedL2, XdpEgress, XdpResolvedEgress, build_ethernet_header};
 use crate::netlink::{netlink_get_links, netlink_get_neighbors, netlink_get_routes};
 
 /// Immutable route and neighbor snapshot.
@@ -331,6 +330,75 @@ impl RouteSnapshot {
         }
     }
 
+    /// Transmit hot-path resolution: returns only the L2 header and effective
+    /// MTU, **borrowing** the prebuilt header for gateway routes instead of
+    /// copying a full egress and stamping the queue.
+    ///
+    /// The caller's `(ifindex, queue)` are fixed and the egress stored in
+    /// `egress_index_v4` for `ifindex` is already correct for it, so no queue
+    /// stamping or revalidation is needed — unlike the general
+    /// [`Self::resolved_v4_for_interface`], which custom routers and the
+    /// `egress_v4_for_interface` API still use.
+    #[inline]
+    pub(crate) fn resolve_l2_for_interface(
+        &self,
+        dst: Ipv4Addr,
+        ifindex: IfIndex,
+        mtu: usize,
+    ) -> Option<ResolvedL2<'_>> {
+        let route_index = self.lookup_route_index_v4(dst)?;
+        let interface_egress = self.egress_index_v4.get(&ifindex)?;
+        match *interface_egress.slots.get(route_index as usize)? {
+            EGRESS_NONE => None,
+            // On-link destinations build a fresh header (neighbor lookup +
+            // `build_ethernet_header`); keep that out of line so this resolver
+            // stays small enough to inline into the per-packet send path. The
+            // borrow (gateway) arm below is the hot path.
+            EGRESS_ON_LINK => self.resolve_l2_on_link_v4(route_index, dst, ifindex, mtu),
+            gateway_slot => {
+                let resolved = &interface_egress.egresses[gateway_slot as usize];
+                Some(ResolvedL2::Borrowed {
+                    l2_header: resolved.l2_header(),
+                    ip_mtu: mtu.min(resolved.mtu() as usize),
+                })
+            }
+        }
+    }
+
+    /// Cold on-link path of [`Self::resolve_l2_for_interface`]: resolves the
+    /// destination's own neighbor MAC and builds the Ethernet header inline.
+    /// Kept out of line (`#[inline(never)]`) so the gateway hot path stays
+    /// small and inlinable.
+    #[inline(never)]
+    fn resolve_l2_on_link_v4(
+        &self,
+        route_index: u32,
+        dst: Ipv4Addr,
+        ifindex: IfIndex,
+        mtu: usize,
+    ) -> Option<ResolvedL2<'_>> {
+        let route = self.routes_v4.get(route_index as usize).copied()?;
+        let interface = self.interfaces.get(&ifindex).copied()?;
+        let dst_mac = self
+            .neighbors_v4
+            .get(&(ifindex, dst))
+            .or_else(|| self.neighbors_v4.get(&(route.ifindex, dst)))
+            .copied()?;
+        let egress = XdpEgress::ipv4(
+            ifindex,
+            interface.queue,
+            dst_mac,
+            interface.mac,
+            route.mtu.min(interface.mtu),
+        );
+        let (l2_header, l2_len) = build_ethernet_header(egress);
+        Some(ResolvedL2::Inline {
+            l2_header,
+            l2_len,
+            ip_mtu: mtu.min(egress.mtu as usize),
+        })
+    }
+
     /// Returns the index into `routes_v4` of the longest-prefix match, via the
     /// poptrie. This index is what `egress_index_v4`'s per-interface `slots`
     /// are keyed on, so the send path resolves egress with a single lookup.
@@ -498,6 +566,7 @@ impl XdpLocalRoutes {
 
     /// Returns the currently adopted snapshot.
     #[must_use]
+    #[inline]
     pub fn snapshot(&self) -> &RouteSnapshot {
         &self.snapshot
     }
@@ -722,6 +791,70 @@ mod tests {
             snapshot.route_v4(Ipv4Addr::new(11, 0, 0, 1)).is_none(),
             "no route outside the /8"
         );
+    }
+
+    #[test]
+    fn resolve_l2_for_interface_borrows_gateway_and_builds_on_link() {
+        let mut snapshot = RouteSnapshot::new();
+        snapshot.upsert_interface(InterfaceInfo {
+            ifindex: IfIndex::new(2),
+            master_ifindex: None,
+            mac: mac(1),
+            mtu: 1500,
+            queue: QueueId::new(0),
+        });
+        // Default route via a gateway (prebuilt egress).
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(0, 0, 0, 0),
+            prefix_len: 0,
+            ifindex: IfIndex::new(2),
+            gateway: Some(Ipv4Addr::new(192, 0, 2, 99)),
+            priority: 100,
+            mtu: 1400,
+        });
+        snapshot.upsert_neighbor_v4(IfIndex::new(2), Ipv4Addr::new(192, 0, 2, 99), mac(9));
+        // On-link /8 (direct route; per-destination neighbor).
+        snapshot.upsert_route_v4(Ipv4Route {
+            destination: Ipv4Addr::new(10, 0, 0, 0),
+            prefix_len: 8,
+            ifindex: IfIndex::new(2),
+            gateway: None,
+            priority: 100,
+            mtu: 1500,
+        });
+        snapshot.upsert_neighbor_v4(IfIndex::new(2), Ipv4Addr::new(10, 1, 2, 3), mac(5));
+
+        // Gateway destination: header borrowed from the prebuilt egress.
+        let gateway = snapshot
+            .resolve_l2_for_interface(Ipv4Addr::new(8, 8, 8, 8), IfIndex::new(2), 1500)
+            .expect("gateway route resolves");
+        assert!(matches!(gateway, ResolvedL2::Borrowed { .. }));
+        assert_eq!(&gateway.l2_header()[..6], &mac(9).octets()); // dst MAC = gateway
+        assert_eq!(&gateway.l2_header()[6..12], &mac(1).octets()); // src MAC = interface
+        assert_eq!(gateway.ip_mtu(), 1400);
+
+        // On-link destination: header built inline from the destination's own
+        // neighbor entry.
+        let on_link = snapshot
+            .resolve_l2_for_interface(Ipv4Addr::new(10, 1, 2, 3), IfIndex::new(2), 1500)
+            .expect("on-link route resolves");
+        assert!(matches!(on_link, ResolvedL2::Inline { .. }));
+        assert_eq!(&on_link.l2_header()[..6], &mac(5).octets());
+        assert_eq!(on_link.ip_mtu(), 1500);
+
+        // On-link destination with no neighbor entry: no egress.
+        assert!(
+            snapshot
+                .resolve_l2_for_interface(Ipv4Addr::new(10, 9, 9, 9), IfIndex::new(2), 1500)
+                .is_none()
+        );
+
+        // Updating the gateway's neighbor is reflected in the borrowed header.
+        snapshot.upsert_neighbor_v4(IfIndex::new(2), Ipv4Addr::new(192, 0, 2, 99), mac(10));
+        let updated = snapshot
+            .resolve_l2_for_interface(Ipv4Addr::new(8, 8, 8, 8), IfIndex::new(2), 1500)
+            .expect("gateway route resolves after neighbor update");
+        assert_eq!(&updated.l2_header()[..6], &mac(10).octets());
     }
 
     #[test]

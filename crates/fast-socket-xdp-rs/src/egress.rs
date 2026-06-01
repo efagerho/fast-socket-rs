@@ -126,6 +126,55 @@ impl XdpResolvedEgress {
     }
 }
 
+/// A resolved Ethernet header for one outgoing UDP datagram, plus the effective
+/// IP-layer MTU.
+///
+/// Returned on the transmit hot path by
+/// [`XdpUdpRouter::resolve_udp_l2`](crate::socket::XdpUdpRouter::resolve_udp_l2).
+/// Gateway routes borrow a prebuilt header (no per-packet copy); on-link
+/// destinations, whose next-hop MAC varies per packet, carry a header built
+/// inline.
+#[derive(Clone, Copy, Debug)]
+pub enum ResolvedL2<'a> {
+    /// Header bytes borrowed from a prebuilt (gateway) egress.
+    Borrowed {
+        /// Ethernet header bytes to prepend before the IP datagram.
+        l2_header: &'a [u8],
+        /// Effective IP-layer MTU for this datagram.
+        ip_mtu: usize,
+    },
+    /// Header built inline for an on-link destination.
+    Inline {
+        /// Ethernet header buffer; only the first `l2_len` bytes are valid.
+        l2_header: [u8; VLAN_HEADER_LEN],
+        /// Valid length of `l2_header`.
+        l2_len: usize,
+        /// Effective IP-layer MTU for this datagram.
+        ip_mtu: usize,
+    },
+}
+
+impl ResolvedL2<'_> {
+    /// Returns the Ethernet header bytes to prepend before the IP datagram.
+    #[must_use]
+    pub fn l2_header(&self) -> &[u8] {
+        match self {
+            Self::Borrowed { l2_header, .. } => l2_header,
+            Self::Inline {
+                l2_header, l2_len, ..
+            } => &l2_header[..*l2_len],
+        }
+    }
+
+    /// Returns the effective IP-layer MTU for this datagram.
+    #[must_use]
+    pub fn ip_mtu(&self) -> usize {
+        match self {
+            Self::Borrowed { ip_mtu, .. } | Self::Inline { ip_mtu, .. } => *ip_mtu,
+        }
+    }
+}
+
 pub(crate) fn ethernet_header_len(egress: XdpEgress) -> usize {
     if egress.vlan.is_some() {
         VLAN_HEADER_LEN
