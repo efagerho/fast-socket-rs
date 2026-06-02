@@ -1,0 +1,6 @@
+[package]
+name = "fast-socket-examples"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

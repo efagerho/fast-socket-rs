@@ -1,0 +1,6 @@
+[package]
+name = "fast-socket-xdp-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

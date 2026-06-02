@@ -1,0 +1,6 @@
+[package]
+name = "fast-socket-os-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

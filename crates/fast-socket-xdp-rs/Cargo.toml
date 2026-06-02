@@ -1,0 +1,6 @@
+[package]
+name = "fast-socket-xdp-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

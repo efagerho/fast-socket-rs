@@ -1,0 +1,1 @@
+//! Placeholder core API crate.

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/fast-socket-rs",
+    "crates/fast-socket-os-rs",
+    "crates/fast-socket-xdp-rs",
+    "crates/fast-socket-xdp-ebpf",
+    "crates/poptrie",
+    "benchmarks",
+    "examples",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

@@ -1,0 +1,6 @@
+[package]
+name = "fast-socket-benchmarks"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
