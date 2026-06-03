@@ -1,1 +1,1 @@
-//! Placeholder OS backend crate.
+//! Placeholder OS crate.

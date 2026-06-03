@@ -64,9 +64,10 @@ impl<T> From<T> for TxSlot<T> {
 pub struct SendError {
     /// Number of leading slots accepted and consumed before the error.
     ///
-    /// Backends must have set slots `[0..accepted)` to [`TxSlot::Taken`] before
-    /// returning this error. Slots at index `>= accepted` are left in their
-    /// caller-provided state and may still hold [`TxSlot::Ready`] items.
+    /// Implementations must have set slots `[0..accepted)` to
+    /// [`TxSlot::Taken`] before returning this error. Slots at index
+    /// `>= accepted` are left in their caller-provided state and may still hold
+    /// [`TxSlot::Ready`] items.
     pub accepted: usize,
     /// Error that caused the next slot to be rejected.
     pub kind: Error,
@@ -226,7 +227,7 @@ mod tests {
     #[test]
     fn send_short_accept_leaves_tail_untouched() {
         let mut batch = [TxSlot::Ready(1u32), TxSlot::Ready(2), TxSlot::Ready(3)];
-        // Simulate a ring-full short accept: backend takes only the first item.
+        // Simulate a partial accept: only the first item is taken.
         let _ = batch[0].take();
         let accepted = 1;
 

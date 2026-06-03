@@ -56,7 +56,7 @@ impl QueueId {
     }
 }
 
-/// Logical socket identity, distinct from a NIC [`QueueId`].
+/// Logical socket identity, distinct from a queue identity.
 ///
 /// This lets code carry socket identity separately from any backing queue
 /// identity.

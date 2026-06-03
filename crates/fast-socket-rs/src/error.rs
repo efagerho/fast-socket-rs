@@ -19,7 +19,7 @@ pub enum Error {
     InvalidPacket,
     /// Caller submitted a malformed batch.
     InvalidBatch,
-    /// Backend-reported device or descriptor failure.
+    /// Implementation-reported device or queue failure.
     Device(DeviceError),
     /// Receive path: caller-provided output storage has no remaining capacity.
     ///
@@ -31,8 +31,8 @@ pub enum Error {
     Truncated,
     /// Transmit path: packet exceeds the socket MTU.
     ///
-    /// Raised when the finished packet is too large for the configured wire
-    /// MTU, after any caller-side packet construction has already completed.
+    /// Raised when the finished packet is too large for the configured MTU,
+    /// after any caller-side packet construction has already completed.
     OversizeForMtu,
     /// Transmit path: the resolved egress handle no longer maps to a destination.
     NoEgressRoute,
@@ -62,17 +62,17 @@ impl std::error::Error for Error {
     }
 }
 
-/// Coarse category for a backend-reported device error.
+/// Coarse category for a device error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DeviceErrorKind {
-    /// Backend-specific error not covered by a more specific variant.
+    /// Implementation-specific error not covered by a more specific variant.
     Backend,
     /// The underlying device disappeared or was administratively removed.
     DeviceRemoved,
     /// The underlying file descriptor or handle was closed.
     FdClosed,
-    /// A descriptor ring or completion queue reported corruption.
+    /// Internal queue or completion state was corrupted.
     RingCorrupt,
 }
 
@@ -89,9 +89,9 @@ impl fmt::Display for DeviceErrorKind {
 
 /// Core-owned device error container.
 ///
-/// The optional backend-specific source is held behind an [`Arc`] so the whole
-/// `DeviceError` (and the enclosing [`Error`]) can be cheaply cloned without
-/// losing the source chain.
+/// The optional implementation-specific source is held behind an [`Arc`] so the
+/// whole `DeviceError` (and the enclosing [`Error`]) can be cheaply cloned
+/// without losing the source chain.
 #[derive(Clone, Debug)]
 pub struct DeviceError {
     kind: DeviceErrorKind,
@@ -99,13 +99,13 @@ pub struct DeviceError {
 }
 
 impl DeviceError {
-    /// Creates a device error without a backend-specific source.
+    /// Creates a device error without an implementation-specific source.
     #[must_use]
     pub const fn new(kind: DeviceErrorKind) -> Self {
         Self { kind, source: None }
     }
 
-    /// Creates a device error with a backend-specific source attached.
+    /// Creates a device error with an implementation-specific source attached.
     #[must_use]
     pub fn with_source<E>(kind: DeviceErrorKind, source: E) -> Self
     where

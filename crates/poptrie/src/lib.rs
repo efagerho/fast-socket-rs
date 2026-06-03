@@ -1,1 +1,1 @@
-//! Placeholder Poptrie route lookup crate.
+//! Placeholder Poptrie crate.

@@ -1,1 +1,1 @@
-//! Placeholder benchmark support crate.
+//! Placeholder benchmarks crate.

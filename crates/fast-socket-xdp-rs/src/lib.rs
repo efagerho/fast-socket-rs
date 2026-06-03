@@ -1,1 +1,1 @@
-//! Placeholder XDP backend crate.
+//! Placeholder XDP crate.

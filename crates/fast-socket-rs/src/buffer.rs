@@ -8,9 +8,7 @@ pub type Segment<'a> = &'a [u8];
 
 /// Iterator over packet segments in packet-byte order.
 ///
-/// The heap-backed buffers in this crate always have at most one segment, so
-/// `Segments` is an alias for `Option::into_iter()`. Multi-segment backends
-/// (AF_XDP UMEM, DPDK mempools) define their own iterator type.
+/// This alias is useful for single-segment packet buffers.
 pub type Segments<'a> = core::option::IntoIter<Segment<'a>>;
 
 /// Borrowed scatter-gather view over packet segments.
@@ -33,7 +31,7 @@ impl<'a> ScatterGather<'a> {
     }
 }
 
-/// Buffer layout facts shared by pools, queues, and backends.
+/// Buffer layout facts shared by pools and queues.
 ///
 /// Field invariants:
 ///
@@ -41,8 +39,7 @@ impl<'a> ScatterGather<'a> {
 /// - `chunk_size >= data_offset + payload_capacity + tailroom`
 /// - `stride >= chunk_size`
 ///
-/// `align` and `max_segments` are descriptive facts that backends with their
-/// own allocators must honor.
+/// `align` and `max_segments` are descriptive facts for allocators and queues.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferLayout {
     payload_capacity: usize,
@@ -66,8 +63,8 @@ impl BufferLayout {
 
     /// Creates a layout sized for a UDP/IP-like payload of at most
     /// `payload_capacity` bytes, rounded up to at least 2 KiB so a single
-    /// buffer comfortably holds an MTU-sized Ethernet frame after backend-
-    /// reserved L2 headroom is added.
+    /// buffer comfortably holds an MTU-sized Ethernet frame after link-layer
+    /// headroom is added.
     ///
     /// Equivalent to `BufferLayout::new(payload_capacity.max(2048))`. Use
     /// this instead of repeating the magic `2048` constant at every callsite.
@@ -101,7 +98,7 @@ impl BufferLayout {
         }
     }
 
-    /// Returns a copy of this layout with backend-reserved L2 headroom.
+    /// Returns a copy of this layout with link-layer headroom.
     ///
     /// When the chunk has not been fixed via [`Self::with_fixed_chunk`], the
     /// chunk size and stride grow to accommodate the new data offset. When the
@@ -165,10 +162,9 @@ impl BufferLayout {
 
     /// Returns a copy of this layout with fixed chunk and stride facts.
     ///
-    /// This is useful for describing AF_XDP UMEM frames, DPDK-style mbuf
-    /// storage, and other fixed-size packet memory. `chunk_size` must fit the
-    /// configured L2 headroom, public headroom, payload capacity, and tailroom.
-    /// `stride` must be at least as large as the chunk size.
+    /// This is useful for describing fixed-size packet memory. `chunk_size`
+    /// must fit the configured L2 headroom, public headroom, payload capacity,
+    /// and tailroom. `stride` must be at least as large as the chunk size.
     ///
     /// # Panics
     ///
@@ -243,13 +239,13 @@ impl BufferLayout {
         self.max_segments
     }
 
-    /// Backend-reserved link-layer headroom.
+    /// Link-layer headroom before the public headroom.
     #[must_use]
     pub const fn l2_headroom(self) -> usize {
         self.l2_headroom
     }
 
-    /// Total allocation length needed by the heap-backed implementation.
+    /// Total contiguous allocation length needed for one packet chunk.
     #[must_use]
     pub const fn allocation_len(self) -> usize {
         self.chunk_size
@@ -260,23 +256,23 @@ impl BufferLayout {
     }
 }
 
-/// Per-queue buffer layout and descriptor-depth configuration.
+/// Per-queue buffer layout and depth configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct QueueBufferConfig {
     /// Receive buffer layout.
     pub rx: BufferLayout,
     /// Transmit buffer layout.
     pub tx: BufferLayout,
-    /// Receive descriptor depth when exposed by a backend.
+    /// Receive queue depth when known.
     pub rx_depth: Option<usize>,
-    /// Transmit descriptor depth when exposed by a backend.
+    /// Transmit queue depth when known.
     pub tx_depth: Option<usize>,
 }
 
 /// Static or queue-local buffer capability facts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferCapabilities {
-    /// Maximum packet length accepted by this buffer/backend.
+    /// Maximum packet length accepted by this buffer configuration.
     pub max_packet_len: usize,
     /// Maximum public headroom available without reallocation.
     pub max_headroom: usize,
@@ -286,7 +282,7 @@ pub struct BufferCapabilities {
     pub max_segments: usize,
     /// Whether the backing memory is DMA-capable.
     pub dma_capable: bool,
-    /// Whether the backing memory is externally registered with a backend.
+    /// Whether the backing memory is externally registered.
     pub externally_registered: bool,
 }
 
@@ -306,8 +302,8 @@ pub enum BufferAccessError {
     /// The append operation did not fit in the available tailroom.
     ///
     /// This is a *buffer-layout* error raised while building a packet on the
-    /// caller side. The wire-level "packet exceeds socket MTU" check on the
-    /// transmit path is reported as [`crate::Error::OversizeForMtu`] instead.
+    /// caller side. The transmit-path MTU check is reported as
+    /// [`crate::Error::OversizeForMtu`] instead.
     InsufficientTailroom {
         /// Available tailroom bytes.
         available: usize,
