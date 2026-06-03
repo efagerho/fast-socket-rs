@@ -1,0 +1,8 @@
+[book]
+authors = ["fast-socket-rs contributors"]
+language = "en"
+src = "src"
+title = "fast-socket-rs"
+
+[build]
+build-dir = "book"
