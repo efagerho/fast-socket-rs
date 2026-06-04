@@ -64,6 +64,14 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(target_feature = "popcnt"),
+    not(test),
+    not(doc)
+))]
+compile_error!("poptrie requires x86/x86_64 builds to enable the +popcnt target feature");
+
 mod build;
 
 pub use build::PoptrieBuilder;
