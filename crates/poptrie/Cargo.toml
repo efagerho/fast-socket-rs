@@ -2,5 +2,13 @@
 name = "poptrie"
 version.workspace = true
 edition.workspace = true
+description = "Fast longest-prefix-match IP routing lookups using a Poptrie (a popcount-compressed multibit trie)."
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "lookup"
+harness = false
