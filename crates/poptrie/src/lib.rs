@@ -7,9 +7,10 @@
 //! Software IP Routing Table Lookup"* (SIGCOMM 2015), and is one of the fastest
 //! software LPM structures published.
 //!
-//! This crate is dependency-free and `#![forbid(unsafe_code)]`: the lookups are
-//! plain safe indexing, and the speed comes from the algorithm, not from
-//! skipping bounds checks.
+//! This crate is dependency-free. The public API is safe; internally, the hot
+//! lookup path uses unchecked indexing into private, builder-generated arrays.
+//! The builder validates those array invariants in debug/test builds, and the
+//! immutable [`Poptrie`] fields are not exposed for callers to mutate.
 //!
 //! # The three optimizations that matter
 //!
@@ -62,7 +63,7 @@
 //! ```
 
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -205,7 +206,9 @@ impl<K: IpKey, V, const DIRECT_BITS: u32> Poptrie<K, V, DIRECT_BITS> {
     #[inline]
     #[must_use]
     pub fn lookup(&self, key: K) -> Option<&V> {
-        let entry = self.direct[key.direct(DIRECT_BITS)];
+        // SAFETY: `build` creates exactly `2^DIRECT_BITS` direct entries, and
+        // `IpKey::direct(DIRECT_BITS)` returns an index in that range.
+        let entry = unsafe { *self.direct.get_unchecked(key.direct(DIRECT_BITS)) };
         if entry & LEAF_FLAG != 0 {
             return self.value(entry & VALUE_MASK);
         }
@@ -213,7 +216,9 @@ impl<K: IpKey, V, const DIRECT_BITS: u32> Poptrie<K, V, DIRECT_BITS> {
         let mut node_index = entry as usize;
         let mut offset = DIRECT_BITS;
         loop {
-            let node = &self.nodes[node_index];
+            // SAFETY: every reachable direct/node child entry is validated to be
+            // within `nodes`, and node child ranges are validated after build.
+            let node = unsafe { self.nodes.get_unchecked(node_index) };
             let v = key.stride(offset);
             offset += STRIDE;
             let bit = 1u64 << v;
@@ -226,7 +231,11 @@ impl<K: IpKey, V, const DIRECT_BITS: u32> Poptrie<K, V, DIRECT_BITS> {
                 let mask = bit | (bit - 1);
                 let runs = (node.leafvec & mask).count_ones() as usize;
                 debug_assert!(runs >= 1, "leaf slot must be covered by a leaf run");
-                return self.value(self.leaves[node.base0 as usize + runs - 1]);
+                let leaf_index = node.base0 as usize + runs - 1;
+                // SAFETY: every node's leaf-run range is validated after build,
+                // and every leaf slot is validated to have a covering run.
+                let encoding = unsafe { *self.leaves.get_unchecked(leaf_index) };
+                return self.value(encoding);
             }
         }
     }
@@ -237,7 +246,149 @@ impl<K: IpKey, V, const DIRECT_BITS: u32> Poptrie<K, V, DIRECT_BITS> {
         if encoding == 0 {
             None
         } else {
-            Some(&self.values[encoding as usize - 1])
+            // SAFETY: all value encodings stored in direct/leaves are validated
+            // after build to be 1-based indices into `values`, or zero.
+            Some(unsafe { self.values.get_unchecked(encoding as usize - 1) })
+        }
+    }
+
+    /// Validates every array index invariant relied on by unchecked lookup.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn validate_invariants(&self) -> Result<(), String> {
+        let expected_direct_len = 1usize
+            .checked_shl(DIRECT_BITS)
+            .ok_or_else(|| format!("DIRECT_BITS {DIRECT_BITS} exceeds usize width"))?;
+        if self.direct.len() != expected_direct_len {
+            return Err(format!(
+                "direct length {} does not match 2^{DIRECT_BITS}",
+                self.direct.len()
+            ));
+        }
+
+        for (i, &entry) in self.direct.iter().enumerate() {
+            if entry & LEAF_FLAG != 0 {
+                Self::validate_value_encoding(entry & VALUE_MASK, self.values.len())
+                    .map_err(|err| format!("direct[{i}] {err}"))?;
+            } else if entry as usize >= self.nodes.len() {
+                return Err(format!(
+                    "direct[{i}] points to node {}, but only {} nodes exist",
+                    entry,
+                    self.nodes.len()
+                ));
+            }
+        }
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.vector & node.leafvec != 0 {
+                return Err(format!(
+                    "node[{i}] marks a slot as both internal and leaf-run start"
+                ));
+            }
+
+            let child_count = node.vector.count_ones() as usize;
+            let child_start = node.base1 as usize;
+            let child_end = child_start
+                .checked_add(child_count)
+                .ok_or_else(|| format!("node[{i}] child range overflows"))?;
+            if child_end > self.nodes.len() {
+                return Err(format!(
+                    "node[{i}] child range {child_start}..{child_end} exceeds {} nodes",
+                    self.nodes.len()
+                ));
+            }
+
+            let leaf_runs = node.leafvec.count_ones() as usize;
+            let leaf_start = node.base0 as usize;
+            let leaf_end = leaf_start
+                .checked_add(leaf_runs)
+                .ok_or_else(|| format!("node[{i}] leaf range overflows"))?;
+            if leaf_end > self.leaves.len() {
+                return Err(format!(
+                    "node[{i}] leaf range {leaf_start}..{leaf_end} exceeds {} leaves",
+                    self.leaves.len()
+                ));
+            }
+
+            let mut covering_run = false;
+            for slot in 0..64 {
+                let bit = 1u64 << slot;
+                if node.vector & bit != 0 {
+                    covering_run = false;
+                } else {
+                    if node.leafvec & bit != 0 {
+                        covering_run = true;
+                    }
+                    if !covering_run {
+                        return Err(format!(
+                            "node[{i}] leaf slot {slot} has no covering leaf run"
+                        ));
+                    }
+                }
+            }
+
+            for leaf_index in leaf_start..leaf_end {
+                Self::validate_value_encoding(self.leaves[leaf_index], self.values.len())
+                    .map_err(|err| format!("leaves[{leaf_index}] {err}"))?;
+            }
+        }
+
+        let max_strides = (K::BITS - DIRECT_BITS) / STRIDE;
+        let mut seen_depths = vec![None; self.nodes.len()];
+        for &entry in self.direct.iter().filter(|&&entry| entry & LEAF_FLAG == 0) {
+            self.validate_reachable_node(entry as usize, 0, max_strides, &mut seen_depths)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn validate_reachable_node(
+        &self,
+        node_index: usize,
+        depth: u32,
+        max_strides: u32,
+        seen_depths: &mut [Option<u32>],
+    ) -> Result<(), String> {
+        if depth >= max_strides {
+            return Err(format!(
+                "node[{node_index}] is reachable at depth {depth}, beyond {max_strides} strides"
+            ));
+        }
+
+        if let Some(seen_depth) = seen_depths[node_index] {
+            return if seen_depth == depth {
+                Ok(())
+            } else {
+                Err(format!(
+                    "node[{node_index}] is reachable at depths {seen_depth} and {depth}"
+                ))
+            };
+        }
+        seen_depths[node_index] = Some(depth);
+
+        let node = &self.nodes[node_index];
+        if depth + 1 == max_strides && node.vector != 0 {
+            return Err(format!(
+                "node[{node_index}] has internal children at final stride depth {depth}"
+            ));
+        }
+
+        for child_rank in 0..node.vector.count_ones() as usize {
+            let child_index = node.base1 as usize + child_rank;
+            self.validate_reachable_node(child_index, depth + 1, max_strides, seen_depths)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn validate_value_encoding(encoding: u32, value_count: usize) -> Result<(), String> {
+        if encoding == 0 || encoding as usize <= value_count {
+            Ok(())
+        } else {
+            Err(format!(
+                "value encoding {encoding} exceeds {value_count} stored values"
+            ))
         }
     }
 
@@ -333,6 +484,19 @@ mod tests {
         best.map(|(_, v)| v)
     }
 
+    fn assert_invariant_error<K: IpKey, V, const DIRECT_BITS: u32>(
+        table: &Poptrie<K, V, DIRECT_BITS>,
+        expected: &str,
+    ) {
+        let err = table
+            .validate_invariants()
+            .expect_err("corrupt table should fail invariant validation");
+        assert!(
+            err.contains(expected),
+            "expected invariant error containing {expected:?}, got {err:?}"
+        );
+    }
+
     #[test]
     fn empty_table_misses_everything() {
         let table = Ipv4Poptrie::<&str>::builder().build();
@@ -408,6 +572,82 @@ mod tests {
         let table = b.build();
         assert_eq!(table.lookup(v4(10, 1, 1, 1)), Some(&"second"));
         assert_eq!(table.value_count(), 1);
+    }
+
+    #[test]
+    fn invariant_validator_rejects_bad_direct_node_index() {
+        let mut table = Ipv4Poptrie::<u32>::builder().build();
+        table.direct[0] = 0;
+        assert_invariant_error(&table, "direct[0] points to node");
+    }
+
+    #[test]
+    fn invariant_validator_rejects_bad_direct_value_encoding() {
+        let table = Poptrie::<u32, u32, 2> {
+            direct: vec![LEAF_FLAG | 1; 1 << 2].into_boxed_slice(),
+            nodes: Vec::new().into_boxed_slice(),
+            leaves: Vec::new().into_boxed_slice(),
+            values: Vec::new().into_boxed_slice(),
+            _key: PhantomData,
+        };
+        assert_invariant_error(&table, "direct[0] value encoding");
+    }
+
+    #[test]
+    fn invariant_validator_rejects_bad_node_child_range() {
+        let mut b = Ipv4Poptrie::builder();
+        b.insert(v4(10, 0, 0, 1), 32, 1u32);
+        let mut table = b.build();
+        assert!(!table.nodes.is_empty());
+
+        table.nodes[0] = Node {
+            vector: 1,
+            leafvec: 1 << 1,
+            base0: 0,
+            base1: table.nodes.len() as u32,
+        };
+        assert_invariant_error(&table, "child range");
+    }
+
+    #[test]
+    fn invariant_validator_rejects_leaf_slot_without_run() {
+        let mut b = Ipv4Poptrie::builder();
+        b.insert(v4(10, 0, 0, 1), 32, 1u32);
+        let mut table = b.build();
+        assert!(!table.nodes.is_empty());
+
+        table.nodes[0].vector = 0;
+        table.nodes[0].leafvec = 0;
+        assert_invariant_error(&table, "leaf slot 0 has no covering leaf run");
+    }
+
+    #[test]
+    fn invariant_validator_rejects_bad_leaf_value_encoding() {
+        let mut b = Ipv4Poptrie::builder();
+        b.insert(v4(10, 0, 0, 1), 32, 1u32);
+        let mut table = b.build();
+        assert!(!table.leaves.is_empty());
+
+        table.leaves[0] = table.value_count() as u32 + 1;
+        assert_invariant_error(&table, "leaves[0] value encoding");
+    }
+
+    #[test]
+    fn invariant_validator_rejects_reachable_node_cycle() {
+        let table = Poptrie::<u32, u32, 2> {
+            direct: vec![0; 1 << 2].into_boxed_slice(),
+            nodes: vec![Node {
+                vector: 1,
+                leafvec: 1 << 1,
+                base0: 0,
+                base1: 0,
+            }]
+            .into_boxed_slice(),
+            leaves: vec![0].into_boxed_slice(),
+            values: Vec::new().into_boxed_slice(),
+            _key: PhantomData,
+        };
+        assert_invariant_error(&table, "reachable at depths");
     }
 
     #[test]

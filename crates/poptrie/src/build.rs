@@ -180,13 +180,20 @@ where
             "too many Poptrie nodes to index with 31 bits",
         );
 
-        Poptrie {
+        let table = Poptrie {
             direct: direct.into_boxed_slice(),
             nodes: emitter.nodes.into_boxed_slice(),
             leaves: emitter.leaves.into_boxed_slice(),
             values: values.into_boxed_slice(),
             _key: PhantomData,
-        }
+        };
+
+        #[cfg(debug_assertions)]
+        table
+            .validate_invariants()
+            .expect("Poptrie builder emitted invalid lookup tables");
+
+        table
     }
 }
 
