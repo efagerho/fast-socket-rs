@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fast-socket-rs = { path = "../fast-socket-rs" }
+libc = "0.2"
+
+[[bench]]
+name = "direct_udp"
+harness = false

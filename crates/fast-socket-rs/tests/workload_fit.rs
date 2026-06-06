@@ -2,10 +2,14 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
 use fast_socket_rs::{
-    BufferLayout, BusyPollDriver, EgressResolver, Error, HeapBufferPool, IpPacketReceive,
-    IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, PacketBuf, PacketBufMut,
-    PacketBuffer, PacketBufferMut, RecvBatch, SendError, TxSlot, V4Only,
+    BufferLayout, BusyPollDriver, EgressResolver, Error, IpPacketReceive, IpPacketRecvMeta,
+    IpPacketSocket, IpPacketTransmit, IpVersion, PacketBufferMut, RecvBatch, SendError, TxSlot,
+    V4Only,
 };
+
+mod support;
+
+use support::{HeapBufferPool, PacketBuf, PacketBufMut};
 
 const IPV4_HEADER_LEN: usize = 20;
 

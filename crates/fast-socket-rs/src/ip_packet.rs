@@ -5,7 +5,7 @@ use core::num::NonZeroU16;
 use crate::route::{NeighborId, RouteId};
 use crate::{
     BufferPool, BusyPollDriverMode, Error, IpFamily, Mixed, PacketBufferMut, PollDriver,
-    QueueAffinity, ReadinessDriverMode, RecvBatch, SendError, SocketId, TxSlot,
+    QueueAffinity, ReadinessDriverMode, RecvBatch, SendError, SocketBufferPool, SocketId, TxSlot,
 };
 
 /// IP version carried by an IP packet.
@@ -196,12 +196,18 @@ pub type IpPacketTxItem<S> = IpPacketTransmit<
 pub type IpPacketRxItem<S> = IpPacketReceive<IpPacketRxBuffer<S>, <S as IpPacketSocket>::RecvMeta>;
 
 /// IP-packet queue abstraction.
-pub trait IpPacketSocket {
+pub trait IpPacketSocket
+where
+    <Self::RxPool as BufferPool>::Buffer: Send,
+    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxPool as BufferPool>::Buffer: Send,
+    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+{
     /// Buffer pool used by the socket receive path.
-    type RxPool: BufferPool;
+    type RxPool: SocketBufferPool;
 
     /// Buffer pool used by the socket transmit path.
-    type TxPool: BufferPool;
+    type TxPool: SocketBufferPool;
 
     /// Compile-time address-family policy.
     type Family: IpFamily;

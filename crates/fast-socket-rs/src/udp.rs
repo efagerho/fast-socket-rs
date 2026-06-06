@@ -4,8 +4,8 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId,
-    TxSlot,
+    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError,
+    SocketBufferPool, SocketId, TxSlot,
 };
 use crate::{BusyPollDriverMode, ReadinessDriverMode};
 
@@ -106,12 +106,18 @@ pub type UdpTxBufferMut<S> = <<S as UdpSocket>::TxPool as BufferPool>::Buffer;
 pub type UdpRxBuffer<S> = <<S as UdpSocket>::RxPool as BufferPool>::Buffer;
 
 /// High-level UDP socket interface.
-pub trait UdpSocket {
+pub trait UdpSocket
+where
+    <Self::RxPool as BufferPool>::Buffer: Send,
+    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxPool as BufferPool>::Buffer: Send,
+    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+{
     /// Buffer pool used by the socket receive path.
-    type RxPool: BufferPool;
+    type RxPool: SocketBufferPool;
 
     /// Buffer pool used by the socket transmit path.
-    type TxPool: BufferPool;
+    type TxPool: SocketBufferPool;
 
     /// Polling driver selected by this socket implementation.
     type Driver: PollDriver;

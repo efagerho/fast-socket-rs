@@ -1,4 +1,8 @@
-use fast_socket_rs::{BufferLayout, PacketBufMut, PacketBuffer, PacketBufferMut, ReserveError};
+mod support;
+
+use fast_socket_rs::{BufferLayout, PacketBuffer, PacketBufferMut, ReserveError};
+
+use support::PacketBufMut;
 
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;

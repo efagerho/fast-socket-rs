@@ -4,10 +4,15 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use fast_socket_rs::{
-    BufferLayout, BusyPollDriver, EgressResolver, Error, HeapBufferPool, IpPacketReceive,
-    IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, PacketBuf, PacketBufMut,
-    PacketBuffer, PacketBufferMut, RecvBatch, SendError, TxSlot, V4Only,
+    BufferLayout, BusyPollDriver, EgressResolver, Error, IpPacketReceive, IpPacketRecvMeta,
+    IpPacketSocket, IpPacketTransmit, IpVersion, PacketBuffer, PacketBufferMut, RecvBatch,
+    SendError, TxSlot, V4Only,
 };
+
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+use support::{HeapBufferPool, PacketBuf, PacketBufMut};
 
 const ITERATIONS: usize = 20_000;
 const IPV4_HEADER_LEN: usize = 20;

@@ -27,7 +27,7 @@ pub use batch::{RecvBatch, SendError, TxSlot};
 pub use buffer::{
     BufferAccessError, BufferCapabilities, BufferLayout, BufferPool, OwnedPacketBuffer,
     PacketBuffer, PacketBufferMut, QueueBufferConfig, ReserveError, ScatterGather, Segment,
-    Segments,
+    Segments, SocketBufferPool,
 };
 pub use device::{Capabilities, RawDevice, RawDeviceStats};
 pub use error::{DeviceError, DeviceErrorKind, Error};

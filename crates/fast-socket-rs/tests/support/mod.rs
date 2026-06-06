@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use fast_socket_rs::{
     BufferAccessError, BufferLayout, BufferPool, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     ReserveError, Segments,
@@ -96,8 +98,22 @@ impl PacketBufMut {
     }
 
     #[must_use]
+    pub fn copy_from_slice(bytes: &[u8]) -> Self {
+        let mut buffer = Self::new(BufferLayout::new(bytes.len()));
+        buffer
+            .extend_from_slice(bytes)
+            .expect("fresh compact buffer has enough tailroom");
+        buffer
+    }
+
+    #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.storage[self.start..self.end]
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.storage[self.start..self.end]
     }
 
     fn relocate(&mut self, headroom: usize, tailroom: usize) {
