@@ -3,4 +3,15 @@ name = "fast-socket-xdp-ebpf"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
+# The XDP program lives in `src/main.rs`. Its entire body is gated on
+# `cfg(target_arch = "bpf")` so the bin compiles to an empty stub on host
+# architectures — `cargo check --workspace` works without a BPF toolchain,
+# while `build-ebpf.sh` (which targets `bpfel-unknown-none`) compiles the
+# real program. No `[features]` gate is needed because the cfg already
+# excludes the aya-ebpf dependency on host builds.
+[[bin]]
+name = "fast-socket-xdp-prog"
+path = "src/main.rs"
+
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = "0.1"
