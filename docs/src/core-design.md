@@ -38,11 +38,6 @@ Instead, the design favors preallocated packet pools, fixed-capacity structures,
 and caller-provided storage. The hot path should be able to operate on buffers,
 descriptors, and stack-local state that already exist before packets arrive.
 
-This does not mean the whole library can never allocate. Setup code, control
-planes, and convenience APIs may allocate where that is appropriate. The design
-line is the packet processing path: once packets are flowing, the common receive
-and transmit operations should not need to touch the heap.
-
 ## Compile-Time Specialization
 
 Runtime checks are useful at the edges of a system, but they are expensive when

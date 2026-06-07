@@ -1,5 +1,11 @@
 # Summary
 
+# Basics
+
 - [Core Design](./core-design.md)
-- [OS Socket Backend](./os-socket-backend.md)
+- [Core Traits](./core-traits.md)
+- [Packet Processing](./packet-processing.md)
+
+# Routing
+
 - [Poptrie Route Tables](./poptrie-route-tables.md)
