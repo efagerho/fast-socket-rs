@@ -3,4 +3,29 @@ name = "fast-socket-xdp-rs"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enables the per-buffer owner-generation guard (use-after-socket-drop
+# detection) in release builds too. It is always on in debug builds. When off,
+# the guard types are zero-sized and all checks compile away, so there is no
+# hot-path cost and no struct grows. Turn this on for hardened / canary release
+# builds where catching the (otherwise undefined-behavior) misuse as a panic is
+# worth a per-access atomic load and a per-allocation refcount bump.
+buffer-guard = []
+
+# Exposes the low-level AF_XDP building blocks (raw socket, UMEM, descriptor
+# rings) through the `internals` module. Off by default: these expose raw
+# pointers and panic-capable accessors and carry no semver guarantee. Enable
+# only to build a custom data path on top of the primitives.
+unstable-internals = []
+
 [dependencies]
+arc-swap = "1"
+crossbeam-queue = "0.3"
+fast-socket-rs = { path = "../fast-socket-rs" }
+fast-socket-xdp-ebpf = { path = "../fast-socket-xdp-ebpf" }
+poptrie = { path = "../poptrie" }
+rustc-hash = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.13"
+libc = "0.2"
