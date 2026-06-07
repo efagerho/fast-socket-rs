@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -eu
-cargo +nightly build --release --features ebpf \
+cargo +nightly build --release \
   --target-dir ./target \
   --target bpfel-unknown-none -Z build-std=core,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem

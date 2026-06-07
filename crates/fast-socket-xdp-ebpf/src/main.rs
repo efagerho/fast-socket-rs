@@ -1,9 +1,10 @@
-//! XDP redirect program for AF_XDP raw sockets.
+//! XDP redirect programs for AF_XDP raw sockets.
 //!
-//! The program redirects IPv4 and IPv6 Ethernet frames to the AF_XDP socket
-//! registered in `XSKMAP[rx_queue_index]`. When userspace binds UDP ports, only
-//! matching IPv4 UDP packets are redirected and unrelated traffic stays on the
-//! kernel path.
+//! The object contains two programs. `fast_socket_xdp` uses the `BOUND_PORTS`
+//! membership array and is efficient when the bound UDP ports are sparse.
+//! `fast_socket_xdp_port_range` uses an inclusive start/end range and is useful
+//! when userspace binds a large contiguous block of UDP ports. Both programs pass
+//! non-UDP traffic and unmatched UDP traffic back to the OS.
 //!
 //! The whole file is gated on `cfg(target_arch = "bpf")`. On host
 //! architectures the compilation produces a tiny stub `fn main() {}` so
@@ -30,8 +31,8 @@ mod bpf {
         programs::XdpContext,
     };
     use fast_socket_xdp_ebpf::{
-        BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_REDIRECT_ERROR,
-        DROP_REASON_XSKMAP_MISS, MAX_QUEUES,
+        BOUND_PORT_COUNT_LEN, BOUND_PORT_RANGE_END, BOUND_PORT_RANGE_LEN, BOUND_PORT_RANGE_START,
+        BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_XSKMAP_MISS, MAX_QUEUES,
     };
 
     /// `rx_queue_index -> AF_XDP socket fd`. Userspace inserts after `bind(2)`.
@@ -46,6 +47,10 @@ mod bpf {
     #[map]
     static BOUND_PORT_COUNT: Array<u32> = Array::with_max_entries(BOUND_PORT_COUNT_LEN, 0);
 
+    /// Inclusive UDP destination-port range for `fast_socket_xdp_port_range`.
+    #[map]
+    static BOUND_PORT_RANGE: Array<u16> = Array::with_max_entries(BOUND_PORT_RANGE_LEN, 0);
+
     /// Per-reason drop counters. Indexed by `DROP_REASON_*` constants.
     #[map]
     static DROP_COUNTERS: Array<u64> = Array::with_max_entries(DROP_COUNTERS_LEN, 0);
@@ -54,7 +59,6 @@ mod bpf {
     const VLAN_INNER_ETHER_TYPE_OFFSET: usize = 16;
     const QINQ_INNER_ETHER_TYPE_OFFSET: usize = 20;
     const ETHERTYPE_IPV4: u16 = 0x0800;
-    const ETHERTYPE_IPV6: u16 = 0x86dd;
     /// Single 802.1Q tag.
     const ETHERTYPE_VLAN: u16 = 0x8100;
     /// Outer 802.1ad (S-VLAN) tag for QinQ. The inner tag is `ETHERTYPE_VLAN`.
@@ -69,56 +73,53 @@ mod bpf {
 
     #[xdp]
     pub fn fast_socket_xdp(ctx: XdpContext) -> u32 {
-        match try_redirect(&ctx) {
+        match try_redirect_bound_ports(&ctx) {
+            Ok(action) => action,
+            Err(()) => xdp_action::XDP_PASS,
+        }
+    }
+
+    #[xdp]
+    pub fn fast_socket_xdp_port_range(ctx: XdpContext) -> u32 {
+        match try_redirect_port_range(&ctx) {
             Ok(action) => action,
             Err(()) => xdp_action::XDP_PASS,
         }
     }
 
     #[inline(always)]
-    fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
-        let mut l2_len = 14;
-        let mut ethertype = unsafe { read_u16_be(ctx, ETHER_TYPE_OFFSET)? };
-        if ethertype == ETHERTYPE_VLAN {
-            ethertype = unsafe { read_u16_be(ctx, VLAN_INNER_ETHER_TYPE_OFFSET)? };
-            l2_len = 18;
-        } else if ethertype == ETHERTYPE_QINQ {
-            // 802.1ad outer S-VLAN (0x88a8). Expect a single inner 802.1Q tag
-            // and read the inner-inner ethertype. Anything else (e.g., stacked
-            // S-VLAN-on-S-VLAN) falls through to XDP_PASS — there is no second
-            // QinQ layer in any traffic we currently target.
-            let inner_tpid = unsafe { read_u16_be(ctx, VLAN_INNER_ETHER_TYPE_OFFSET)? };
-            if inner_tpid != ETHERTYPE_VLAN {
-                return Ok(xdp_action::XDP_PASS);
-            }
-            ethertype = unsafe { read_u16_be(ctx, QINQ_INNER_ETHER_TYPE_OFFSET)? };
-            l2_len = 22;
-        }
-
-        if ethertype != ETHERTYPE_IPV4 && ethertype != ETHERTYPE_IPV6 {
+    fn try_redirect_bound_ports(ctx: &XdpContext) -> Result<u32, ()> {
+        let Some(destination_port) = packet_udp_destination_port(ctx)? else {
             return Ok(xdp_action::XDP_PASS);
-        }
+        };
 
-        // Closed-by-default: with no UDP ports bound, leave every packet on the
-        // kernel path. Userspace must explicitly call `bind_port(port)` to opt a
-        // destination port into AF_XDP redirection. The previous behavior —
-        // redirect everything when nothing is bound — surprised operators who
-        // expected AF_XDP attachment alone not to hijack their TCP / ICMP / ND
-        // traffic.
         if !has_bound_ports() {
             return Ok(xdp_action::XDP_PASS);
         }
-
-        if ethertype != ETHERTYPE_IPV4 {
-            return Ok(xdp_action::XDP_PASS);
-        }
-        let Some(destination_port) = ipv4_udp_destination_port(ctx, l2_len)? else {
-            return Ok(xdp_action::XDP_PASS);
-        };
         if !is_bound_port(destination_port) {
             return Ok(xdp_action::XDP_PASS);
         }
 
+        redirect_to_xskmap(ctx)
+    }
+
+    #[inline(always)]
+    fn try_redirect_port_range(ctx: &XdpContext) -> Result<u32, ()> {
+        let Some(destination_port) = packet_udp_destination_port(ctx)? else {
+            return Ok(xdp_action::XDP_PASS);
+        };
+        let Some((start, end)) = bound_port_range() else {
+            return Ok(xdp_action::XDP_PASS);
+        };
+        if destination_port < start || destination_port > end {
+            return Ok(xdp_action::XDP_PASS);
+        }
+
+        redirect_to_xskmap(ctx)
+    }
+
+    #[inline(always)]
+    fn redirect_to_xskmap(ctx: &XdpContext) -> Result<u32, ()> {
         let queue_id = unsafe { (*ctx.ctx).rx_queue_index };
         match XSKMAP.redirect(queue_id, 0) {
             Ok(action) => Ok(action),
@@ -130,10 +131,6 @@ mod bpf {
                 // misconfiguration. Drop it and bump a counter the operator can
                 // read from userspace to spot partial / mis-registered queues.
                 increment_drop_counter(DROP_REASON_XSKMAP_MISS);
-                // `redirect` only returns `Err` on lookup miss in current aya;
-                // count any other paths under REDIRECT_ERROR for forward-
-                // compatibility with future aya semantics.
-                let _ = DROP_REASON_REDIRECT_ERROR;
                 Ok(xdp_action::XDP_DROP)
             }
         }
@@ -164,6 +161,56 @@ mod bpf {
             Some(enabled) => *enabled != 0,
             None => false,
         }
+    }
+
+    #[inline(always)]
+    fn bound_port_range() -> Option<(u16, u16)> {
+        let start = match BOUND_PORT_RANGE.get(BOUND_PORT_RANGE_START) {
+            Some(start) => *start,
+            None => return None,
+        };
+        let end = match BOUND_PORT_RANGE.get(BOUND_PORT_RANGE_END) {
+            Some(end) => *end,
+            None => return None,
+        };
+
+        if start == 0 && end == 0 {
+            return None;
+        }
+        if start > end {
+            return None;
+        }
+        Some((start, end))
+    }
+
+    #[inline(always)]
+    fn packet_udp_destination_port(ctx: &XdpContext) -> Result<Option<u16>, ()> {
+        let (ethertype, l2_len) = packet_ethertype(ctx)?;
+        if ethertype != ETHERTYPE_IPV4 {
+            return Ok(None);
+        }
+        ipv4_udp_destination_port(ctx, l2_len)
+    }
+
+    #[inline(always)]
+    fn packet_ethertype(ctx: &XdpContext) -> Result<(u16, usize), ()> {
+        let mut l2_len = 14;
+        let mut ethertype = unsafe { read_u16_be(ctx, ETHER_TYPE_OFFSET)? };
+        if ethertype == ETHERTYPE_VLAN {
+            ethertype = unsafe { read_u16_be(ctx, VLAN_INNER_ETHER_TYPE_OFFSET)? };
+            l2_len = 18;
+        } else if ethertype == ETHERTYPE_QINQ {
+            // 802.1ad outer S-VLAN (0x88a8). Expect a single inner 802.1Q tag
+            // and read the inner-inner ethertype. Anything else (e.g., stacked
+            // S-VLAN-on-S-VLAN) falls through to XDP_PASS.
+            let inner_tpid = unsafe { read_u16_be(ctx, VLAN_INNER_ETHER_TYPE_OFFSET)? };
+            if inner_tpid != ETHERTYPE_VLAN {
+                return Ok((inner_tpid, 18));
+            }
+            ethertype = unsafe { read_u16_be(ctx, QINQ_INNER_ETHER_TYPE_OFFSET)? };
+            l2_len = 22;
+        }
+        Ok((ethertype, l2_len))
     }
 
     #[inline(always)]
