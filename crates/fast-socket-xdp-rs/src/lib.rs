@@ -25,8 +25,10 @@ pub use interface::{
 };
 #[cfg(target_os = "linux")]
 pub use program::{
-    AttachMode, BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, MAX_BOUND_PORTS, MAX_QUEUES, XdpProgram,
-    XdpProgramHandle, embedded_program_bytes, get_or_load, xdp_program_bytes,
+    AttachMode, BOUND_PORT_COUNT_LEN, BOUND_PORT_RANGE_END, BOUND_PORT_RANGE_LEN,
+    BOUND_PORT_RANGE_START, BOUND_PORTS_LEN, BOUND_PORTS_PROGRAM, MAX_BOUND_PORTS, MAX_QUEUES,
+    PORT_RANGE_PROGRAM, XdpProgram, XdpProgramConfig, XdpProgramHandle, embedded_program_bytes,
+    get_or_load, get_or_load_with_config, xdp_program_bytes,
 };
 #[cfg(target_os = "linux")]
 pub use raw_socket::{RingSizes, XdpMode};

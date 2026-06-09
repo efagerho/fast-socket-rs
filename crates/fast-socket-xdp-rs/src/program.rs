@@ -1,12 +1,10 @@
 //! XDP/eBPF program loading and XSKMAP management.
 //!
-//! The embedded program redirects IPv4/IPv6 packets to `XSKMAP[rx_queue_index]`
-//! while no UDP ports are bound. When `BOUND_PORTS` and `BOUND_PORT_COUNT` are
-//! present and at least one UDP port is bound, it redirects only matching IPv4
-//! UDP packets and leaves unrelated traffic on the kernel path. The loader
-//! requires both maps together: an object that ships `BOUND_PORTS` without
-//! `BOUND_PORT_COUNT` is rejected because port binding would silently become a
-//! no-op and the program would hijack every matching IPv4/IPv6 packet.
+//! The embedded object contains two XDP programs. `fast_socket_xdp` redirects
+//! UDP packets whose destination port is enabled in `BOUND_PORTS`.
+//! `fast_socket_xdp_port_range` redirects UDP packets whose destination port is
+//! in the configured inclusive `BOUND_PORT_RANGE`. Both programs leave
+//! unrelated traffic on the kernel path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
@@ -21,8 +19,9 @@ use aya::maps::{Array as AyaArray, XskMap};
 use aya::programs::{Xdp, XdpFlags};
 
 pub use fast_socket_xdp_ebpf::{
-    BOUND_PORT_COUNT_LEN, BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_REDIRECT_ERROR,
-    DROP_REASON_XSKMAP_MISS, MAX_BOUND_PORTS, MAX_QUEUES,
+    BOUND_PORT_COUNT_LEN, BOUND_PORT_RANGE_END, BOUND_PORT_RANGE_LEN, BOUND_PORT_RANGE_START,
+    BOUND_PORTS_LEN, BOUND_PORTS_PROGRAM, DROP_COUNTERS_LEN, DROP_REASON_REDIRECT_ERROR,
+    DROP_REASON_XSKMAP_MISS, MAX_BOUND_PORTS, MAX_QUEUES, PORT_RANGE_PROGRAM,
 };
 
 /// XDP attach mode.
@@ -49,11 +48,84 @@ impl AttachMode {
     }
 }
 
+/// XDP program and filter configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XdpProgramConfig {
+    /// Use the per-port membership array program.
+    ///
+    /// Call [`XdpProgram::bind_port`] and [`XdpProgram::unbind_port`] to update
+    /// the redirected UDP destination ports after the program is attached.
+    BoundPorts,
+    /// Use the inclusive UDP destination-port range program.
+    ///
+    /// The loader writes this range into `BOUND_PORT_RANGE` before attaching
+    /// the XDP program, so packets in the range are redirected immediately
+    /// after attach.
+    PortRange {
+        /// Inclusive first UDP destination port.
+        start: u16,
+        /// Inclusive last UDP destination port.
+        end: u16,
+    },
+}
+
+impl XdpProgramConfig {
+    /// Returns the default per-port membership-array configuration.
+    #[must_use]
+    pub const fn bound_ports() -> Self {
+        Self::BoundPorts
+    }
+
+    /// Returns an inclusive UDP destination-port range configuration.
+    ///
+    /// The loader rejects an inverted range and the all-zero range, which the
+    /// eBPF program treats as disabled.
+    #[must_use]
+    pub const fn port_range(start: u16, end: u16) -> Self {
+        Self::PortRange { start, end }
+    }
+
+    /// Returns the eBPF program symbol selected by this configuration.
+    #[must_use]
+    pub const fn program_name(self) -> &'static str {
+        match self {
+            Self::BoundPorts => BOUND_PORTS_PROGRAM,
+            Self::PortRange { .. } => PORT_RANGE_PROGRAM,
+        }
+    }
+
+    fn validate(self) -> io::Result<Self> {
+        if let Self::PortRange { start, end } = self {
+            if start > end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid XDP port range {start}..={end}: start is greater than end"),
+                ));
+            }
+            if start == 0 && end == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid XDP port range 0..=0: the eBPF program treats it as disabled",
+                ));
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl Default for XdpProgramConfig {
+    fn default() -> Self {
+        Self::BoundPorts
+    }
+}
+
 /// Loaded XDP program plus userspace-managed redirect maps.
 pub struct XdpProgram {
     ebpf: Ebpf,
     if_index: u32,
     program_hash: u64,
+    mode: AttachMode,
+    config: XdpProgramConfig,
     bound_ports_available: bool,
     bound_port_count_available: bool,
     bound_ports: BTreeMap<u16, usize>,
@@ -64,22 +136,31 @@ impl XdpProgram {
     fn load_and_attach(
         if_index: u32,
         mode: AttachMode,
+        config: XdpProgramConfig,
         bytes: &[u8],
         program_hash: u64,
     ) -> io::Result<Self> {
+        let config = config.validate()?;
         let mut ebpf = Ebpf::load(bytes).map_err(load_err)?;
-        let bound_port_maps = validate_bound_port_maps(&mut ebpf)?;
+        let bound_port_maps = match config {
+            XdpProgramConfig::BoundPorts => validate_bound_port_maps(&mut ebpf)?,
+            XdpProgramConfig::PortRange { start, end } => {
+                configure_bound_port_range(&mut ebpf, start, end)?;
+                BoundPortMaps {
+                    ports_available: false,
+                    count_available: false,
+                }
+            }
+        };
         validate_xskmap(&mut ebpf)?;
         validate_drop_counters(&mut ebpf)?;
 
-        // Only the in-tree program symbol is accepted. The historical
-        // `quac_xdp` fallback became unreachable once the loader started
-        // requiring `BOUND_PORT_COUNT` (those older objects do not ship it,
-        // so they fail validation above), so it is dropped here to keep the
-        // attach path honest.
+        let program_name = config.program_name();
         let program: &mut Xdp = ebpf
-            .program_mut("fast_socket_xdp")
-            .ok_or_else(|| io::Error::other("eBPF object has no `fast_socket_xdp` XDP program"))?
+            .program_mut(program_name)
+            .ok_or_else(|| {
+                io::Error::other(format!("eBPF object has no `{program_name}` XDP program"))
+            })?
             .try_into()
             .map_err(load_err)?;
         program.load().map_err(load_err)?;
@@ -91,6 +172,8 @@ impl XdpProgram {
             ebpf,
             if_index,
             program_hash,
+            mode,
+            config,
             bound_ports_available: bound_port_maps.ports_available,
             bound_port_count_available: bound_port_maps.count_available,
             bound_ports: BTreeMap::new(),
@@ -98,8 +181,13 @@ impl XdpProgram {
         })
     }
 
-    /// Enables UDP destination-port redirection.
+    /// Enables UDP destination-port redirection for the bound-ports program.
     pub fn bind_port(&mut self, port: u16) -> io::Result<()> {
+        if self.config != XdpProgramConfig::BoundPorts {
+            return Err(io::Error::other(
+                "individual port binding is only supported by the bound-ports XDP program",
+            ));
+        }
         if !self.bound_ports_available {
             return Ok(());
         }
@@ -128,6 +216,11 @@ impl XdpProgram {
 
     /// Disables UDP destination-port redirection when the last user drops it.
     pub fn unbind_port(&mut self, port: u16) -> io::Result<()> {
+        if self.config != XdpProgramConfig::BoundPorts {
+            return Err(io::Error::other(
+                "individual port binding is only supported by the bound-ports XDP program",
+            ));
+        }
         if !self.bound_ports_available {
             return Ok(());
         }
@@ -209,6 +302,18 @@ impl XdpProgram {
     pub const fn if_index(&self) -> u32 {
         self.if_index
     }
+
+    /// Returns the attach mode used for this program.
+    #[must_use]
+    pub const fn mode(&self) -> AttachMode {
+        self.mode
+    }
+
+    /// Returns the selected XDP program configuration.
+    #[must_use]
+    pub const fn config(&self) -> XdpProgramConfig {
+        self.config
+    }
 }
 
 impl Drop for XdpProgram {
@@ -240,7 +345,17 @@ pub struct XdpProgramHandle {
 impl XdpProgramHandle {
     /// Gets the already-attached program for an interface or loads a new one.
     pub fn load(if_index: u32, mode: AttachMode, program_bytes: Option<&[u8]>) -> io::Result<Self> {
-        let program = get_or_load(if_index, mode, program_bytes)?;
+        Self::load_with_config(if_index, mode, XdpProgramConfig::default(), program_bytes)
+    }
+
+    /// Gets or loads an XDP program using an explicit program configuration.
+    pub fn load_with_config(
+        if_index: u32,
+        mode: AttachMode,
+        config: XdpProgramConfig,
+        program_bytes: Option<&[u8]>,
+    ) -> io::Result<Self> {
+        let program = get_or_load_with_config(if_index, mode, config, program_bytes)?;
         Ok(Self {
             if_index,
             program: Some(program),
@@ -319,6 +434,17 @@ pub fn get_or_load(
     mode: AttachMode,
     program_bytes: Option<&[u8]>,
 ) -> io::Result<Arc<Mutex<XdpProgram>>> {
+    get_or_load_with_config(if_index, mode, XdpProgramConfig::default(), program_bytes)
+}
+
+/// Gets the already-attached program for an interface or loads a configured one.
+pub fn get_or_load_with_config(
+    if_index: u32,
+    mode: AttachMode,
+    config: XdpProgramConfig,
+    program_bytes: Option<&[u8]>,
+) -> io::Result<Arc<Mutex<XdpProgram>>> {
+    let config = config.validate()?;
     let bytes = match program_bytes {
         Some(bytes) => bytes,
         None => xdp_program_bytes(),
@@ -329,21 +455,21 @@ pub fn get_or_load(
         .lock()
         .expect("XDP program registry mutex poisoned");
 
-    if let Some(existing) = map.get(&if_index) {
-        let existing_hash = existing
-            .lock()
-            .expect("XDP program mutex poisoned")
-            .program_hash;
-        if existing_hash != new_hash {
+    if let Some(existing_program) = map.get(&if_index) {
+        let existing = existing_program.lock().expect("XDP program mutex poisoned");
+        if existing.program_hash != new_hash || existing.mode != mode || existing.config != config {
             return Err(io::Error::other(format!(
-                "XDP program mismatch on if_index {if_index}: existing hash \
-                 {existing_hash:#018x}, supplied hash {new_hash:#018x}"
+                "XDP program mismatch on if_index {if_index}: existing hash {:#018x}, \
+                 mode {:?}, config {:?}; supplied hash {new_hash:#018x}, mode {mode:?}, \
+                 config {config:?}",
+                existing.program_hash, existing.mode, existing.config
             )));
         }
-        return Ok(Arc::clone(existing));
+        drop(existing);
+        return Ok(Arc::clone(existing_program));
     }
 
-    let program = XdpProgram::load_and_attach(if_index, mode, bytes, new_hash)?;
+    let program = XdpProgram::load_and_attach(if_index, mode, config, bytes, new_hash)?;
     let program = Arc::new(Mutex::new(program));
     map.insert(if_index, Arc::clone(&program));
     Ok(program)
@@ -352,10 +478,10 @@ pub fn get_or_load(
 /// Releases a program registry reference when the last queue user drops it.
 ///
 /// The strong-count check is performed while holding the registry mutex, and
-/// `get_or_load` *and* `XdpProgramHandle::clone` take the same mutex before
-/// bumping the count, so it is stable for the duration of this critical
-/// section: a value of 2 means "this caller + the registry slot itself" and
-/// nothing else.
+/// `get_or_load`, `get_or_load_with_config`, and `XdpProgramHandle::clone`
+/// take the same mutex before bumping the count, so it is stable for the
+/// duration of this critical section: a value of 2 means "this caller + the
+/// registry slot itself" and nothing else.
 ///
 /// Note that a handle that is `mem::forget`'d will keep the strong count
 /// elevated forever, leaving an orphan registry entry behind. Callers that
@@ -424,6 +550,38 @@ fn validate_bound_port_maps(ebpf: &mut Ebpf) -> io::Result<BoundPortMaps> {
     })
 }
 
+fn configure_bound_port_range(ebpf: &mut Ebpf, start: u16, end: u16) -> io::Result<()> {
+    let map = ebpf
+        .map_mut("BOUND_PORT_RANGE")
+        .ok_or_else(|| io::Error::other("eBPF object missing required map `BOUND_PORT_RANGE`"))?;
+    let mut range: AyaArray<_, u16> = AyaArray::try_from(map).map_err(io_err)?;
+    if range.len() != BOUND_PORT_RANGE_LEN {
+        return Err(io::Error::other(format!(
+            "eBPF map `BOUND_PORT_RANGE` has wrong length: expected {BOUND_PORT_RANGE_LEN}, got {}",
+            range.len()
+        )));
+    }
+    range
+        .set(BOUND_PORT_RANGE_START, start, 0)
+        .map_err(io_err)?;
+    range.set(BOUND_PORT_RANGE_END, end, 0).map_err(io_err)
+}
+
+#[cfg(test)]
+fn validate_bound_port_range_map(ebpf: &mut Ebpf) -> io::Result<()> {
+    let map = ebpf
+        .map_mut("BOUND_PORT_RANGE")
+        .ok_or_else(|| io::Error::other("eBPF object missing required map `BOUND_PORT_RANGE`"))?;
+    let range: AyaArray<_, u16> = AyaArray::try_from(map).map_err(io_err)?;
+    if range.len() != BOUND_PORT_RANGE_LEN {
+        return Err(io::Error::other(format!(
+            "eBPF map `BOUND_PORT_RANGE` has wrong length: expected {BOUND_PORT_RANGE_LEN}, got {}",
+            range.len()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_xskmap(ebpf: &mut Ebpf) -> io::Result<()> {
     let map = ebpf
         .map_mut("XSKMAP")
@@ -450,12 +608,6 @@ fn validate_drop_counters(ebpf: &mut Ebpf) -> io::Result<()> {
     Ok(())
 }
 
-/// Intra-process fingerprint for an XDP object payload.
-///
-/// Uses `DefaultHasher` (SipHash), which is **not** stable across processes
-/// or Rust versions. The output is only compared with other fingerprints
-/// computed in the same process to decide whether a cached `XdpProgram` can
-/// be reused; never persist or transmit this value.
 /// Issues `bpf(BPF_MAP_DELETE_ELEM, ...)` directly because aya 0.13's
 /// [`aya::maps::XskMap`] only exposes `set` / `len`.
 ///
@@ -506,6 +658,12 @@ unsafe fn bpf_map_delete_elem(map_fd: BorrowedFd<'_>, key: u32) -> io::Result<()
     Ok(())
 }
 
+/// Intra-process fingerprint for an XDP object payload.
+///
+/// Uses `DefaultHasher` (SipHash), which is **not** stable across processes
+/// or Rust versions. The output is only compared with other fingerprints
+/// computed in the same process to decide whether a cached `XdpProgram` can
+/// be reused; never persist or transmit this value.
 fn hash_program_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -593,6 +751,8 @@ mod tests {
             }
         };
 
+        assert!(ebpf.program(BOUND_PORTS_PROGRAM).is_some());
+        assert!(ebpf.program(PORT_RANGE_PROGRAM).is_some());
         assert_eq!(
             validate_bound_port_maps(&mut ebpf).unwrap(),
             BoundPortMaps {
@@ -600,6 +760,31 @@ mod tests {
                 count_available: true,
             }
         );
+        validate_bound_port_range_map(&mut ebpf).unwrap();
         validate_xskmap(&mut ebpf).unwrap();
+        validate_drop_counters(&mut ebpf).unwrap();
+    }
+
+    #[test]
+    fn program_config_selects_expected_program_names() {
+        assert_eq!(
+            XdpProgramConfig::bound_ports().program_name(),
+            BOUND_PORTS_PROGRAM
+        );
+        assert_eq!(
+            XdpProgramConfig::port_range(10_000, 20_000).program_name(),
+            PORT_RANGE_PROGRAM
+        );
+    }
+
+    #[test]
+    fn port_range_config_rejects_disabled_or_inverted_ranges() {
+        assert!(XdpProgramConfig::port_range(0, 0).validate().is_err());
+        assert!(
+            XdpProgramConfig::port_range(20_000, 10_000)
+                .validate()
+                .is_err()
+        );
+        assert!(XdpProgramConfig::port_range(0, 1).validate().is_ok());
     }
 }
