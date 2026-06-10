@@ -23,9 +23,8 @@ use std::time::Duration;
 
 use fast_socket_rs::{
     BufferLayout, BufferPool, DeviceError, DeviceErrorKind, Error, IfIndex, PacketBuffer,
-    QueueAffinity, QueueId, ReadinessDriver, ReadinessSource, RecvBatch, SendError, SocketId,
-    TxSlot, UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, WaitOutcome,
-    WakeHandle,
+    PollDriver, PollMode, QueueAffinity, QueueId, RecvBatch, SendError, SocketId, TxSlot,
+    UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, WaitOutcome, WakeHandle,
 };
 
 pub use buffer::{OsBufferPool, OsPacketBuf, OsPacketBufMut};
@@ -310,7 +309,7 @@ pub struct OsUdpSocket {
     socket: StdUdpSocket,
     rx_pool: OsBufferPool,
     tx_pool: OsBufferPool,
-    driver: ReadinessDriver<OsReadinessSource>,
+    driver: OsWaitDrivenDriver,
     if_index: Option<IfIndex>,
     queue_id: QueueId,
     queue_affinity: QueueAffinity,
@@ -398,7 +397,7 @@ impl OsUdpSocket {
         #[cfg(target_os = "linux")]
         enable_pktinfo(&socket)?;
         socket.set_nonblocking(true)?;
-        let readiness_socket = socket.try_clone()?;
+        let wait_socket = socket.try_clone()?;
         #[cfg(target_os = "linux")]
         let raw_fd = socket.as_raw_fd();
         #[cfg(target_os = "linux")]
@@ -416,7 +415,7 @@ impl OsUdpSocket {
                 config.tx_buffer_layout,
                 config.tx_pool_max_buffers,
             ),
-            driver: ReadinessDriver::new(OsReadinessSource::new(readiness_socket)),
+            driver: OsWaitDrivenDriver::new(wait_socket),
             if_index: config.if_index,
             queue_id: config.queue_id,
             queue_affinity: config.queue_affinity,
@@ -469,7 +468,7 @@ impl OsUdpSocket {
 impl UdpSocket for OsUdpSocket {
     type RxPool = OsBufferPool;
     type TxPool = OsBufferPool;
-    type Driver = ReadinessDriver<OsReadinessSource>;
+    type Driver = OsWaitDrivenDriver;
     type RecvMeta = UdpRecvMeta;
 
     fn socket_id(&self) -> SocketId {
@@ -869,21 +868,23 @@ impl OsUdpSocket {
     }
 }
 
-/// Readiness source backed by an OS UDP socket handle.
+/// Wait-driven polling driver backed by an OS UDP socket handle.
 #[derive(Debug)]
-pub struct OsReadinessSource {
+pub struct OsWaitDrivenDriver {
     socket: StdUdpSocket,
 }
 
-impl OsReadinessSource {
-    /// Creates a readiness source from a UDP socket handle.
+impl OsWaitDrivenDriver {
+    /// Creates a wait-driven polling driver from a UDP socket handle.
     #[must_use]
     pub const fn new(socket: StdUdpSocket) -> Self {
         Self { socket }
     }
 }
 
-impl ReadinessSource for OsReadinessSource {
+impl PollDriver for OsWaitDrivenDriver {
+    const MODE: PollMode = PollMode::WaitDriven;
+
     fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error> {
         wait_for_readable(&self.socket, timeout)
     }
@@ -1488,16 +1489,16 @@ mod tests {
     }
 
     #[test]
-    fn os_readiness_driver_times_out() {
+    fn os_wait_driven_driver_times_out() {
         let socket = OsUdpSocketBuilder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .bind()
             .unwrap();
-        let driver = socket.driver().source().socket.try_clone().unwrap();
+        let driver = socket.driver().socket.try_clone().unwrap();
         driver.set_nonblocking(true).unwrap();
 
-        let mut source = OsReadinessSource::new(driver);
+        let mut driver = OsWaitDrivenDriver::new(driver);
         assert_eq!(
-            source.wait(Some(Duration::from_millis(1))).unwrap(),
+            driver.wait(Some(Duration::from_millis(1))).unwrap(),
             WaitOutcome::Timeout
         );
     }

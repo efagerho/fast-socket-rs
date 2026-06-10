@@ -1,9 +1,9 @@
 mod support;
 
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, BusyPollIpPacketSocket, ChecksumStatus, CoreEgress, Error,
-    IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, NeighborId,
-    RecvBatch, SendError, SocketId, TxOffload, TxSlot, V4Only,
+    BufferPool, BusyPollDriver, ChecksumStatus, CoreEgress, Error, IpPacketReceive,
+    IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, NeighborId, PollDriver,
+    PollMode, RecvBatch, SendError, SocketId, TxOffload, TxSlot, V4Only,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};
@@ -101,12 +101,13 @@ impl IpPacketSocket for MockIpPacketSocket {
     }
 }
 
-fn assert_busy_poll_ip_packet_socket<S: BusyPollIpPacketSocket>(_socket: &S) {}
-
 #[test]
 fn ip_packet_socket_trait_surface_accepts_mock_socket() {
     let mut socket = MockIpPacketSocket::new();
-    assert_busy_poll_ip_packet_socket(&socket);
+    assert_eq!(
+        <<MockIpPacketSocket as IpPacketSocket>::Driver as PollDriver>::MODE,
+        PollMode::BusyPoll
+    );
 
     let packet = PacketBuf::copy_from_slice(&[0x45, 0, 0, 20]);
     let mut tx = [TxSlot::Ready(IpPacketTransmit::new(

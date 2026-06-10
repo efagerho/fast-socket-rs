@@ -35,10 +35,11 @@ must add headers before handing it to a lower layer.
 layout describes payload capacity, headroom, tailroom, alignment, and segment
 shape. A pool returns `None` when no buffer is immediately available.
 
-`SocketBufferPool` is the version of `BufferPool` accepted by socket traits. It
-adds the core threading contract: mutable buffers and their frozen form must both
-be `Send`. An owned packet buffer can therefore move to another thread and be
-dropped there.
+Socket traits accept ordinary `BufferPool` implementations. The pools
+themselves are not required to be `Send`; they can remain worker-local. The
+threading contract is on the buffers handed out by socket pools: mutable buffers
+and their frozen form must both be `Send`, so an owned packet buffer can move to
+another thread and be dropped there.
 
 Sockets own their pools. `UdpSocket::RxPool` and `IpPacketSocket::RxPool` provide
 storage for received packets. `UdpSocket::TxPool` and `IpPacketSocket::TxPool`
@@ -105,9 +106,9 @@ prefix and `SendError` rules as `UdpSocket`.
 ## Polling Model
 
 Every socket has a `PollDriver`. The driver records whether the socket is meant
-to be used in readiness mode or busy-poll mode.
+to be used in wait-driven mode or busy-poll mode.
 
-Readiness-mode sockets can wait on an external event source. A worker tries to
+Wait-driven sockets can wait on an external event source. A worker tries to
 receive, send, and drain completions first, then calls the driver when it has no
 work left.
 
@@ -115,6 +116,6 @@ Busy-poll sockets are intended for workers that repeatedly probe the socket.
 Their driver does not sleep; the worker decides whether to spin, run periodic
 maintenance, or yield when no packets are available.
 
-The marker traits `ReadinessUdpSocket`, `BusyPollUdpSocket`,
-`ReadinessIpPacketSocket`, and `BusyPollIpPacketSocket` let application code
-state the expected polling model in a function signature.
+Applications can select the appropriate worker loop once at startup from
+`<S::Driver as PollDriver>::MODE`. That keeps the mode branch outside the packet
+hot path while avoiding separate wait-driven/busy-poll marker traits.

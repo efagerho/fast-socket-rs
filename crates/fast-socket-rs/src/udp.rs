@@ -4,10 +4,9 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError,
-    SocketBufferPool, SocketId, TxSlot,
+    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId,
+    TxSlot,
 };
-use crate::{BusyPollDriverMode, ReadinessDriverMode};
 
 /// Explicit Congestion Notification codepoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,10 +113,10 @@ where
     <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
 {
     /// Buffer pool used by the socket receive path.
-    type RxPool: SocketBufferPool;
+    type RxPool: BufferPool;
 
     /// Buffer pool used by the socket transmit path.
-    type TxPool: SocketBufferPool;
+    type TxPool: BufferPool;
 
     /// Polling driver selected by this socket implementation.
     type Driver: PollDriver;
@@ -249,37 +248,5 @@ where
     /// Notifies the transmit path when an explicit flush is required.
     fn notify_tx(&mut self) -> Result<(), Error> {
         Ok(())
-    }
-}
-
-/// Marker trait for readiness-mode UDP sockets.
-pub trait ReadinessUdpSocket: UdpSocket + sealed::ReadinessUdpSocketSealed {}
-
-impl<S> ReadinessUdpSocket for S where S: UdpSocket + sealed::ReadinessUdpSocketSealed {}
-
-/// Marker trait for busy-poll-mode UDP sockets.
-pub trait BusyPollUdpSocket: UdpSocket + sealed::BusyPollUdpSocketSealed {}
-
-impl<S> BusyPollUdpSocket for S where S: UdpSocket + sealed::BusyPollUdpSocketSealed {}
-
-mod sealed {
-    use super::*;
-
-    pub trait ReadinessUdpSocketSealed {}
-
-    impl<S> ReadinessUdpSocketSealed for S
-    where
-        S: UdpSocket,
-        S::Driver: ReadinessDriverMode,
-    {
-    }
-
-    pub trait BusyPollUdpSocketSealed {}
-
-    impl<S> BusyPollUdpSocketSealed for S
-    where
-        S: UdpSocket,
-        S::Driver: BusyPollDriverMode,
-    {
     }
 }

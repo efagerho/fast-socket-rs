@@ -2,7 +2,7 @@
 
 This chapter shows the shape of UDP worker loops. A loop receives packets into a
 reused `RecvBatch`, prepares transmit buffers from the socket's transmit pool,
-submits ready transmit slots, and then either waits for readiness or keeps
+submits ready transmit slots, and then either waits for work or keeps
 busy-polling.
 
 The examples use `UdpSocket`. Additionally, `S` denotes a type that implements the
@@ -144,9 +144,9 @@ For a simple burst where the caller wants to submit every slot before returning,
 acceptance. Worker loops usually keep the explicit `send` form so they can run
 timers, handle receive work, or apply back-pressure policy between attempts.
 
-## Readiness-Mode Loops
+## Wait-Driven Loops
 
-A readiness-mode socket uses a `PollDriver` that can wait for an external event
+A wait-driven socket uses a `PollDriver` that can wait for an external event
 source. A typical worker tries receive, transmit, and completion work first. If
 none of those steps makes progress, it waits on the driver.
 
@@ -154,16 +154,16 @@ none of those steps makes progress, it waits on the driver.
 use std::time::Duration;
 
 use fast_socket_rs::{
-    Error, PollDriver, ReadinessUdpSocket, RecvBatch, TxSlot, UdpTransmit,
-    UdpTxBuffer, WaitOutcome,
+    Error, PollDriver, RecvBatch, TxSlot, UdpSocket, UdpTransmit, UdpTxBuffer,
+    WaitOutcome,
 };
 
-fn readiness_loop<S>(
+fn wait_driven_loop<S>(
     socket: &mut S,
     pending: &mut Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>,
 ) -> Result<(), Error>
 where
-    S: ReadinessUdpSocket,
+    S: UdpSocket,
 {
     let mut rx = RecvBatch::with_capacity(64);
 
@@ -200,7 +200,7 @@ where
 
 `WaitOutcome::Ready` means the loop should try the socket again. `Timeout` means
 the worker reached its chosen idle deadline. `Spurious` is valid and should be
-handled like a normal loop retry. Readiness drivers may also expose a borrowed
+handled like a normal loop retry. Wait-driven drivers may also expose a borrowed
 wake handle through `wake_handle` for integration with an external reactor.
 
 ## Busy-Poll Loops
@@ -213,7 +213,7 @@ latency policy.
 
 ```rust,ignore
 use fast_socket_rs::{
-    BusyPollUdpSocket, Error, RecvBatch, TxSlot, UdpTransmit, UdpTxBuffer,
+    Error, RecvBatch, TxSlot, UdpSocket, UdpTransmit, UdpTxBuffer,
 };
 
 fn busy_poll_loop<S>(
@@ -221,7 +221,7 @@ fn busy_poll_loop<S>(
     pending: &mut Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>,
 ) -> Result<(), Error>
 where
-    S: BusyPollUdpSocket,
+    S: UdpSocket,
 {
     let mut rx = RecvBatch::with_capacity(64);
 
@@ -253,13 +253,26 @@ worker near the queue or device that the backend expects.
 
 ## Selecting a Loop
 
-When the poll mode is known in the type signature, prefer the marker traits:
-`ReadinessUdpSocket` for readiness workers and `BusyPollUdpSocket` for dedicated
-busy-poll workers. They make the intended scheduling model explicit at the API
-boundary.
+Select the worker loop once when the socket is created by checking the socket
+driver's compile-time mode:
 
-At the socket-trait level, the distinction comes from `UdpSocket::Driver`: a
-readiness socket has a readiness driver, and a busy-poll socket has a busy-poll
-driver. Application code usually should not branch on that directly. The
-marker-trait form keeps the scheduling model visible in the function signature
-and gives monomorphized code the same compile-time information.
+```rust,ignore
+use fast_socket_rs::{Error, PollDriver, PollMode, TxSlot, UdpSocket, UdpTransmit, UdpTxBuffer};
+
+fn run_socket<S>(
+    socket: &mut S,
+    pending: &mut Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>,
+) -> Result<(), Error>
+where
+    S: UdpSocket,
+{
+    match <S::Driver as PollDriver>::MODE {
+        PollMode::WaitDriven => wait_driven_loop(socket, pending),
+        PollMode::BusyPoll => busy_poll_loop(socket, pending),
+        _ => unreachable!("unknown poll mode"),
+    }
+}
+```
+
+That branch happens outside the packet hot path. After startup, the chosen loop
+runs directly and does not repeatedly inspect the mode.

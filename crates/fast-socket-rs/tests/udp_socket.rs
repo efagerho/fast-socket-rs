@@ -3,8 +3,8 @@ mod support;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, BusyPollUdpSocket, Error, RecvBatch, SendError, SocketId, TxSlot,
-    UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit,
+    BufferPool, BusyPollDriver, Error, PollDriver, PollMode, RecvBatch, SendError, SocketId,
+    TxSlot, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};
@@ -97,12 +97,13 @@ impl UdpSocket for MockUdpSocket {
     }
 }
 
-fn assert_busy_poll_udp_socket<S: BusyPollUdpSocket>(_socket: &S) {}
-
 #[test]
 fn udp_socket_trait_surface_accepts_mock_socket() {
     let mut socket = MockUdpSocket::new();
-    assert_busy_poll_udp_socket(&socket);
+    assert_eq!(
+        <<MockUdpSocket as UdpSocket>::Driver as PollDriver>::MODE,
+        PollMode::BusyPoll
+    );
     assert_eq!(socket.socket_id(), SocketId::new(7));
 
     let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999).into();

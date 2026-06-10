@@ -15,8 +15,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PollMode {
-    /// Readiness-based polling through an external event source.
-    Readiness,
+    /// Wait-driven polling through an external event source.
+    WaitDriven,
     /// Busy-polling on a dedicated worker core.
     BusyPoll,
 }
@@ -25,15 +25,15 @@ pub enum PollMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WaitOutcome {
-    /// At least one receive, transmit-completion, or wake source is ready.
+    /// At least one receive, transmit-completion, or wake source has work.
     Ready,
-    /// The timeout elapsed with no readiness.
+    /// The timeout elapsed with no work.
     Timeout,
-    /// Returned without readiness; callers should continue their worker loop.
+    /// Returned without work; callers should continue their worker loop.
     Spurious,
 }
 
-/// Borrowed readiness handle for Unix platforms.
+/// Borrowed wake handle for Unix platforms.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct WakeHandle<'a> {
@@ -62,7 +62,7 @@ impl AsFd for WakeHandle<'_> {
     }
 }
 
-/// Borrowed readiness token for non-Unix platforms.
+/// Borrowed wake token for non-Unix platforms.
 #[cfg(not(unix))]
 #[derive(Clone, Copy, Debug)]
 pub struct WakeHandle<'a> {
@@ -93,67 +93,11 @@ pub trait PollDriver {
     /// Compile-time polling mode selected by this driver.
     const MODE: PollMode;
 
-    /// Waits for readiness, timeout, or a spurious wakeup.
+    /// Waits for work, timeout, or a spurious wakeup.
     fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error>;
 
     /// Returns a borrowed wake handle when this driver supports one.
     fn wake_handle(&self) -> Option<WakeHandle<'_>>;
-}
-
-/// Event source used by [`ReadinessDriver`].
-pub trait ReadinessSource {
-    /// Waits for readiness on the underlying event source.
-    fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error>;
-
-    /// Returns a borrowed wake handle for readiness registration.
-    fn wake_handle(&self) -> Option<WakeHandle<'_>>;
-}
-
-/// Generic readiness-mode driver backed by an event source.
-#[derive(Clone, Debug)]
-pub struct ReadinessDriver<S> {
-    source: S,
-}
-
-impl<S> ReadinessDriver<S> {
-    /// Creates a readiness driver from an event source.
-    #[must_use]
-    pub const fn new(source: S) -> Self {
-        Self { source }
-    }
-
-    /// Returns the wrapped readiness source.
-    #[must_use]
-    pub const fn source(&self) -> &S {
-        &self.source
-    }
-
-    /// Returns the wrapped readiness source mutably.
-    #[must_use]
-    pub fn source_mut(&mut self) -> &mut S {
-        &mut self.source
-    }
-
-    /// Consumes the driver and returns the wrapped readiness source.
-    #[must_use]
-    pub fn into_source(self) -> S {
-        self.source
-    }
-}
-
-impl<S> PollDriver for ReadinessDriver<S>
-where
-    S: ReadinessSource,
-{
-    const MODE: PollMode = PollMode::Readiness;
-
-    fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error> {
-        self.source.wait(timeout)
-    }
-
-    fn wake_handle(&self) -> Option<WakeHandle<'_>> {
-        self.source.wake_handle()
-    }
 }
 
 /// Busy-poll driver for sockets that own a worker core.
@@ -181,16 +125,6 @@ impl PollDriver for BusyPollDriver {
         None
     }
 }
-
-/// Marker trait for readiness-mode drivers.
-pub trait ReadinessDriverMode {}
-
-impl<S> ReadinessDriverMode for ReadinessDriver<S> where S: ReadinessSource {}
-
-/// Marker trait for busy-poll-mode drivers.
-pub trait BusyPollDriverMode {}
-
-impl BusyPollDriverMode for BusyPollDriver {}
 
 /// Type-level IP family policy used by IP packet sockets and packet policies.
 pub trait IpFamily {

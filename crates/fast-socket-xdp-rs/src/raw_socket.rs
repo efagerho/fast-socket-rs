@@ -370,7 +370,7 @@ impl RawXdpSocket {
         self.fd.as_raw_fd()
     }
 
-    /// Clones the AF_XDP fd for readiness-driver ownership.
+    /// Clones the AF_XDP fd for wait-driven driver ownership.
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }

@@ -27,18 +27,17 @@ pub use batch::{RecvBatch, SendError, TxSlot};
 pub use buffer::{
     BufferAccessError, BufferCapabilities, BufferLayout, BufferPool, OwnedPacketBuffer,
     PacketBuffer, PacketBufferMut, QueueBufferConfig, ReserveError, ScatterGather, Segment,
-    Segments, SocketBufferPool,
+    Segments,
 };
 pub use device::{Capabilities, RawDevice, RawDeviceStats};
 pub use error::{DeviceError, DeviceErrorKind, Error};
 pub use ip_packet::{
-    BusyPollIpPacketSocket, ChecksumStatus, CoreEgress, IpPacketEgress, IpPacketReceive,
-    IpPacketRecvMeta, IpPacketRxBuffer, IpPacketRxItem, IpPacketSocket, IpPacketTransmit,
-    IpPacketTxBuffer, IpPacketTxItem, IpVersion, ReadinessIpPacketSocket, TxOffload,
+    ChecksumStatus, CoreEgress, IpPacketEgress, IpPacketReceive, IpPacketRecvMeta,
+    IpPacketRxBuffer, IpPacketRxItem, IpPacketSocket, IpPacketTransmit, IpPacketTxBuffer,
+    IpPacketTxItem, IpVersion, TxOffload,
 };
 pub use policy::{
-    BusyPollDriver, BusyPollDriverMode, IpFamily, Mixed, PollDriver, PollMode, ReadinessDriver,
-    ReadinessDriverMode, ReadinessSource, V4Only, V6Only, WaitOutcome, WakeHandle,
+    BusyPollDriver, IpFamily, Mixed, PollDriver, PollMode, V4Only, V6Only, WaitOutcome, WakeHandle,
 };
 pub use route::{
     EgressResolver, LinkAddr, LinkAddrParseError, NeighborId, NeighborTable, RouteHop, RouteId,
@@ -46,6 +45,6 @@ pub use route::{
 };
 pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId, SocketId};
 pub use udp::{
-    BusyPollUdpSocket, EcnCodepoint, ReadinessUdpSocket, UdpCapabilities, UdpReceive, UdpRecvMeta,
-    UdpRxBuffer, UdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut,
+    EcnCodepoint, UdpCapabilities, UdpReceive, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTransmit,
+    UdpTxBuffer, UdpTxBufferMut,
 };

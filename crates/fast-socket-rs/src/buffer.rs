@@ -475,27 +475,6 @@ pub trait BufferPool {
     fn allocate(&mut self) -> Option<Self::Buffer>;
 }
 
-/// Buffer pool suitable for socket traits.
-///
-/// Socket receive and transmit buffers can cross worker-thread boundaries as
-/// owned values. A socket buffer pool must therefore hand out mutable buffers
-/// that are [`Send`], and freezing those buffers must also produce a [`Send`]
-/// immutable buffer.
-pub trait SocketBufferPool: BufferPool
-where
-    Self::Buffer: Send,
-    <Self::Buffer as PacketBufferMut>::Frozen: Send,
-{
-}
-
-impl<P> SocketBufferPool for P
-where
-    P: BufferPool,
-    P::Buffer: Send,
-    <P::Buffer as PacketBufferMut>::Frozen: Send,
-{
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

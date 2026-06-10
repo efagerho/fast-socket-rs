@@ -4,8 +4,8 @@ use core::num::NonZeroU16;
 
 use crate::route::{NeighborId, RouteId};
 use crate::{
-    BufferPool, BusyPollDriverMode, Error, IpFamily, Mixed, PacketBufferMut, PollDriver,
-    QueueAffinity, ReadinessDriverMode, RecvBatch, SendError, SocketBufferPool, SocketId, TxSlot,
+    BufferPool, Error, IpFamily, Mixed, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch,
+    SendError, SocketId, TxSlot,
 };
 
 /// IP version carried by an IP packet.
@@ -204,10 +204,10 @@ where
     <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
 {
     /// Buffer pool used by the socket receive path.
-    type RxPool: SocketBufferPool;
+    type RxPool: BufferPool;
 
     /// Buffer pool used by the socket transmit path.
-    type TxPool: SocketBufferPool;
+    type TxPool: BufferPool;
 
     /// Compile-time address-family policy.
     type Family: IpFamily;
@@ -265,38 +265,5 @@ where
     /// Notifies the transmit path when an explicit flush is required.
     fn notify_tx(&mut self) -> Result<(), Error> {
         Ok(())
-    }
-}
-
-/// Marker trait for readiness-mode IP packet sockets.
-pub trait ReadinessIpPacketSocket: IpPacketSocket + sealed::ReadinessIpPacketSocketSealed {}
-
-impl<S> ReadinessIpPacketSocket for S where S: IpPacketSocket + sealed::ReadinessIpPacketSocketSealed
-{}
-
-/// Marker trait for busy-poll-mode IP packet sockets.
-pub trait BusyPollIpPacketSocket: IpPacketSocket + sealed::BusyPollIpPacketSocketSealed {}
-
-impl<S> BusyPollIpPacketSocket for S where S: IpPacketSocket + sealed::BusyPollIpPacketSocketSealed {}
-
-mod sealed {
-    use super::*;
-
-    pub trait ReadinessIpPacketSocketSealed {}
-
-    impl<S> ReadinessIpPacketSocketSealed for S
-    where
-        S: IpPacketSocket,
-        S::Driver: ReadinessDriverMode,
-    {
-    }
-
-    pub trait BusyPollIpPacketSocketSealed {}
-
-    impl<S> BusyPollIpPacketSocketSealed for S
-    where
-        S: IpPacketSocket,
-        S::Driver: BusyPollDriverMode,
-    {
     }
 }
