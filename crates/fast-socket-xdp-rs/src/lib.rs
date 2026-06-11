@@ -3,6 +3,10 @@
 #![deny(missing_docs)]
 
 #[cfg(target_os = "linux")]
+pub mod buffer;
+#[cfg(target_os = "linux")]
+pub mod egress;
+#[cfg(target_os = "linux")]
 pub mod interface;
 #[cfg(target_os = "linux")]
 pub mod netlink;
@@ -15,9 +19,17 @@ pub(crate) mod raw_socket;
 #[cfg_attr(not(feature = "unstable-internals"), allow(dead_code))]
 pub(crate) mod ring;
 #[cfg(target_os = "linux")]
+pub mod route;
+#[cfg(target_os = "linux")]
+pub mod route_monitor;
+#[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "unstable-internals"), allow(dead_code))]
 pub(crate) mod umem;
 
+#[cfg(target_os = "linux")]
+pub use buffer::{XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
+#[cfg(target_os = "linux")]
+pub use egress::{ETHERTYPE_IPV4, ETHERTYPE_IPV6, ResolvedL2, XdpEgress, XdpResolvedEgress};
 #[cfg(target_os = "linux")]
 pub use interface::{
     XdpQueueSlot, bond_slaves, cpu_for_xdp_queue, if_index_to_name, if_name_to_index,
@@ -32,6 +44,10 @@ pub use program::{
 };
 #[cfg(target_os = "linux")]
 pub use raw_socket::{RingSizes, XdpMode};
+#[cfg(target_os = "linux")]
+pub use route::{RouteSnapshot, XdpLocalRoutes};
+#[cfg(target_os = "linux")]
+pub use route_monitor::{XdpRouteMonitor, XdpRouteMonitorHandle};
 
 /// Unstable low-level AF_XDP building blocks.
 ///
