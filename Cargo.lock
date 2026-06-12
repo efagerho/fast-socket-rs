@@ -391,6 +391,7 @@ version = "0.1.0"
 name = "fast-socket-os-rs"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "fast-socket-rs",
  "libc",
 ]

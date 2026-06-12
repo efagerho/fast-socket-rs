@@ -300,10 +300,10 @@ impl Default for OsUdpSocketConfig {
 
 /// Direct OS-backed UDP socket implementation.
 ///
-/// Drop order: `socket` first, then the pools and their cloned `Rc` references.
-/// Frozen and mutable packets handed out to callers each hold an `Rc` to the
-/// pool's interior, so the pool stays alive until every outstanding buffer is
-/// dropped even if the socket is dropped earlier.
+/// Buffer lifetime contract: this socket and its RX/TX pools must outlive every
+/// buffer they hand out, including buffers moved to other threads. Buffers hold
+/// raw pointers into pool-owned reclaim state so owner-thread drops can return
+/// storage without a mutex or per-buffer reference-count traffic.
 #[derive(Debug)]
 pub struct OsUdpSocket {
     socket: StdUdpSocket,
@@ -345,6 +345,16 @@ pub struct OsUdpSocket {
     #[cfg(target_os = "linux")]
     tx_hdrs: Box<[libc::mmsghdr]>,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for OsUdpSocket {
+    fn drop(&mut self) {
+        // Prepared receive buffers borrow the RX pool reclaim state through raw
+        // pointers, so release them before field drop reaches the pools.
+        for buffer in &mut self.recv_buffers {
+            let _ = buffer.take();
+        }
+    }
 }
 
 impl OsUdpSocket {

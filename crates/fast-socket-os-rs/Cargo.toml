@@ -3,7 +3,11 @@ name = "fast-socket-os-rs"
 version.workspace = true
 edition.workspace = true
 
+[features]
+buffer-guard = []
+
 [dependencies]
+crossbeam-queue = "0.3"
 fast-socket-rs = { path = "../fast-socket-rs" }
 libc = "0.2"
 
