@@ -2,3 +2,4 @@
 docs/book/
 bench-results/
 AGENTS.md
+benchmarks/*.sh
