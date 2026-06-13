@@ -250,18 +250,17 @@ mod bpf {
 
     #[inline(always)]
     unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-        // Canonical AF_XDP bounds-check form: keep arithmetic on the offset side
-        // of the comparison so the verifier never has to track a possibly-
-        // overflowing pointer sum. `offset + size` and `end - start` each fit in
-        // a `usize` on every supported kernel, and the comparison itself is the
-        // single check the verifier proves.
         let start = ctx.data();
         let end = ctx.data_end();
         let size = core::mem::size_of::<T>();
-        if offset.checked_add(size).ok_or(())? > end.wrapping_sub(start) {
+        // The verifier tracks bounds on packet pointers, not on scalar packet
+        // lengths. Check the exact pointer returned below so the load inherits
+        // the proven range.
+        let ptr = start + offset;
+        if ptr + size > end {
             return Err(());
         }
-        Ok(start.wrapping_add(offset) as *const T)
+        Ok(ptr as *const T)
     }
 
     /// Reads `N` bytes from the packet at `offset` in a single bounds check.
