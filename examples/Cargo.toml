@@ -4,3 +4,21 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fast-socket-benchmarks = { path = "../benchmarks" }
+fast-socket-os-rs = { path = "../crates/fast-socket-os-rs" }
+fast-socket-rs = { path = "../crates/fast-socket-rs" }
+fast-socket-xdp-rs = { path = "../crates/fast-socket-xdp-rs" }
+libc = "0.2"
+
+[[bin]]
+name = "blast"
+path = "src/bin/blast.rs"
+
+[[bin]]
+name = "pong-server"
+path = "src/bin/pong-server.rs"
+
+[[bin]]
+name = "custom-router"
+path = "src/bin/custom-router.rs"

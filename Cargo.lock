@@ -458,6 +458,14 @@ dependencies = [
 [[package]]
 name = "fast-socket-examples"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "fast-socket-benchmarks",
+ "fast-socket-os-rs",
+ "fast-socket-rs",
+ "fast-socket-xdp-rs",
+ "libc",
+]
 
 [[package]]
 name = "fast-socket-os-rs"
