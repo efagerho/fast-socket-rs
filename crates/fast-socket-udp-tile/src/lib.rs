@@ -470,6 +470,11 @@ impl<S: UdpSocket> TileTxBatch<S> {
         self.packets.pop()
     }
 
+    /// Iterates packets in this batch without consuming them.
+    pub fn iter(&self) -> std::slice::Iter<'_, TileTxPacket<S>> {
+        self.packets.iter()
+    }
+
     /// Drops every packet in this batch while keeping the allocation.
     pub fn clear(&mut self) {
         self.packets.clear();
@@ -617,38 +622,6 @@ impl From<Error> for TileError {
     }
 }
 
-/// A tile-to-lane ingress queue.
-pub trait TileRxQueue<S: UdpSocket>: Send + Sync + 'static {
-    /// Pops one received packet batch.
-    fn pop_batch(&self) -> Option<TileRxBatch<S>>;
-}
-
-impl<S, Q> TileRxQueue<S> for Arc<Q>
-where
-    S: UdpSocket,
-    Q: TileRxQueue<S>,
-{
-    fn pop_batch(&self) -> Option<TileRxBatch<S>> {
-        self.as_ref().pop_batch()
-    }
-}
-
-/// A lane-to-tile egress queue.
-pub trait TileTxQueue<S: UdpSocket>: Send + Sync + 'static {
-    /// Pushes one batch for transmit, returning it when the queue is full.
-    fn push_batch(&self, batch: TileTxBatch<S>) -> Result<(), TileTxBatch<S>>;
-}
-
-impl<S, Q> TileTxQueue<S> for Arc<Q>
-where
-    S: UdpSocket,
-    Q: TileTxQueue<S>,
-{
-    fn push_batch(&self, batch: TileTxBatch<S>) -> Result<(), TileTxBatch<S>> {
-        self.as_ref().push_batch(batch)
-    }
-}
-
 /// Per-lane handle used by application code to exchange UDP work with a tile.
 ///
 /// Handles are `Send` so they can move into lane threads. The trait does not
@@ -699,44 +672,11 @@ pub trait UdpNetworkTile: Send + Sync + 'static {
     /// Concrete per-lane handle type.
     type Handle: UdpNetworkTileHandle<Socket = Self::Socket>;
 
-    /// Concrete tile-to-lane ingress queue type.
-    type RxQueue: TileRxQueue<Self::Socket>;
-
-    /// Concrete lane-to-tile egress queue type.
-    type TxQueue: TileTxQueue<Self::Socket>;
-
     /// Creates a handle for `lane_index`.
     ///
     /// Returns `None` when the lane index is outside the tile's configured
     /// lane range.
     fn lane_handle(self: Arc<Self>, lane_index: usize) -> Option<Self::Handle>;
-
-    /// Pops up to `count` preallocated transmit buffers for `lane_index` into
-    /// `out`.
-    fn alloc_tx_buffers(
-        &self,
-        lane_index: usize,
-        count: usize,
-        out: &mut Vec<TileTxBuffer<Self::Socket>>,
-    ) -> usize;
-
-    /// Allocates an empty receive batch container.
-    fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket>;
-
-    /// Recycles an empty or discarded receive batch container.
-    fn recycle_rx_batch(&self, batch: TileRxBatch<Self::Socket>);
-
-    /// Allocates an empty transmit batch container.
-    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket>;
-
-    /// Recycles an empty or discarded transmit batch container.
-    fn recycle_tx_batch(&self, batch: TileTxBatch<Self::Socket>);
-
-    /// Returns tile-to-lane RX queues, one per lane.
-    fn rx_queues(&self) -> &[Self::RxQueue];
-
-    /// Returns lane-to-tile TX queues, one per lane.
-    fn tx_queues(&self) -> &[Self::TxQueue];
 
     /// Returns a snapshot of tile drop counters.
     fn stats(&self) -> TileStats;
