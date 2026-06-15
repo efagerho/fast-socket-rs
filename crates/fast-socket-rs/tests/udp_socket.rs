@@ -82,6 +82,7 @@ impl UdpSocket for MockUdpSocket {
         let meta = UdpRecvMeta {
             source: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234).into(),
             destination: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            destination_port: Some(5678),
             ecn: None,
             len: 0,
             gro_stride: None,

@@ -11,6 +11,8 @@ compile_error!("fast-socket-os-rs supports only Linux, macOS, and FreeBSD");
 
 mod buffer;
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::io;
 use std::marker::PhantomData;
 #[cfg(any(target_os = "linux", test))]
@@ -84,6 +86,7 @@ pub struct OsUdpSocketBuilder {
     tx_buffer_layout: BufferLayout,
     mtu: usize,
     reuse_port: bool,
+    bind_device: Option<String>,
     max_batch: usize,
     rx_pool_max_buffers: Option<usize>,
     tx_pool_max_buffers: Option<usize>,
@@ -102,6 +105,7 @@ impl OsUdpSocketBuilder {
             tx_buffer_layout: BufferLayout::new(2048),
             mtu: 1472,
             reuse_port: false,
+            bind_device: None,
             max_batch: DEFAULT_MAX_BATCH,
             rx_pool_max_buffers: None,
             tx_pool_max_buffers: None,
@@ -179,6 +183,18 @@ impl OsUdpSocketBuilder {
         self
     }
 
+    /// Binds the socket to an operating-system network device.
+    ///
+    /// On Linux this sets `SO_BINDTODEVICE` before the UDP bind and records the
+    /// interface index in the resulting socket metadata when
+    /// [`Self::if_index`] was not set explicitly. Other platforms return an
+    /// unsupported-operation error from [`Self::bind`] when this option is set.
+    #[must_use]
+    pub fn bind_to_device(mut self, device: impl Into<String>) -> Self {
+        self.bind_device = Some(device.into());
+        self
+    }
+
     /// Sets the per-syscall batch size used by `recvmmsg` / `sendmmsg` and
     /// the pre-allocated state arrays.
     ///
@@ -231,7 +247,12 @@ impl OsUdpSocketBuilder {
 
     /// Binds and opens the live OS-backed UDP socket.
     pub fn bind(self) -> io::Result<OsUdpSocket> {
-        let socket = bind_udp_socket(self.bind_addr, self.reuse_port)?;
+        let if_index = match (self.if_index, self.bind_device.as_deref()) {
+            (Some(if_index), _) => Some(if_index),
+            (None, Some(device)) => Some(if_name_to_index(device)?),
+            (None, None) => None,
+        };
+        let socket = bind_udp_socket(self.bind_addr, self.reuse_port, self.bind_device.as_deref())?;
         let rx_pool_max_buffers = self
             .rx_pool_max_buffers
             .unwrap_or(default_pool_max_buffers(self.max_batch));
@@ -241,7 +262,7 @@ impl OsUdpSocketBuilder {
         OsUdpSocket::from_std(
             socket,
             OsUdpSocketConfig {
-                if_index: self.if_index,
+                if_index,
                 queue_id: self.queue_id,
                 queue_affinity: self.queue_affinity,
                 rx_buffer_layout: self.rx_buffer_layout,
@@ -313,6 +334,7 @@ pub struct OsUdpSocket {
     if_index: Option<IfIndex>,
     queue_id: QueueId,
     queue_affinity: QueueAffinity,
+    local_port: u16,
     mtu: usize,
     /// Per-syscall cap; same value chunks both `recvmmsg` and `sendmmsg` and
     /// sizes every per-message scratch array below.
@@ -410,6 +432,7 @@ impl OsUdpSocket {
         let wait_socket = socket.try_clone()?;
         #[cfg(target_os = "linux")]
         let raw_fd = socket.as_raw_fd();
+        let local_port = socket.local_addr()?.port();
         #[cfg(target_os = "linux")]
         let recv_state = build_recv_state(config.max_batch);
         #[cfg(target_os = "linux")]
@@ -429,6 +452,7 @@ impl OsUdpSocket {
             if_index: config.if_index,
             queue_id: config.queue_id,
             queue_affinity: config.queue_affinity,
+            local_port,
             mtu: config.mtu,
             max_batch: config.max_batch,
             recv_buffers: (0..config.max_batch)
@@ -827,6 +851,7 @@ impl OsUdpSocket {
             let meta = UdpRecvMeta {
                 source,
                 destination,
+                destination_port: Some(self.local_port),
                 ecn: None,
                 len,
                 gro_stride: None,
@@ -861,6 +886,7 @@ impl OsUdpSocket {
                     let meta = UdpRecvMeta {
                         source,
                         destination: None,
+                        destination_port: Some(self.local_port),
                         ecn: None,
                         len,
                         gro_stride: None,
@@ -904,8 +930,12 @@ impl PollDriver for OsWaitDrivenDriver {
     }
 }
 
-fn bind_udp_socket(addr: SocketAddr, reuse_port: bool) -> io::Result<StdUdpSocket> {
-    if !reuse_port {
+fn bind_udp_socket(
+    addr: SocketAddr,
+    reuse_port: bool,
+    bind_device: Option<&str>,
+) -> io::Result<StdUdpSocket> {
+    if !reuse_port && bind_device.is_none() {
         return StdUdpSocket::bind(addr);
     }
 
@@ -922,8 +952,13 @@ fn bind_udp_socket(addr: SocketAddr, reuse_port: bool) -> io::Result<StdUdpSocke
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     set_close_on_exec(fd.as_raw_fd())?;
-    set_reuse_addr(fd.as_raw_fd())?;
-    set_reuse_port(fd.as_raw_fd())?;
+    if reuse_port {
+        set_reuse_addr(fd.as_raw_fd())?;
+        set_reuse_port(fd.as_raw_fd())?;
+    }
+    if let Some(device) = bind_device {
+        set_bind_to_device(fd.as_raw_fd(), device)?;
+    }
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr_len = sockaddr_from_socketaddr(&addr, &mut storage);
@@ -982,6 +1017,63 @@ fn set_reuse_port(fd: std::os::fd::RawFd) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_bind_to_device(fd: std::os::fd::RawFd, device: &str) -> io::Result<()> {
+    let device = CString::new(device).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SO_BINDTODEVICE name contains an interior NUL byte",
+        )
+    })?;
+    let name = device.as_bytes_with_nul();
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            name.len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_bind_to_device(_fd: std::os::fd::RawFd, _device: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SO_BINDTODEVICE is only supported on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn if_name_to_index(device: &str) -> io::Result<IfIndex> {
+    let device = CString::new(device).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name contains an interior NUL byte",
+        )
+    })?;
+    let index = unsafe { libc::if_nametoindex(device.as_ptr()) };
+    if index == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(IfIndex::new(index))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn if_name_to_index(_device: &str) -> io::Result<IfIndex> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "interface name resolution for bind_to_device is only supported on Linux",
+    ))
 }
 
 fn is_transient(error: &io::Error) -> bool {

@@ -10,22 +10,31 @@
 mod queue;
 
 use std::cell::UnsafeCell;
+use std::fmt;
+use std::io;
 use std::marker::PhantomData;
 use std::mem;
+use std::net::SocketAddrV4;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
-    RecvBatch, TxSlot, UdpReceive, UdpRxBuffer, UdpSocket, UdpTransmit, UdpTxBuffer,
-    UdpTxBufferMut, pin_current_thread_to_affinity,
+    BusyPollDriver, QueueId, RecvBatch, TxSlot, UdpReceive, UdpRxBuffer, UdpSocket, UdpTransmit,
+    UdpTxBuffer, UdpTxBufferMut, pin_current_thread_to_affinity,
 };
 use fast_socket_udp_tile::validate_socket_affinity;
 pub use fast_socket_udp_tile::{
     AcceptAllClassifier, IngressClassifier, IngressDecision, SocketIndex, SourceAddrClassifier,
     TileConfig, TileError, TileRxBatch, TileRxPacket, TileStats, TileTxBatch, TileTxBuffer,
     TileTxPacket, UdpNetworkTile, UdpNetworkTileHandle,
+};
+use fast_socket_xdp_rs::{
+    InterfaceSelector, RouteSnapshot, XdpFactory, XdpFactoryBuilder, XdpQueueLocalRouter,
+    XdpRouteMonitor, XdpRouteMonitorHandle, XdpUdpAggregate, XdpUdpSocket,
 };
 
 pub use queue::{Park, Spin};
@@ -34,6 +43,13 @@ use queue::{Queue, SpscConsumer, SpscProducer, WaitStrategy, spsc_pair, wait_any
 type RxQueue<S, W> = Arc<Queue<TileRxBatch<S>, W>>;
 
 type TxQueue<S, W> = Arc<Queue<TileTxBatch<S>, W>>;
+
+type DefaultXdpSocket = XdpUdpSocket<BusyPollDriver, XdpQueueLocalRouter>;
+type DefaultXdpAggregate = XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter>;
+type DefaultXdpRecvMeta = <DefaultXdpSocket as UdpSocket>::RecvMeta;
+type DefaultXdpRxBuffer = UdpRxBuffer<DefaultXdpSocket>;
+type DefaultXdpTile<C> = UdpTile<RouteMonitoredXdpAggregate, Spin, C>;
+type DefaultXdpTileHandle<C> = UdpTileHandle<RouteMonitoredXdpAggregate, Spin, C>;
 
 /// Lane-owned handle for an [`UdpTile`].
 ///
@@ -104,6 +120,502 @@ where
 
     fn can_transmit_from_any_socket(&self) -> bool {
         self.members_share_umem()
+    }
+}
+
+struct RouteMonitoredXdpAggregate {
+    aggregate: DefaultXdpAggregate,
+    route_updates: Vec<XdpRouteMonitorHandle>,
+}
+
+impl UdpSocketSet for RouteMonitoredXdpAggregate {
+    type Socket = DefaultXdpSocket;
+
+    fn poll_maintenance(&mut self) -> bool {
+        let mut updates = 0usize;
+        for (socket, route_update) in self
+            .aggregate
+            .members_mut()
+            .iter_mut()
+            .zip(self.route_updates.iter_mut())
+        {
+            updates += route_update.apply_updates(socket.routes_mut());
+        }
+        updates != 0
+    }
+
+    fn sockets_mut(&mut self) -> &mut [Self::Socket] {
+        self.aggregate.members_mut()
+    }
+
+    fn can_transmit_from_any_socket(&self) -> bool {
+        self.aggregate.members_share_umem()
+    }
+}
+
+/// Builder for the common busy-poll AF_XDP UDP tile set.
+///
+/// The builder consumes an [`XdpFactory`] and hides the per-worker socket-set
+/// wrapper, route-monitor handles, and concrete wait strategy from application
+/// code. It returns an [`XdpUdpTiles`] value that can create lane handles and
+/// monitor tile-worker failures.
+pub struct XdpUdpTileBuilder<C = SourceAddrClassifier>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    factory: XdpFactory,
+    local: SocketAddrV4,
+    lane_count: usize,
+    classifier: C,
+    config: TileConfig,
+    route_poll_interval: Duration,
+}
+
+impl XdpUdpTileBuilder<SourceAddrClassifier> {
+    /// Creates a builder using [`SourceAddrClassifier`] and default tile config.
+    #[must_use]
+    pub fn new(factory: XdpFactory, local: SocketAddrV4, lane_count: usize) -> Self {
+        Self {
+            factory,
+            local,
+            lane_count,
+            classifier: SourceAddrClassifier,
+            config: TileConfig::default(),
+            route_poll_interval: Duration::from_secs(1),
+        }
+    }
+
+    /// Creates a device-oriented builder for `device` and `local`.
+    ///
+    /// This is the high-level path for application code. It discovers the XDP
+    /// queues, seeds routes from netlink, and installs a UDP destination-port
+    /// filter for `local.port()`. Use [`XdpUdpTileDeviceBuilder::threads`] to
+    /// choose the number of tile workers before calling
+    /// [`XdpUdpTileDeviceBuilder::build`].
+    pub fn bind_device(
+        device: impl Into<String>,
+        local: SocketAddrV4,
+        lane_count: usize,
+    ) -> io::Result<XdpUdpTileDeviceBuilder<SourceAddrClassifier>> {
+        Self::bind_interface(InterfaceSelector::Name(device.into()), local, lane_count)
+    }
+
+    /// Creates a device-oriented builder for an interface selector and `local`.
+    ///
+    /// This is the same as [`Self::bind_device`], but accepts an
+    /// [`InterfaceSelector`] for callers that already resolved an interface
+    /// index.
+    pub fn bind_interface(
+        interface: InterfaceSelector,
+        local: SocketAddrV4,
+        lane_count: usize,
+    ) -> io::Result<XdpUdpTileDeviceBuilder<SourceAddrClassifier>> {
+        let factory = XdpFactoryBuilder::new(interface)?
+            .udp_ports([local.port()])
+            .route_snapshot(RouteSnapshot::from_netlink()?);
+        Ok(XdpUdpTileDeviceBuilder {
+            factory,
+            local,
+            lane_count,
+            classifier: SourceAddrClassifier,
+            config: TileConfig::default(),
+            route_poll_interval: Duration::from_secs(1),
+        })
+    }
+}
+
+impl<C> XdpUdpTileBuilder<C>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    /// Uses a different ingress classifier.
+    #[must_use]
+    pub fn classifier<N>(self, classifier: N) -> XdpUdpTileBuilder<N>
+    where
+        N: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+    {
+        XdpUdpTileBuilder {
+            factory: self.factory,
+            local: self.local,
+            lane_count: self.lane_count,
+            classifier,
+            config: self.config,
+            route_poll_interval: self.route_poll_interval,
+        }
+    }
+
+    /// Uses an explicit tile configuration.
+    #[must_use]
+    pub fn config(mut self, config: TileConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets the netlink route-monitor polling interval.
+    #[must_use]
+    pub fn route_poll_interval(mut self, interval: Duration) -> Self {
+        self.route_poll_interval = interval;
+        self
+    }
+
+    /// Starts one tile worker per XDP factory worker plan.
+    pub fn build(self) -> Result<XdpUdpTiles<C>, TileError> {
+        let plans = self.factory.into_worker_plans();
+        let monitor_queue = plans
+            .first()
+            .and_then(|plan| plan.queue_ids().first())
+            .copied()
+            .unwrap_or_else(|| QueueId::new(0));
+
+        let mut route_monitor = XdpRouteMonitor::new();
+        let mut workers = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let route_updates = plan
+                .queue_ids()
+                .iter()
+                .map(|_| route_monitor.register_queue())
+                .collect::<Vec<_>>();
+            workers.push((plan, route_updates));
+        }
+        let route_monitor_thread =
+            route_monitor.start_netlink(monitor_queue, self.route_poll_interval);
+
+        let mut tiles = Vec::with_capacity(workers.len());
+        let mut worker_threads = Vec::with_capacity(workers.len());
+        for (tile_index, (plan, route_updates)) in workers.into_iter().enumerate() {
+            let local = self.local;
+            let tile = Arc::new(DefaultXdpTile::with_config(
+                move || RouteMonitoredXdpAggregate {
+                    aggregate: plan
+                        .open_udp_busy_poll(local)
+                        .expect("failed to open XDP tile aggregate"),
+                    route_updates,
+                },
+                self.classifier.clone(),
+                self.lane_count,
+                self.config,
+            ));
+            let handle = Arc::clone(&tile).start(tile_index)?;
+            tiles.push(tile);
+            worker_threads.push(Some(handle));
+        }
+
+        Ok(XdpUdpTiles {
+            tiles,
+            worker_threads,
+            taken_lanes: vec![false; self.lane_count],
+            _route_monitor_thread: route_monitor_thread,
+        })
+    }
+}
+
+/// Device-oriented builder for the common busy-poll AF_XDP UDP tile set.
+///
+/// This builder owns the lower-level [`XdpFactoryBuilder`] until
+/// [`Self::build`], so application code can configure worker count and common
+/// factory options without manually constructing an [`XdpFactory`].
+pub struct XdpUdpTileDeviceBuilder<C = SourceAddrClassifier>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    factory: XdpFactoryBuilder,
+    local: SocketAddrV4,
+    lane_count: usize,
+    classifier: C,
+    config: TileConfig,
+    route_poll_interval: Duration,
+}
+
+impl<C> XdpUdpTileDeviceBuilder<C>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    /// Sets the number of tile workers.
+    ///
+    /// The lower-level factory validates that this divides the claimed queue
+    /// layout.
+    #[must_use]
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.factory = self.factory.threads(threads);
+        self
+    }
+
+    /// Applies custom configuration to the underlying XDP factory builder.
+    ///
+    /// This keeps uncommon factory knobs available without making applications
+    /// construct the whole factory by hand.
+    #[must_use]
+    pub fn configure_factory(
+        mut self,
+        configure: impl FnOnce(XdpFactoryBuilder) -> XdpFactoryBuilder,
+    ) -> Self {
+        self.factory = configure(self.factory);
+        self
+    }
+
+    /// Redirects and accepts UDP traffic for the provided destination ports.
+    ///
+    /// The local address port remains the default source port for transmit
+    /// packets; set [`TileTxPacket::source_port`] per packet when sending from a
+    /// different bound port.
+    #[must_use]
+    pub fn udp_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.factory = self.factory.udp_ports(ports);
+        self
+    }
+
+    /// Redirects and accepts UDP traffic whose destination port is in `range`.
+    ///
+    /// The local address port remains the default source port for transmit
+    /// packets; set [`TileTxPacket::source_port`] per packet when sending from a
+    /// different bound port.
+    #[must_use]
+    pub fn udp_port_range(mut self, range: RangeInclusive<u16>) -> Self {
+        self.factory = self.factory.udp_port_range(*range.start(), *range.end());
+        self
+    }
+
+    /// Uses a different ingress classifier.
+    #[must_use]
+    pub fn classifier<N>(self, classifier: N) -> XdpUdpTileDeviceBuilder<N>
+    where
+        N: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+    {
+        XdpUdpTileDeviceBuilder {
+            factory: self.factory,
+            local: self.local,
+            lane_count: self.lane_count,
+            classifier,
+            config: self.config,
+            route_poll_interval: self.route_poll_interval,
+        }
+    }
+
+    /// Uses an explicit tile configuration.
+    #[must_use]
+    pub fn config(mut self, config: TileConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets the netlink route-monitor polling interval.
+    #[must_use]
+    pub fn route_poll_interval(mut self, interval: Duration) -> Self {
+        self.route_poll_interval = interval;
+        self
+    }
+
+    /// Builds the XDP factory and starts one tile worker per worker plan.
+    pub fn build(self) -> Result<XdpUdpTiles<C>, XdpTileBuildError> {
+        let factory = self.factory.build().map_err(XdpTileBuildError::Setup)?;
+        XdpUdpTileBuilder::new(factory, self.local, self.lane_count)
+            .classifier(self.classifier)
+            .config(self.config)
+            .route_poll_interval(self.route_poll_interval)
+            .build()
+            .map_err(XdpTileBuildError::Tile)
+    }
+}
+
+/// Error returned while building high-level XDP UDP tiles.
+#[derive(Debug)]
+pub enum XdpTileBuildError {
+    /// XDP factory setup failed.
+    Setup(io::Error),
+    /// Tile startup failed.
+    Tile(TileError),
+}
+
+impl fmt::Display for XdpTileBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setup(error) => write!(f, "XDP tile setup failed: {error}"),
+            Self::Tile(error) => write!(f, "XDP tile startup failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for XdpTileBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Setup(error) => Some(error),
+            Self::Tile(error) => Some(error),
+        }
+    }
+}
+
+/// Started busy-poll AF_XDP UDP tiles.
+pub struct XdpUdpTiles<C = SourceAddrClassifier>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    tiles: Vec<Arc<DefaultXdpTile<C>>>,
+    worker_threads: Vec<Option<JoinHandle<Result<(), TileError>>>>,
+    taken_lanes: Vec<bool>,
+    _route_monitor_thread: JoinHandle<()>,
+}
+
+impl<C> XdpUdpTiles<C>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    /// Returns the number of tile workers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tiles.len()
+    }
+
+    /// Returns `true` when no tile workers were started.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+
+    /// Creates one handle for `lane_index` on every tile.
+    ///
+    /// Returns `None` if the lane index is outside the configured lane range or
+    /// if a handle for this lane was already taken.
+    pub fn lane_handles(&mut self, lane_index: usize) -> Option<Vec<XdpUdpTileHandle<C>>> {
+        if *self.taken_lanes.get(lane_index)? {
+            return None;
+        }
+
+        let handles = self
+            .tiles
+            .iter()
+            .map(|tile| {
+                Arc::clone(tile)
+                    .lane_handle(lane_index)
+                    .map(|inner| XdpUdpTileHandle { inner })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.taken_lanes[lane_index] = true;
+        Some(handles)
+    }
+
+    /// Returns summed drop counters across all tiles.
+    #[must_use]
+    pub fn stats(&self) -> TileStats {
+        let mut total = TileStats::default();
+        for tile in &self.tiles {
+            let stats = tile.stats();
+            total.classifier_drops += stats.classifier_drops;
+            total.rx_queue_drops += stats.rx_queue_drops;
+            total.tx_drops += stats.tx_drops;
+        }
+        total
+    }
+
+    /// Checks whether any tile worker exited unexpectedly.
+    pub fn check_worker_threads(&mut self) -> Result<(), TileWorkerError> {
+        for (index, handle) in self.worker_threads.iter_mut().enumerate() {
+            if !handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+                continue;
+            }
+            let handle = handle.take().expect("finished handle is present");
+            match handle.join() {
+                Ok(Ok(())) => return Err(TileWorkerError::Exited { index }),
+                Ok(Err(error)) => return Err(TileWorkerError::Failed { index, error }),
+                Err(_) => return Err(TileWorkerError::Panicked { index }),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lane-owned handle for [`XdpUdpTiles`].
+pub struct XdpUdpTileHandle<C = SourceAddrClassifier>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    inner: DefaultXdpTileHandle<C>,
+}
+
+impl<C> UdpNetworkTileHandle for XdpUdpTileHandle<C>
+where
+    C: IngressClassifier<DefaultXdpRecvMeta, DefaultXdpRxBuffer> + Clone,
+{
+    type Socket = DefaultXdpSocket;
+
+    fn lane_index(&self) -> usize {
+        self.inner.lane_index()
+    }
+
+    fn pop_rx_batch(&self) -> Option<TileRxBatch<Self::Socket>> {
+        self.inner.pop_rx_batch()
+    }
+
+    fn push_tx_batch(
+        &self,
+        batch: TileTxBatch<Self::Socket>,
+    ) -> Result<(), TileTxBatch<Self::Socket>> {
+        self.inner.push_tx_batch(batch)
+    }
+
+    fn alloc_tx_buffers(
+        &mut self,
+        count: usize,
+        out: &mut Vec<TileTxBuffer<Self::Socket>>,
+    ) -> usize {
+        self.inner.alloc_tx_buffers(count, out)
+    }
+
+    fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket> {
+        self.inner.alloc_rx_batch()
+    }
+
+    fn recycle_rx_batch(&self, batch: TileRxBatch<Self::Socket>) {
+        self.inner.recycle_rx_batch(batch);
+    }
+
+    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket> {
+        self.inner.alloc_tx_batch()
+    }
+
+    fn recycle_tx_batch(&self, batch: TileTxBatch<Self::Socket>) {
+        self.inner.recycle_tx_batch(batch);
+    }
+}
+
+/// Failure reported by [`XdpUdpTiles::check_worker_threads`].
+#[derive(Debug)]
+pub enum TileWorkerError {
+    /// A tile worker returned `Ok(())`, which should not happen for the
+    /// long-running tile loop.
+    Exited {
+        /// Tile worker index.
+        index: usize,
+    },
+    /// A tile worker returned a tile error.
+    Failed {
+        /// Tile worker index.
+        index: usize,
+        /// Worker error.
+        error: TileError,
+    },
+    /// A tile worker panicked.
+    Panicked {
+        /// Tile worker index.
+        index: usize,
+    },
+}
+
+impl fmt::Display for TileWorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exited { index } => write!(f, "tile worker {index} exited unexpectedly"),
+            Self::Failed { index, error } => write!(f, "tile worker {index} failed: {error}"),
+            Self::Panicked { index } => write!(f, "tile worker {index} panicked"),
+        }
+    }
+}
+
+impl std::error::Error for TileWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed { error, .. } => Some(error),
+            _ => None,
+        }
     }
 }
 

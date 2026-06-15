@@ -115,6 +115,7 @@ pub struct XdpIpPacketSocket<D = BusyPollDriver> {
 pub struct XdpUdpSocket<D = BusyPollDriver, R = XdpQueueLocalRouter> {
     ip: XdpIpPacketSocket<D>,
     local_addr: SocketAddrV4,
+    accepted_ports: XdpUdpAcceptedPorts,
     router: R,
     ttl: u8,
 }
@@ -257,6 +258,7 @@ where
 struct XdpUdpTxContext {
     destination: SocketAddr,
     source_ip: Option<IpAddr>,
+    source_port: Option<u16>,
     ecn: Option<fast_socket_rs::EcnCodepoint>,
     gso_segment_size: Option<core::num::NonZeroU16>,
 }
@@ -1523,10 +1525,28 @@ impl XdpUdpSocket<BusyPollDriver, XdpQueueLocalRouter> {
         queues: &[QueueId],
         local_addr: SocketAddrV4,
     ) -> std::io::Result<Vec<Self>> {
+        Self::open_shared_busy_poll_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::single(local_addr.port()),
+        )
+    }
+
+    pub(crate) fn open_shared_busy_poll_accepting(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        accepted_ports: XdpUdpAcceptedPorts,
+    ) -> std::io::Result<Vec<Self>> {
         let snapshot = config.route_snapshot.clone();
-        Self::open_shared_busy_poll_with(config, queues, local_addr, move || {
-            XdpQueueLocalRouter::new(snapshot.clone())
-        })
+        Self::open_shared_busy_poll_with_accepting(
+            config,
+            queues,
+            local_addr,
+            accepted_ports,
+            move || XdpQueueLocalRouter::new(snapshot.clone()),
+        )
     }
 }
 
@@ -1538,26 +1558,49 @@ impl<R> XdpUdpSocket<BusyPollDriver, R> {
         config: XdpIpPacketSocketConfig,
         queues: &[QueueId],
         local_addr: SocketAddrV4,
+        make_router: impl FnMut() -> R,
+    ) -> std::io::Result<Vec<Self>> {
+        Self::open_shared_busy_poll_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::single(local_addr.port()),
+            make_router,
+        )
+    }
+
+    pub(crate) fn open_shared_busy_poll_with_accepting(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        accepted_ports: XdpUdpAcceptedPorts,
         mut make_router: impl FnMut() -> R,
     ) -> std::io::Result<Vec<Self>> {
         let ip_members = XdpIpPacketSocket::open_shared_busy_poll(config, queues)?;
         let mut sockets = Vec::with_capacity(ip_members.len());
         for ip in ip_members {
-            sockets.push(Self::from_ip_socket(ip, local_addr, make_router()));
+            sockets.push(Self::from_ip_socket_accepting(
+                ip,
+                local_addr,
+                accepted_ports.clone(),
+                make_router(),
+            ));
         }
         Ok(sockets)
     }
 }
 
 impl<D, R> XdpUdpSocket<D, R> {
-    pub(crate) fn from_ip_socket(
+    pub(crate) fn from_ip_socket_accepting(
         ip: XdpIpPacketSocket<D>,
         local_addr: SocketAddrV4,
+        accepted_ports: XdpUdpAcceptedPorts,
         router: R,
     ) -> Self {
         Self {
             ip,
             local_addr,
+            accepted_ports,
             router,
             ttl: 64,
         }
@@ -1934,7 +1977,9 @@ where
                 .stats
                 .rx_bytes
                 .saturating_add(ip_receive.packet.len() as u64);
-            let Some(udp) = parse_xdp_udp_receive(self.local_addr, ip_receive)? else {
+            let Some(udp) =
+                parse_xdp_udp_receive(self.local_addr, &self.accepted_ports, ip_receive)?
+            else {
                 continue;
             };
             out.push(udp).map_err(|_| Error::BatchFull)?;
@@ -1962,6 +2007,7 @@ where
         }
 
         let local_addr = self.local_addr;
+        let accepted_ports = &self.accepted_ports;
         let mut delivered = 0;
         let rx_reclaim = Rc::clone(&live.rx_reclaim);
         let mut idx = 0;
@@ -1997,7 +2043,7 @@ where
             // real interface address as the L3 destination.
             let local_ip = *local_addr.ip();
             let dest_matches = local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
-            if !dest_matches || parsed.destination_port != local_addr.port() {
+            if !dest_matches || !accepted_ports.accepts(parsed.destination_port) {
                 rx_reclaim.push(frame_addr);
                 continue;
             }
@@ -2016,6 +2062,7 @@ where
                 UdpRecvMeta {
                     source: SocketAddrV4::new(parsed.source, parsed.source_port).into(),
                     destination: Some(IpAddr::V4(parsed.destination)),
+                    destination_port: Some(parsed.destination_port),
                     ecn: parsed.ecn,
                     len: parsed.payload_len,
                     gro_stride: None,
@@ -2331,6 +2378,45 @@ struct ParsedEthernetIpv4Udp {
     ecn: Option<fast_socket_rs::EcnCodepoint>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum XdpUdpAcceptedPorts {
+    Single(u16),
+    Ports(Vec<u16>),
+    Range { start: u16, end: u16 },
+}
+
+impl XdpUdpAcceptedPorts {
+    pub(crate) const fn single(port: u16) -> Self {
+        Self::Single(port)
+    }
+
+    pub(crate) fn ports(mut ports: Vec<u16>) -> Self {
+        assert!(
+            !ports.is_empty(),
+            "XDP UDP accepted port list must not be empty"
+        );
+        ports.sort_unstable();
+        ports.dedup();
+        Self::Ports(ports)
+    }
+
+    pub(crate) fn range(start: u16, end: u16) -> Self {
+        assert!(
+            start <= end,
+            "XDP UDP accepted port range start must be <= end",
+        );
+        Self::Range { start, end }
+    }
+
+    fn accepts(&self, port: u16) -> bool {
+        match self {
+            Self::Single(accepted) => port == *accepted,
+            Self::Ports(ports) => ports.binary_search(&port).is_ok(),
+            Self::Range { start, end } => (*start..=*end).contains(&port),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UdpParse<T> {
     Udp(T),
@@ -2425,7 +2511,7 @@ fn prepare_xdp_udp_transmit_in_place(
     write_ipv4_udp_headers(
         &mut headers,
         Ipv4UdpHeaderFields {
-            source_port: local_addr.port(),
+            source_port: tx.source_port.unwrap_or_else(|| local_addr.port()),
             destination_port: destination.port(),
             source: source_ip,
             destination: *destination.ip(),
@@ -2459,6 +2545,7 @@ fn build_xdp_udp_transmit(
     let context = XdpUdpTxContext {
         destination: tx.destination,
         source_ip: tx.source_ip,
+        source_port: tx.source_port,
         ecn: tx.ecn,
         gso_segment_size: tx.gso_segment_size,
     };
@@ -2498,7 +2585,7 @@ fn build_xdp_udp_transmit(
     write_ipv4_udp_headers(
         &mut headers,
         Ipv4UdpHeaderFields {
-            source_port: local_addr.port(),
+            source_port: tx.source_port.unwrap_or_else(|| local_addr.port()),
             destination_port: destination.port(),
             source: source_ip,
             destination: *destination.ip(),
@@ -2548,6 +2635,7 @@ fn tx_from_xdp_udp_context(
         packet,
         destination: context.destination,
         source_ip: context.source_ip,
+        source_port: context.source_port,
         ecn: context.ecn,
         gso_segment_size: context.gso_segment_size,
     }
@@ -2572,6 +2660,7 @@ fn reclaim_completed_xdp_frame(
 #[cfg(test)]
 fn parse_xdp_udp_receive(
     local_addr: SocketAddrV4,
+    accepted_ports: &XdpUdpAcceptedPorts,
     mut ip: IpPacketReceive<XdpPacketBufMut, XdpIpPacketRecvMeta>,
 ) -> Result<Option<UdpReceive<XdpPacketBufMut, UdpRecvMeta>>, Error> {
     let Some(parsed) = parse_ipv4_udp(ip.packet.as_slice()) else {
@@ -2582,7 +2671,7 @@ fn parse_xdp_udp_receive(
     // or any IP when the socket is bound on 0.0.0.0.
     let local_ip = *local_addr.ip();
     let dest_matches = local_ip == Ipv4Addr::UNSPECIFIED || parsed.destination == local_ip;
-    if !dest_matches || parsed.destination_port != local_addr.port() {
+    if !dest_matches || !accepted_ports.accepts(parsed.destination_port) {
         return Ok(None);
     }
 
@@ -2602,6 +2691,7 @@ fn parse_xdp_udp_receive(
         UdpRecvMeta {
             source: SocketAddrV4::new(parsed.source, parsed.source_port).into(),
             destination: Some(IpAddr::V4(parsed.destination)),
+            destination_port: Some(parsed.destination_port),
             ecn: parsed.ecn,
             len: parsed.payload_len,
             gro_stride: None,
@@ -3286,6 +3376,33 @@ mod tests {
     }
 
     #[test]
+    fn xdp_udp_socket_uses_explicit_source_port_on_send() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                Ipv4Addr::new(192, 0, 2, 1),
+                egress().dst_mac,
+                egress().src_mac,
+            ))
+            .open_busy_poll_test();
+        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        packet.extend_from_slice(b"hello").unwrap();
+        let mut tx = UdpTransmit::new(packet.freeze(), remote.into());
+        tx.source_port = Some(9015);
+        let mut batch = [TxSlot::Ready(tx)];
+
+        assert_eq!(socket.send(&mut batch).unwrap(), 1);
+
+        let frame = socket.ip.pending_tx_frame(0).unwrap();
+        let ip = &frame[ETHERNET_HEADER_LEN..];
+        assert_eq!(u16::from_be_bytes([ip[20], ip[21]]), 9015);
+        assert_eq!(u16::from_be_bytes([ip[22], ip[23]]), remote.port());
+    }
+
+    #[test]
     fn xdp_udp_socket_resolves_route_and_arp_from_local_cache_on_send() {
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
@@ -3380,10 +3497,39 @@ mod tests {
         assert_eq!(item.packet.as_slice(), b"pong");
         assert_eq!(item.meta.source, remote.into());
         assert_eq!(item.meta.destination, Some(IpAddr::V4(*local.ip())));
+        assert_eq!(item.meta.destination_port, Some(local.port()));
         assert_eq!(item.meta.len, 4);
         let stats = fast_socket_rs::RawDevice::stats(&socket, QueueId::new(0));
         assert_eq!(stats.rx_packets, 1);
         assert_eq!(stats.rx_bytes, 32);
+    }
+
+    #[test]
+    fn xdp_udp_socket_accepts_configured_udp_port_list() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .udp_ports([9000, 9002])
+            .open_busy_poll_test();
+
+        let accepted = ipv4_udp_packet(*remote.ip(), *local.ip(), remote.port(), 9002, b"ok");
+        let dropped = ipv4_udp_packet(*remote.ip(), *local.ip(), remote.port(), 9003, b"no");
+        assert!(
+            socket
+                .ip
+                .push_received_ethernet_frame(&ethernet_frame(&accepted))
+        );
+        assert!(
+            socket
+                .ip
+                .push_received_ethernet_frame(&ethernet_frame(&dropped))
+        );
+
+        let mut out = RecvBatch::with_capacity(2);
+        assert_eq!(socket.recv(&mut out).unwrap(), 1);
+        let item = &out.as_slice()[0];
+        assert_eq!(item.packet.as_slice(), b"ok");
+        assert_eq!(item.meta.destination_port, Some(9002));
     }
 
     #[test]

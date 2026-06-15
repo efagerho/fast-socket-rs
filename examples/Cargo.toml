@@ -28,3 +28,7 @@ path = "src/bin/custom-router.rs"
 [[bin]]
 name = "tile-blast"
 path = "src/bin/tile-blast.rs"
+
+[[bin]]
+name = "tile-pong-server"
+path = "src/bin/tile-pong-server.rs"

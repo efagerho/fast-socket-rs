@@ -29,6 +29,8 @@ pub struct UdpRecvMeta {
     pub source: SocketAddr,
     /// Local destination IP when available.
     pub destination: Option<IpAddr>,
+    /// Local destination port when available.
+    pub destination_port: Option<u16>,
     /// ECN codepoint when available.
     pub ecn: Option<EcnCodepoint>,
     /// UDP payload length in bytes.
@@ -63,6 +65,8 @@ pub struct UdpTransmit<B> {
     pub destination: SocketAddr,
     /// Optional source IP selection.
     pub source_ip: Option<IpAddr>,
+    /// Optional source UDP port selection.
+    pub source_port: Option<u16>,
     /// Optional ECN codepoint.
     pub ecn: Option<EcnCodepoint>,
     /// Optional UDP segmentation size.
@@ -77,6 +81,7 @@ impl<B> UdpTransmit<B> {
             packet,
             destination,
             source_ip: None,
+            source_port: None,
             ecn: None,
             gso_segment_size: None,
         }

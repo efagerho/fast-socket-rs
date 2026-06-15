@@ -22,7 +22,9 @@ use fast_socket_rs::{
 };
 
 use crate::config::XdpIpPacketSocketConfig;
-use crate::socket::{XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpRouter, XdpUdpSocket};
+use crate::socket::{
+    XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpAcceptedPorts, XdpUdpRouter, XdpUdpSocket,
+};
 
 /// One logical AF_XDP IP-packet socket fed by 1..N NIC queues.
 pub struct XdpIpPacketAggregate<D> {
@@ -212,6 +214,39 @@ impl XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter> {
             config, queues, local_addr,
         )?)
     }
+
+    /// Opens one busy-poll UDP aggregate accepting the given UDP destination
+    /// ports in the userspace UDP parser.
+    pub fn open_busy_poll_accepting_ports(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        ports: impl IntoIterator<Item = u16>,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::ports(ports.into_iter().collect()),
+        )?)
+    }
+
+    /// Opens one busy-poll UDP aggregate accepting an inclusive UDP destination
+    /// port range in the userspace UDP parser.
+    pub fn open_busy_poll_accepting_port_range(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        start: u16,
+        end: u16,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::range(start, end),
+        )?)
+    }
 }
 
 impl<R> XdpUdpAggregate<BusyPollDriver, R> {
@@ -228,6 +263,43 @@ impl<R> XdpUdpAggregate<BusyPollDriver, R> {
             config,
             queues,
             local_addr,
+            make_router,
+        )?)
+    }
+
+    /// Opens one busy-poll UDP aggregate with a custom router while accepting
+    /// the given UDP destination ports in the userspace UDP parser.
+    pub fn open_busy_poll_with_accepting_ports(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        ports: impl IntoIterator<Item = u16>,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::ports(ports.into_iter().collect()),
+            make_router,
+        )?)
+    }
+
+    /// Opens one busy-poll UDP aggregate with a custom router while accepting an
+    /// inclusive UDP destination port range in the userspace UDP parser.
+    pub fn open_busy_poll_with_accepting_port_range(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        start: u16,
+        end: u16,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::range(start, end),
             make_router,
         )?)
     }

@@ -34,7 +34,7 @@ use crate::interface::{
     XdpQueueSlot, cpu_for_xdp_queue, cpus_for_numa_node, if_index_to_name, if_name_to_index,
     numa_node_for_interface, online_numa_nodes, xdp_queue_slots_for_interface,
 };
-use crate::program::{AttachMode, XdpProgramHandle};
+use crate::program::{AttachMode, XdpProgramConfig, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
 use crate::route::RouteSnapshot;
 use crate::socket::XdpQueueLocalRouter;
@@ -67,6 +67,42 @@ pub enum PortFilter {
     AllIp,
     /// Redirect UDP traffic for this set of destination ports.
     UdpPorts(Vec<u16>),
+    /// Redirect UDP traffic for this inclusive destination-port range.
+    UdpPortRange {
+        /// Inclusive first UDP destination port.
+        start: u16,
+        /// Inclusive last UDP destination port.
+        end: u16,
+    },
+}
+
+impl PortFilter {
+    fn validate(&self) -> io::Result<()> {
+        match self {
+            Self::AllIp => Ok(()),
+            Self::UdpPorts(ports) if ports.is_empty() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP port filter must include at least one port",
+            )),
+            Self::UdpPorts(_) => Ok(()),
+            Self::UdpPortRange { start, end } if start > end => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid UDP port range {start}..={end}: start is greater than end"),
+            )),
+            Self::UdpPortRange { start: 0, end: 0 } => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid UDP port range 0..=0: the XDP program treats it as disabled",
+            )),
+            Self::UdpPortRange { .. } => Ok(()),
+        }
+    }
+
+    fn program_config(&self) -> XdpProgramConfig {
+        match self {
+            Self::UdpPortRange { start, end } => XdpProgramConfig::port_range(*start, *end),
+            Self::AllIp | Self::UdpPorts(_) => XdpProgramConfig::bound_ports(),
+        }
+    }
 }
 
 /// User strategy for choosing a worker's core: given the worker's NUMA node,
@@ -177,6 +213,20 @@ impl XdpFactoryBuilder {
     #[must_use]
     pub fn port_filter(mut self, filter: PortFilter) -> Self {
         self.port_filter = filter;
+        self
+    }
+
+    /// Redirects UDP traffic for the provided destination ports.
+    #[must_use]
+    pub fn udp_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.port_filter = PortFilter::UdpPorts(ports.into_iter().collect());
+        self
+    }
+
+    /// Redirects UDP traffic whose destination port is in the inclusive range.
+    #[must_use]
+    pub fn udp_port_range(mut self, start: u16, end: u16) -> Self {
+        self.port_filter = PortFilter::UdpPortRange { start, end };
         self
     }
 
@@ -324,6 +374,7 @@ impl XdpFactoryBuilder {
     /// claimed queues span, if a node's queue count is not divisible by its
     /// share of threads, or if a resulting block would span interfaces.
     pub fn build(self) -> io::Result<XdpFactory> {
+        self.port_filter.validate()?;
         let claimed = self.claimed_slots_checked()?;
         if claimed.is_empty() {
             return Err(io::Error::new(
@@ -343,12 +394,14 @@ impl XdpFactoryBuilder {
         // Attach one program per distinct interface index among the claimed
         // queues (bond masters fan out to slave ifindexes).
         let mut programs: BTreeMap<IfIndex, XdpProgramHandle> = BTreeMap::new();
+        let program_config = self.port_filter.program_config();
         for slot in &claimed {
             if let std::collections::btree_map::Entry::Vacant(entry) = programs.entry(slot.ifindex)
             {
-                entry.insert(XdpProgramHandle::load(
+                entry.insert(XdpProgramHandle::load_with_config(
                     slot.ifindex.get(),
                     self.attach_mode,
+                    program_config,
                     None,
                 )?);
             }
@@ -468,6 +521,7 @@ impl XdpFactoryBuilder {
                     ifindex,
                     queues,
                     config,
+                    port_filter: self.port_filter.clone(),
                 });
             }
         }
@@ -533,6 +587,7 @@ pub struct XdpWorkerPlan {
     ifindex: IfIndex,
     queues: Vec<QueueId>,
     config: XdpIpPacketSocketConfig,
+    port_filter: PortFilter,
 }
 
 impl XdpWorkerPlan {
@@ -560,6 +615,7 @@ impl XdpWorkerPlan {
             ifindex: config.ifindex,
             queues,
             config,
+            port_filter: PortFilter::AllIp,
         }
     }
 
@@ -609,8 +665,26 @@ impl XdpWorkerPlan {
         local: SocketAddrV4,
     ) -> io::Result<XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter>> {
         let mut config = self.config;
-        config.bind_udp_port = Some(local.port());
-        XdpUdpAggregate::open_busy_poll(config, &self.queues, local)
+        match self.port_filter {
+            PortFilter::AllIp => {
+                config.bind_udp_port = Some(local.port());
+                XdpUdpAggregate::open_busy_poll(config, &self.queues, local)
+            }
+            PortFilter::UdpPorts(ports) => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_busy_poll_accepting_ports(config, &self.queues, local, ports)
+            }
+            PortFilter::UdpPortRange { start, end } => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_busy_poll_accepting_port_range(
+                    config,
+                    &self.queues,
+                    local,
+                    start,
+                    end,
+                )
+            }
+        }
     }
 
     /// Opens this worker's UDP aggregate with a caller-supplied
@@ -624,8 +698,33 @@ impl XdpWorkerPlan {
     ) -> io::Result<XdpUdpAggregate<BusyPollDriver, R>> {
         pin_current_thread_to_cpu(self.cpu)?;
         let mut config = self.config;
-        config.bind_udp_port = Some(local.port());
-        XdpUdpAggregate::open_busy_poll_with(config, &self.queues, local, make_router)
+        match self.port_filter {
+            PortFilter::AllIp => {
+                config.bind_udp_port = Some(local.port());
+                XdpUdpAggregate::open_busy_poll_with(config, &self.queues, local, make_router)
+            }
+            PortFilter::UdpPorts(ports) => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_busy_poll_with_accepting_ports(
+                    config,
+                    &self.queues,
+                    local,
+                    ports,
+                    make_router,
+                )
+            }
+            PortFilter::UdpPortRange { start, end } => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_busy_poll_with_accepting_port_range(
+                    config,
+                    &self.queues,
+                    local,
+                    start,
+                    end,
+                    make_router,
+                )
+            }
+        }
     }
 
     /// Opens this worker's IP-packet aggregate, pinning the current thread to

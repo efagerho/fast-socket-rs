@@ -372,6 +372,8 @@ pub struct TileTxPacket<S: UdpSocket> {
     source_socket: SocketIndex,
     /// Optional source IP selection.
     pub source_ip: Option<IpAddr>,
+    /// Optional source UDP port selection.
+    pub source_port: Option<u16>,
     /// Optional ECN codepoint.
     pub ecn: Option<EcnCodepoint>,
     /// Optional UDP segmentation size.
@@ -389,6 +391,7 @@ impl<S: UdpSocket> TileTxPacket<S> {
             destination,
             source_socket,
             source_ip: None,
+            source_port: None,
             ecn: None,
             gso_segment_size: None,
         }
@@ -417,6 +420,7 @@ impl<S: UdpSocket> TileTxPacket<S> {
             packet: self.packet,
             destination: self.destination,
             source_ip: self.source_ip,
+            source_port: self.source_port,
             ecn: self.ecn,
             gso_segment_size: self.gso_segment_size,
         }
@@ -922,6 +926,7 @@ mod tests {
         let meta = UdpRecvMeta {
             source: "192.0.2.1:4433".parse().unwrap(),
             destination: None,
+            destination_port: None,
             ecn: None,
             len: 0,
             gro_stride: None,

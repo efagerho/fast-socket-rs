@@ -3,6 +3,7 @@
 use core::num::NonZeroUsize;
 use std::io;
 use std::net::SocketAddrV4;
+use std::ops::RangeInclusive;
 
 use fast_socket_rs::{BufferLayout, HugePageSize, IfIndex, NumaNode, QueueBufferConfig, QueueId};
 
@@ -11,7 +12,8 @@ use crate::raw_socket::{RingSizes, XdpMode};
 use crate::route::RouteSnapshot;
 use crate::socket::{
     BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
-    ReadinessXdpUdpSocket, XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpRouter, XdpUdpSocket,
+    ReadinessXdpUdpSocket, XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpAcceptedPorts,
+    XdpUdpRouter, XdpUdpSocket,
 };
 
 /// Configuration for one AF_XDP queue socket.
@@ -96,6 +98,7 @@ pub struct XdpIpPacketSocketBuilder {
 pub struct XdpUdpSocketBuilder<R = XdpQueueLocalRouter> {
     config: XdpIpPacketSocketConfig,
     local_addr: SocketAddrV4,
+    accepted_ports: XdpUdpAcceptedPorts,
     router: R,
 }
 
@@ -186,7 +189,7 @@ impl XdpIpPacketSocketBuilder {
     /// `BOUND_PORTS` map. The bundled program uses this to pass unrelated IP
     /// traffic back to the kernel while UDP sockets are bound.
     #[must_use]
-    pub const fn bind_udp_port(mut self, port: u16) -> Self {
+    pub fn bind_udp_port(mut self, port: u16) -> Self {
         self.config.bind_udp_port = Some(port);
         self
     }
@@ -235,6 +238,7 @@ impl XdpUdpSocketBuilder<XdpQueueLocalRouter> {
                 ..XdpIpPacketSocketConfig::default()
             },
             local_addr,
+            accepted_ports: XdpUdpAcceptedPorts::single(local_addr.port()),
             router: XdpQueueLocalRouter::default(),
         }
     }
@@ -321,8 +325,9 @@ impl<R> XdpUdpSocketBuilder<R> {
 
     /// Sets the UDP destination port used by UDP-filtered redirect programs.
     #[must_use]
-    pub const fn bind_udp_port(mut self, port: u16) -> Self {
+    pub fn bind_udp_port(mut self, port: u16) -> Self {
         self.config.bind_udp_port = Some(port);
+        self.accepted_ports = XdpUdpAcceptedPorts::single(port);
         self
     }
 
@@ -333,12 +338,35 @@ impl<R> XdpUdpSocketBuilder<R> {
         self
     }
 
+    /// Accepts UDP packets for the given destination ports in userspace.
+    ///
+    /// This controls the socket's UDP parser. The XDP program must also be
+    /// configured to redirect the same ports for live traffic to reach the
+    /// socket.
+    #[must_use]
+    pub fn udp_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.accepted_ports = XdpUdpAcceptedPorts::ports(ports.into_iter().collect());
+        self
+    }
+
+    /// Accepts UDP packets whose destination port is in `range`.
+    ///
+    /// This controls the socket's UDP parser. The XDP program must also be
+    /// configured to redirect the same range for live traffic to reach the
+    /// socket.
+    #[must_use]
+    pub fn udp_port_range(mut self, range: RangeInclusive<u16>) -> Self {
+        self.accepted_ports = XdpUdpAcceptedPorts::range(*range.start(), *range.end());
+        self
+    }
+
     /// Uses a custom UDP egress router.
     #[must_use]
     pub fn router<N>(self, router: N) -> XdpUdpSocketBuilder<N> {
         XdpUdpSocketBuilder {
             config: self.config,
             local_addr: self.local_addr,
+            accepted_ports: self.accepted_ports,
             router,
         }
     }
@@ -353,7 +381,12 @@ impl<R> XdpUdpSocketBuilder<R> {
         R: XdpUdpRouter,
     {
         let ip = XdpIpPacketSocket::new_busy_poll_test(self.config);
-        XdpUdpSocket::from_ip_socket(ip, self.local_addr, self.router)
+        XdpUdpSocket::from_ip_socket_accepting(
+            ip,
+            self.local_addr,
+            self.accepted_ports,
+            self.router,
+        )
     }
 
     /// Builds a busy-poll AF_XDP UDP socket.
@@ -362,9 +395,10 @@ impl<R> XdpUdpSocketBuilder<R> {
         R: XdpUdpRouter,
     {
         let ip = XdpIpPacketSocket::new_busy_poll(self.config)?;
-        Ok(XdpUdpSocket::from_ip_socket(
+        Ok(XdpUdpSocket::from_ip_socket_accepting(
             ip,
             self.local_addr,
+            self.accepted_ports,
             self.router,
         ))
     }
@@ -375,9 +409,10 @@ impl<R> XdpUdpSocketBuilder<R> {
         R: XdpUdpRouter,
     {
         let ip = XdpIpPacketSocket::new_readiness(self.config)?;
-        Ok(XdpUdpSocket::from_ip_socket(
+        Ok(XdpUdpSocket::from_ip_socket_accepting(
             ip,
             self.local_addr,
+            self.accepted_ports,
             self.router,
         ))
     }
