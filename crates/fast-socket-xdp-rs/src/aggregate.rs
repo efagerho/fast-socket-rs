@@ -6,14 +6,12 @@
 //! are the proven N=1 building blocks; the aggregate adds round-robin fan-in on
 //! receive and round-robin spread on transmit.
 //!
-//! Members share one UMEM (allocated and registered once) but each owns a
-//! disjoint frame slice and its own rings and reclaim pools. A buffer received
-//! on (or allocated from) one member must therefore be transmitted on that same
-//! member — its frame belongs to that member's slice, and the member's
-//! COMPLETION ring routes it back to that member's pool (the per-queue
-//! reflect/forward model). Receive fan-in (e.g. counting) freely mixes members
-//! because received buffers are only read before being returned to their own
-//! member's pool.
+//! Members opened by the aggregate constructors share one UMEM (allocated and
+//! registered once) while each member owns separate RX/TX/FILL/COMPLETION
+//! rings. Frame addresses are UMEM-relative, so a buffer from one member can be
+//! submitted through another member's TX ring as long as no frame is in flight
+//! on more than one ring at a time; the completing member reclaims the frame
+//! into its local RX or TX pool according to the shared UMEM frame layout.
 
 use std::io;
 use std::net::SocketAddrV4;
@@ -30,6 +28,7 @@ use crate::socket::{XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpRouter, XdpUdp
 pub struct XdpIpPacketAggregate<D> {
     members: Vec<XdpIpPacketSocket<D>>,
     rx_rr: usize,
+    shared_umem: bool,
 }
 
 impl<D> XdpIpPacketAggregate<D> {
@@ -43,7 +42,18 @@ impl<D> XdpIpPacketAggregate<D> {
                 "XdpIpPacketAggregate requires at least one member socket",
             ));
         }
-        Ok(Self { members, rx_rr: 0 })
+        Ok(Self {
+            members,
+            rx_rr: 0,
+            shared_umem: false,
+        })
+    }
+
+    fn from_shared_umem_members(members: Vec<XdpIpPacketSocket<D>>) -> io::Result<Self> {
+        Self::from_members(members).map(|mut aggregate| {
+            aggregate.shared_umem = true;
+            aggregate
+        })
     }
 
     /// Number of NIC queues (member sockets) backing this aggregate.
@@ -64,6 +74,12 @@ impl<D> XdpIpPacketAggregate<D> {
     pub fn members_mut(&mut self) -> &mut [XdpIpPacketSocket<D>] {
         &mut self.members
     }
+
+    /// Returns whether this aggregate's members were opened over one shared UMEM.
+    #[must_use]
+    pub const fn members_share_umem(&self) -> bool {
+        self.shared_umem
+    }
 }
 
 impl XdpIpPacketAggregate<BusyPollDriver> {
@@ -72,7 +88,7 @@ impl XdpIpPacketAggregate<BusyPollDriver> {
     /// `config.frame_count` is the per-member frame count. See
     /// [`XdpIpPacketSocket::open_shared_busy_poll`].
     pub fn open_busy_poll(config: XdpIpPacketSocketConfig, queues: &[QueueId]) -> io::Result<Self> {
-        Self::from_members(XdpIpPacketSocket::open_shared_busy_poll(config, queues)?)
+        Self::from_shared_umem_members(XdpIpPacketSocket::open_shared_busy_poll(config, queues)?)
     }
 }
 
@@ -115,6 +131,7 @@ pub struct XdpUdpAggregate<D, R> {
     members: Vec<XdpUdpSocket<D, R>>,
     rx_rr: usize,
     tx_rr: usize,
+    shared_umem: bool,
 }
 
 impl<D, R> XdpUdpAggregate<D, R> {
@@ -132,6 +149,14 @@ impl<D, R> XdpUdpAggregate<D, R> {
             members,
             rx_rr: 0,
             tx_rr: 0,
+            shared_umem: false,
+        })
+    }
+
+    fn from_shared_umem_members(members: Vec<XdpUdpSocket<D, R>>) -> io::Result<Self> {
+        Self::from_members(members).map(|mut aggregate| {
+            aggregate.shared_umem = true;
+            aggregate
         })
     }
 
@@ -153,13 +178,19 @@ impl<D, R> XdpUdpAggregate<D, R> {
         &mut self.members
     }
 
+    /// Returns whether this aggregate's members were opened over one shared UMEM.
+    #[must_use]
+    pub const fn members_share_umem(&self) -> bool {
+        self.shared_umem
+    }
+
     /// Returns the next member in round-robin order for transmit.
     ///
-    /// Allocate and send on the *same* returned member: members share one UMEM
-    /// but each owns a disjoint frame slice, so a buffer's frame belongs to the
-    /// member it came from and must be transmitted (and completed) there.
     /// Back-to-back calls rotate across queues, spreading TX so no single NIC TX
-    /// ring is hot.
+    /// ring is hot. Aggregates opened by this crate's shared-UMEM constructors
+    /// may submit any member's UMEM-backed buffer through the returned member;
+    /// aggregates assembled with [`Self::from_members`] should allocate and send
+    /// on the same member unless the caller knows those members share a UMEM.
     #[must_use]
     pub fn next_tx_member(&mut self) -> &mut XdpUdpSocket<D, R> {
         let index = self.tx_rr % self.members.len();
@@ -177,7 +208,7 @@ impl XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter> {
         queues: &[QueueId],
         local_addr: SocketAddrV4,
     ) -> io::Result<Self> {
-        Self::from_members(XdpUdpSocket::open_shared_busy_poll(
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll(
             config, queues, local_addr,
         )?)
     }
@@ -193,7 +224,7 @@ impl<R> XdpUdpAggregate<BusyPollDriver, R> {
         local_addr: SocketAddrV4,
         make_router: impl FnMut() -> R,
     ) -> io::Result<Self> {
-        Self::from_members(XdpUdpSocket::open_shared_busy_poll_with(
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_with(
             config,
             queues,
             local_addr,

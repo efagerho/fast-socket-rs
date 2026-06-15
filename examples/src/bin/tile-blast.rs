@@ -15,8 +15,9 @@ use common::{
 };
 use fast_socket_rs::{BusyPollDriver, PacketBufferMut, QueueId};
 use fast_socket_udp_tile::{
-    AcceptAllClassifier, Spin, TileError, UdpNetworkTile, UdpSocketSet, UdpTile,
+    AcceptAllClassifier, TileError, TileRxQueue, TileTxQueue, UdpNetworkTile,
 };
+use fast_socket_udp_tile_xdp::{Spin, UdpSocketSet, UdpTile};
 use fast_socket_xdp_rs::{
     InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpQueueLocalRouter,
     XdpRouteMonitor, XdpRouteMonitorHandle, XdpUdpAggregate, XdpUdpSocket,
@@ -77,6 +78,10 @@ impl UdpSocketSet for MonitoredXdpAggregate {
 
     fn sockets_mut(&mut self) -> &mut [Self::Socket] {
         self.aggregate.members_mut()
+    }
+
+    fn can_transmit_from_any_socket(&self) -> bool {
+        self.aggregate.members_share_umem()
     }
 }
 
@@ -284,15 +289,22 @@ fn run_lane(
             progressed = true;
             let base_sequence = next_sequence.fetch_add(allocated as u64, Ordering::Relaxed);
             let queue = &tile.tx_queues()[lane_index];
+            let mut batch = tile.alloc_tx_batch();
 
             for (offset, mut buffer) in tx_buffers.drain(..).enumerate() {
                 write_sequence(&mut payload_bytes, base_sequence + offset as u64);
                 buffer
                     .extend_from_slice(&payload_bytes)
                     .map_err(|error| error.to_string())?;
-                match queue.push(buffer.freeze(target)) {
-                    Ok(()) => local_queued += 1,
-                    Err(_) => local_dropped += 1,
+                batch.push(buffer.freeze(target));
+            }
+
+            let batch_len = batch.len() as u64;
+            match queue.push_batch(batch) {
+                Ok(()) => local_queued += batch_len,
+                Err(batch) => {
+                    local_dropped += batch.len() as u64;
+                    tile.recycle_tx_batch(batch);
                 }
             }
         }
@@ -320,7 +332,9 @@ fn run_lane(
 }
 
 fn drain_lane_rx(tile: &XdpTile, lane_index: usize) {
-    while tile.rx_queues()[lane_index].pop().is_some() {}
+    while let Some(batch) = tile.rx_queues()[lane_index].pop_batch() {
+        tile.recycle_rx_batch(batch);
+    }
 }
 
 fn check_tile_threads(

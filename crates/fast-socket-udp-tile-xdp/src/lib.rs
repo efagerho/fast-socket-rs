@@ -1,0 +1,620 @@
+//! AF_XDP UDP network-tile orchestration.
+//!
+//! A tile owns one worker thread and one or more UDP sockets. It receives
+//! packets from those sockets, classifies each ingress packet into a lane RX
+//! queue, and drains lane TX queues back to the socket that owns each packet's
+//! buffer.
+
+#![deny(missing_docs)]
+
+mod queue;
+
+use std::marker::PhantomData;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+
+use crossbeam_queue::ArrayQueue;
+use fast_socket_rs::{
+    RecvBatch, TxSlot, UdpReceive, UdpRxBuffer, UdpSocket, UdpTransmit, UdpTxBuffer,
+    UdpTxBufferMut, pin_current_thread_to_affinity,
+};
+use fast_socket_udp_tile::validate_socket_affinity;
+pub use fast_socket_udp_tile::{
+    AcceptAllClassifier, IngressClassifier, IngressDecision, SocketIndex, SourceAddrClassifier,
+    TileConfig, TileError, TileRxBatch, TileRxPacket, TileRxQueue, TileStats, TileTxBatch,
+    TileTxBuffer, TileTxPacket, TileTxQueue, UdpNetworkTile,
+};
+
+pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty};
+
+/// Shorthand for a tile-to-lane ingress queue.
+pub type RxQueue<S, W> = Arc<Queue<TileRxBatch<S>, W>>;
+
+/// Shorthand for a lane-to-tile egress queue.
+pub type TxQueue<S, W> = Arc<Queue<TileTxBatch<S>, W>>;
+
+impl<S, W> TileRxQueue<S> for Queue<TileRxBatch<S>, W>
+where
+    S: UdpSocket + 'static,
+    S::RecvMeta: Send + 'static,
+    W: WaitStrategy,
+{
+    fn pop_batch(&self) -> Option<TileRxBatch<S>> {
+        Queue::pop(self)
+    }
+}
+
+impl<S, W> TileTxQueue<S> for Queue<TileTxBatch<S>, W>
+where
+    S: UdpSocket + 'static,
+    W: WaitStrategy,
+{
+    fn push_batch(&self, batch: TileTxBatch<S>) -> Result<(), TileTxBatch<S>> {
+        Queue::push(self, batch)
+    }
+}
+
+/// Mutable set of UDP sockets driven by one tile thread.
+pub trait UdpSocketSet {
+    /// Concrete socket type in this set.
+    type Socket: UdpSocket;
+
+    /// Runs set-local maintenance before each socket pass.
+    ///
+    /// Returns `true` when the maintenance work made observable progress.
+    fn poll_maintenance(&mut self) -> bool {
+        false
+    }
+
+    /// Returns all sockets in stable tile order.
+    fn sockets_mut(&mut self) -> &mut [Self::Socket];
+
+    /// Returns whether a transmit buffer from any member can be submitted
+    /// through any other member's TX ring.
+    fn can_transmit_from_any_socket(&self) -> bool {
+        false
+    }
+}
+
+impl<S: UdpSocket> UdpSocketSet for Vec<S> {
+    type Socket = S;
+
+    fn sockets_mut(&mut self) -> &mut [Self::Socket] {
+        self.as_mut_slice()
+    }
+}
+
+impl<S: UdpSocket, const N: usize> UdpSocketSet for [S; N] {
+    type Socket = S;
+
+    fn sockets_mut(&mut self) -> &mut [Self::Socket] {
+        self.as_mut_slice()
+    }
+}
+
+impl<D, R> UdpSocketSet for fast_socket_xdp_rs::XdpUdpAggregate<D, R>
+where
+    D: fast_socket_rs::PollDriver,
+    R: fast_socket_xdp_rs::XdpUdpRouter,
+{
+    type Socket = fast_socket_xdp_rs::XdpUdpSocket<D, R>;
+
+    fn sockets_mut(&mut self) -> &mut [Self::Socket] {
+        self.members_mut()
+    }
+
+    fn can_transmit_from_any_socket(&self) -> bool {
+        self.members_share_umem()
+    }
+}
+
+/// Default UDP network tile implementation.
+pub struct UdpTile<Set, W, C>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    socket_factory: Mutex<Option<Box<dyn FnOnce() -> Set + Send + 'static>>>,
+    rx_queues: Vec<RxQueue<Set::Socket, W>>,
+    tx_queues: Vec<TxQueue<Set::Socket, W>>,
+    tx_buffer_queue: Arc<ArrayQueue<TileTxBuffer<Set::Socket>>>,
+    rx_batch_pool: Arc<ArrayQueue<TileRxBatch<Set::Socket>>>,
+    tx_batch_pool: Arc<ArrayQueue<TileTxBatch<Set::Socket>>>,
+    classifier_drops: AtomicU64,
+    rx_queue_drops: AtomicU64,
+    tx_drops: AtomicU64,
+    classifier: C,
+    config: TileConfig,
+    _marker: PhantomData<fn() -> (Set, W)>,
+}
+
+impl<Set, W, C> UdpTile<Set, W, C>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    /// Creates a tile with default configuration.
+    #[must_use]
+    pub fn new(
+        factory: impl FnOnce() -> Set + Send + 'static,
+        classifier: C,
+        lane_count: usize,
+    ) -> Self {
+        Self::with_config(factory, classifier, lane_count, TileConfig::default())
+    }
+
+    /// Creates a tile with explicit configuration.
+    #[must_use]
+    pub fn with_config(
+        factory: impl FnOnce() -> Set + Send + 'static,
+        classifier: C,
+        lane_count: usize,
+        config: TileConfig,
+    ) -> Self {
+        assert!(lane_count > 0, "UdpTile requires at least one lane queue");
+        assert!(
+            config.batch_size > 0,
+            "UdpTile batch_size must be at least one",
+        );
+        assert!(
+            config.tx_buffer_queue_capacity > 0,
+            "UdpTile tx_buffer_queue_capacity must be at least one",
+        );
+        assert!(
+            config.tx_buffer_refill_batch > 0,
+            "UdpTile tx_buffer_refill_batch must be at least one",
+        );
+
+        let rx_queue_capacity = rx_queue_capacity(config);
+        let rx_queues = (0..lane_count)
+            .map(|_| Queue::<TileRxBatch<Set::Socket>, W>::new(rx_queue_capacity))
+            .collect();
+        let tx_queue_capacity = tx_queue_capacity(config);
+        let tx_queues = (0..lane_count)
+            .map(|_| Queue::<TileTxBatch<Set::Socket>, W>::new(tx_queue_capacity))
+            .collect();
+        let rx_batch_pool_capacity = rx_queue_capacity
+            .saturating_mul(lane_count)
+            .saturating_add(lane_count)
+            .max(1);
+        let tx_batch_pool_capacity = tx_queue_capacity
+            .saturating_mul(lane_count)
+            .saturating_add(lane_count)
+            .max(1);
+        Self {
+            socket_factory: Mutex::new(Some(Box::new(factory))),
+            rx_queues,
+            tx_queues,
+            tx_buffer_queue: Arc::new(ArrayQueue::new(config.tx_buffer_queue_capacity)),
+            rx_batch_pool: Arc::new(ArrayQueue::new(rx_batch_pool_capacity)),
+            tx_batch_pool: Arc::new(ArrayQueue::new(tx_batch_pool_capacity)),
+            classifier_drops: AtomicU64::new(0),
+            rx_queue_drops: AtomicU64::new(0),
+            tx_drops: AtomicU64::new(0),
+            classifier,
+            config,
+            _marker: PhantomData,
+        }
+    }
+
+    fn record_classifier_drop(&self) {
+        self.classifier_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rx_queue_drop(&self) {
+        self.rx_queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rx_queue_drops(&self, count: usize) {
+        self.rx_queue_drops
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    fn record_tx_drop(&self) {
+        self.tx_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recycle_rx_batch_container(&self, batch: TileRxBatch<Set::Socket>) {
+        self.recycle_rx_batch(batch);
+    }
+
+    fn recycle_tx_batch_container(&self, batch: TileTxBatch<Set::Socket>) {
+        self.recycle_tx_batch(batch);
+    }
+}
+
+fn rx_queue_capacity(config: TileConfig) -> usize {
+    config.queue_capacity.div_ceil(config.batch_size).max(1)
+}
+
+fn tx_queue_capacity(config: TileConfig) -> usize {
+    config.queue_capacity.div_ceil(config.batch_size).max(1)
+}
+
+impl<Set, W, C> UdpNetworkTile for UdpTile<Set, W, C>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    type Socket = Set::Socket;
+    type RxQueue = RxQueue<Set::Socket, W>;
+    type TxQueue = TxQueue<Set::Socket, W>;
+
+    fn alloc_tx_buffers(&self, count: usize, out: &mut Vec<TileTxBuffer<Self::Socket>>) -> usize {
+        let mut allocated = 0usize;
+        for _ in 0..count {
+            let Some(buffer) = self.tx_buffer_queue.pop() else {
+                break;
+            };
+            out.push(buffer);
+            allocated += 1;
+        }
+        allocated
+    }
+
+    fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket> {
+        self.rx_batch_pool
+            .pop()
+            .unwrap_or_else(|| TileRxBatch::with_capacity(self.config.batch_size))
+    }
+
+    fn recycle_rx_batch(&self, mut batch: TileRxBatch<Self::Socket>) {
+        batch.clear();
+        if batch.capacity() < self.config.batch_size {
+            batch.reserve(self.config.batch_size - batch.capacity());
+        }
+        let _ = self.rx_batch_pool.push(batch);
+    }
+
+    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket> {
+        self.tx_batch_pool
+            .pop()
+            .unwrap_or_else(|| TileTxBatch::with_capacity(self.config.batch_size))
+    }
+
+    fn recycle_tx_batch(&self, mut batch: TileTxBatch<Self::Socket>) {
+        batch.clear();
+        if batch.capacity() < self.config.batch_size {
+            batch.reserve(self.config.batch_size - batch.capacity());
+        }
+        let _ = self.tx_batch_pool.push(batch);
+    }
+
+    fn rx_queues(&self) -> &[Self::RxQueue] {
+        &self.rx_queues
+    }
+
+    fn tx_queues(&self) -> &[Self::TxQueue] {
+        &self.tx_queues
+    }
+
+    fn stats(&self) -> TileStats {
+        TileStats {
+            classifier_drops: self.classifier_drops.load(Ordering::Relaxed),
+            rx_queue_drops: self.rx_queue_drops.load(Ordering::Relaxed),
+            tx_drops: self.tx_drops.load(Ordering::Relaxed),
+        }
+    }
+
+    fn start(
+        self: Arc<Self>,
+        tile_index: usize,
+    ) -> Result<JoinHandle<Result<(), TileError>>, TileError> {
+        let factory = self
+            .socket_factory
+            .lock()
+            .map_err(|_| TileError::FactoryPoisoned)?
+            .take()
+            .ok_or(TileError::AlreadyStarted)?;
+
+        thread::Builder::new()
+            .name(format!("fastsock-udp-tile-{tile_index}"))
+            .spawn(move || run_tile(self, factory(), tile_index))
+            .map_err(TileError::Spawn)
+    }
+}
+
+fn run_tile<Set, W, C>(
+    tile: Arc<UdpTile<Set, W, C>>,
+    mut socket_set: Set,
+    _tile_index: usize,
+) -> Result<(), TileError>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    let socket_count = {
+        let sockets = socket_set.sockets_mut();
+        if sockets.is_empty() {
+            return Err(TileError::EmptySocketSet);
+        }
+        if sockets.len() > u16::MAX as usize + 1 {
+            return Err(TileError::TooManySockets {
+                count: sockets.len(),
+            });
+        }
+
+        let affinity = validate_socket_affinity(sockets)?;
+        if tile.config.pin_thread {
+            let _ = pin_current_thread_to_affinity(affinity.as_queue_affinity())
+                .map_err(TileError::Pin)?;
+        }
+        sockets.len()
+    };
+
+    for queue in &tile.tx_queues {
+        queue.register_consumer();
+    }
+
+    let mut rx = RecvBatch::with_capacity(tile.config.batch_size);
+    let mut pending_rx = (0..tile.rx_queues.len())
+        .map(|_| tile.alloc_rx_batch())
+        .collect::<Vec<_>>();
+    let mut tx_alloc_scratch = Vec::with_capacity(tile.config.tx_buffer_refill_batch);
+    let mut pending_tx: Vec<Vec<TxSlot<UdpTransmit<UdpTxBuffer<Set::Socket>>>>> = (0..socket_count)
+        .map(|_| Vec::with_capacity(tile.config.batch_size))
+        .collect();
+    let mut next_tx_socket = 0usize;
+
+    loop {
+        let mut progressed = false;
+
+        progressed |= socket_set.poll_maintenance();
+        progressed |= drain_lane_tx(&tile, &socket_set, &mut pending_tx, &mut next_tx_socket);
+        progressed |= flush_pending_tx(socket_set.sockets_mut(), &mut pending_tx)?;
+        progressed |= drain_socket_completions(socket_set.sockets_mut())?;
+        progressed |= refill_tx_buffers(&tile, socket_set.sockets_mut(), &mut tx_alloc_scratch)?;
+        progressed |= recv_from_sockets(&tile, socket_set.sockets_mut(), &mut rx, &mut pending_rx)?;
+
+        if !progressed {
+            wait_any_non_empty(&tile.tx_queues);
+        }
+    }
+}
+
+fn drain_lane_tx<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    socket_set: &Set,
+    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<Set::Socket>>>>],
+    next_tx_socket: &mut usize,
+) -> bool
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    let mut progressed = false;
+    let can_retarget = socket_set.can_transmit_from_any_socket();
+    for queue in &tile.tx_queues {
+        while let Some(mut batch) = queue.pop() {
+            progressed = true;
+            if can_retarget {
+                drain_retargetable_tx_batch(tile, &mut batch, pending_tx, next_tx_socket);
+            } else {
+                drain_source_local_tx_batch(tile, &mut batch, pending_tx);
+            }
+            tile.recycle_tx_batch_container(batch);
+        }
+    }
+    progressed
+}
+
+fn drain_retargetable_tx_batch<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    batch: &mut TileTxBatch<Set::Socket>,
+    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<Set::Socket>>>>],
+    next_tx_socket: &mut usize,
+) where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    let socket_count = pending_tx.len();
+    let target = choose_next_target_socket(socket_count, next_tx_socket);
+    let Some(bucket) = pending_tx.get_mut(target) else {
+        tile.record_tx_drop();
+        return;
+    };
+
+    for packet in batch.drain() {
+        if usize::from(packet.source_socket.get()) >= socket_count {
+            tile.record_tx_drop();
+            continue;
+        }
+        bucket.push(TxSlot::Ready(packet.into_udp_transmit()));
+    }
+}
+
+fn drain_source_local_tx_batch<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    batch: &mut TileTxBatch<Set::Socket>,
+    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<Set::Socket>>>>],
+) where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    for packet in batch.drain() {
+        let index = usize::from(packet.source_socket.get());
+        let Some(bucket) = pending_tx.get_mut(index) else {
+            tile.record_tx_drop();
+            continue;
+        };
+        bucket.push(TxSlot::Ready(packet.into_udp_transmit()));
+    }
+}
+
+fn choose_next_target_socket(socket_count: usize, next_tx_socket: &mut usize) -> usize {
+    let index = *next_tx_socket % socket_count;
+    *next_tx_socket = (*next_tx_socket).wrapping_add(1);
+    index
+}
+
+fn flush_pending_tx<S>(
+    sockets: &mut [S],
+    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>],
+) -> Result<bool, TileError>
+where
+    S: UdpSocket,
+{
+    let mut progressed = false;
+    for (socket, pending) in sockets.iter_mut().zip(pending_tx.iter_mut()) {
+        while !pending.is_empty() {
+            match socket.send(pending.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(accepted) => {
+                    pending.drain(..accepted);
+                    progressed = true;
+                }
+                Err(error) => {
+                    if error.accepted > 0 {
+                        pending.drain(..error.accepted);
+                    }
+                    return Err(TileError::Send(error));
+                }
+            }
+        }
+    }
+    Ok(progressed)
+}
+
+fn drain_socket_completions<S: UdpSocket>(sockets: &mut [S]) -> Result<bool, TileError> {
+    let mut progressed = false;
+    for socket in sockets {
+        progressed |= socket.drain_tx_completions()? != 0;
+    }
+    Ok(progressed)
+}
+
+fn refill_tx_buffers<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    sockets: &mut [Set::Socket],
+    scratch: &mut Vec<UdpTxBufferMut<Set::Socket>>,
+) -> Result<bool, TileError>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    if tile.tx_buffer_queue.len() >= tile.config.tx_buffer_refill_watermark {
+        return Ok(false);
+    }
+
+    let mut progressed = false;
+    let per_socket = tile
+        .config
+        .tx_buffer_refill_batch
+        .div_ceil(sockets.len())
+        .max(1);
+    for (index, socket) in sockets.iter_mut().enumerate() {
+        if tile.tx_buffer_queue.len() >= tile.config.tx_buffer_queue_capacity {
+            break;
+        }
+        scratch.clear();
+        let allocated = socket.allocate_tx_batch(scratch, per_socket)?;
+        progressed |= allocated != 0;
+        let source_socket = SocketIndex::new(index as u16);
+        for buffer in scratch.drain(..) {
+            if tile
+                .tx_buffer_queue
+                .push(TileTxBuffer::new(source_socket, buffer))
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    Ok(progressed)
+}
+
+fn recv_from_sockets<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    sockets: &mut [Set::Socket],
+    rx: &mut RecvBatch<UdpReceive<UdpRxBuffer<Set::Socket>, <Set::Socket as UdpSocket>::RecvMeta>>,
+    pending_rx: &mut [TileRxBatch<Set::Socket>],
+) -> Result<bool, TileError>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    let mut progressed = false;
+    for (socket_index, socket) in sockets.iter_mut().enumerate() {
+        rx.clear();
+        let received = socket.recv(rx)?;
+        if received == 0 {
+            continue;
+        }
+        progressed = true;
+        let source_socket = SocketIndex::new(socket_index as u16);
+        for item in rx.drain() {
+            match tile
+                .classifier
+                .classify(&item.meta, &item.packet, tile.rx_queues.len())
+            {
+                IngressDecision::Drop => tile.record_classifier_drop(),
+                IngressDecision::Deliver(index) => {
+                    if index >= tile.rx_queues.len() {
+                        tile.record_rx_queue_drop();
+                        continue;
+                    }
+                    pending_rx[index].push(TileRxPacket {
+                        meta: item.meta,
+                        packet: item.packet,
+                        source_socket,
+                    });
+                    if pending_rx[index].len() >= tile.config.batch_size {
+                        flush_rx_batch(tile, index, pending_rx);
+                    }
+                }
+            }
+        }
+    }
+    for index in 0..pending_rx.len() {
+        flush_rx_batch(tile, index, pending_rx);
+    }
+    Ok(progressed)
+}
+
+fn flush_rx_batch<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    index: usize,
+    pending_rx: &mut [TileRxBatch<Set::Socket>],
+) where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    if pending_rx[index].is_empty() {
+        return;
+    }
+
+    let batch = mem::replace(&mut pending_rx[index], tile.alloc_rx_batch());
+    let batch_len = batch.len();
+    let Some(queue) = tile.rx_queues.get(index) else {
+        tile.record_rx_queue_drops(batch_len);
+        tile.recycle_rx_batch_container(batch);
+        return;
+    };
+
+    if let Err(batch) = queue.push(batch) {
+        tile.record_rx_queue_drops(batch_len);
+        tile.recycle_rx_batch_container(batch);
+    }
+}

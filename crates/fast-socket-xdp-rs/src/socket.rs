@@ -284,8 +284,7 @@ struct LiveXdpState {
     raw: RawXdpSocket,
     umem: Rc<Umem>,
     rx_reclaim: Rc<FrameReclaim>,
-    /// First UMEM frame owned by the TX pool; lower frame addresses return to FILL.
-    first_tx_frame_addr: u64,
+    completion_reclaim: CompletionReclaim,
     program: Option<XdpProgramHandle>,
     bound_port: Option<u16>,
     numa_node: NumaNode,
@@ -314,6 +313,58 @@ struct OpenedLiveXdp {
     state: LiveXdpState,
     rx_pool: XdpRxPool,
     tx_pool: XdpTxPool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompletionReclaim {
+    LocalSplit {
+        first_tx_frame_addr: u64,
+    },
+    SharedMemberSlices {
+        frame_size: u64,
+        frames_per_member: u32,
+        rx_frames_per_member: u32,
+        active_frames: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionPool {
+    Rx,
+    Tx,
+}
+
+impl CompletionReclaim {
+    fn classify(self, frame_addr: u64) -> Option<CompletionPool> {
+        match self {
+            Self::LocalSplit {
+                first_tx_frame_addr,
+            } => {
+                if frame_addr < first_tx_frame_addr {
+                    Some(CompletionPool::Rx)
+                } else {
+                    Some(CompletionPool::Tx)
+                }
+            }
+            Self::SharedMemberSlices {
+                frame_size,
+                frames_per_member,
+                rx_frames_per_member,
+                active_frames,
+            } => {
+                let frame_index = u32::try_from(frame_addr / frame_size).ok()?;
+                if frame_index >= active_frames {
+                    return None;
+                }
+                let member_frame = frame_index % frames_per_member;
+                if member_frame < rx_frames_per_member {
+                    Some(CompletionPool::Rx)
+                } else {
+                    Some(CompletionPool::Tx)
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Debug for LiveXdpState {
@@ -436,6 +487,9 @@ impl LiveXdpState {
         }
 
         let first_tx_frame_addr = umem.frame_offset(rx_frames);
+        let completion_reclaim = CompletionReclaim::LocalSplit {
+            first_tx_frame_addr,
+        };
         let tx_frames = (rx_frames..frame_count)
             .map(|index| umem.frame_offset(index))
             .collect::<Vec<_>>();
@@ -458,7 +512,7 @@ impl LiveXdpState {
                 raw,
                 umem: Rc::clone(&umem),
                 rx_reclaim,
-                first_tx_frame_addr,
+                completion_reclaim,
                 program: Some(program),
                 bound_port,
                 numa_node,
@@ -478,11 +532,13 @@ impl LiveXdpState {
     ///
     /// Member 0 registers the UMEM (`XDP_UMEM_REG`) and binds normally; members
     /// 1..N bind it with `XDP_SHARED_UMEM` against member 0's fd. The UMEM is
-    /// partitioned into one disjoint frame slice per member, so each member runs
-    /// the proven single-queue RX/TX path over its own frames while the
-    /// (NUMA-local) DMA region is allocated and registered exactly once. The UDP
-    /// destination port, when set, is bound once in the shared program; every
-    /// member's queue is registered into `XSKMAP[queue]`.
+    /// initially partitioned into one disjoint frame slice per member so no
+    /// frame is posted to multiple rings at open time, but completions are
+    /// classified by the shared UMEM's global frame layout. That lets a frame
+    /// submitted through another member's TX ring migrate into the completing
+    /// member's RX or TX pool. The UDP destination port, when set, is bound once
+    /// in the shared program; every member's queue is registered into
+    /// `XSKMAP[queue]`.
     ///
     /// `config.frame_count` is the **per-member** frame count; the UMEM holds
     /// `frame_count * queues.len()` frames (rounded up to a power of two for the
@@ -616,16 +672,26 @@ impl LiveXdpState {
         // rings/frames), identical across members.
         let (drain_threshold, drain_interval) =
             tx_drain_hysteresis(config.rings.completion, per_member);
+        let completion_reclaim = CompletionReclaim::SharedMemberSlices {
+            frame_size: u64::from(frame_size),
+            frames_per_member: per_member,
+            rx_frames_per_member: per_rx,
+            active_frames: total_frames,
+        };
+        let shared_remote_reclaim_capacity = total_frames as usize;
 
         let mut opened = Vec::with_capacity(member_count);
         for (index, raw) in raws.into_iter().enumerate() {
             let base = index as u32 * per_member;
-            let first_tx_frame_addr = umem.frame_offset(base + per_rx);
             let tx_frames: Vec<u64> = (base + per_rx..base + per_member)
                 .map(|i| umem.frame_offset(i))
                 .collect();
-            let rx_reclaim = FrameReclaim::new(Vec::with_capacity(per_rx as usize));
-            let tx_reclaim = FrameReclaim::new(tx_frames);
+            let rx_reclaim = FrameReclaim::new_with_remote_capacity(
+                Vec::with_capacity(per_rx as usize),
+                shared_remote_reclaim_capacity,
+            );
+            let tx_reclaim =
+                FrameReclaim::new_with_remote_capacity(tx_frames, shared_remote_reclaim_capacity);
             let rx_pool =
                 XdpRxPool::live(config.buffers.rx, Rc::clone(&umem), Rc::clone(&rx_reclaim));
             let tx_pool =
@@ -644,7 +710,7 @@ impl LiveXdpState {
                     raw,
                     umem: Rc::clone(&umem),
                     rx_reclaim,
-                    first_tx_frame_addr,
+                    completion_reclaim,
                     program: Some(program.clone()),
                     bound_port,
                     numa_node,
@@ -864,7 +930,7 @@ impl<D> XdpIpPacketSocket<D> {
             return Ok(0);
         };
 
-        let first_tx_frame_addr = live.first_tx_frame_addr;
+        let completion_reclaim = live.completion_reclaim;
         let frame_size = u64::from(live.umem.frame_size());
         let frame_mask = frame_size - 1;
         let umem_len = u64::from(live.umem.frame_count()) * frame_size;
@@ -885,10 +951,12 @@ impl<D> XdpIpPacketSocket<D> {
                     if frame_addr >= umem_len {
                         return Err(ring_corrupt_error());
                     }
-                    if frame_addr < first_tx_frame_addr {
-                        rx_reclaim.push_local(frame_addr);
-                    } else {
-                        tx_reclaim.push_local(frame_addr);
+                    match completion_reclaim
+                        .classify(frame_addr)
+                        .ok_or_else(ring_corrupt_error)?
+                    {
+                        CompletionPool::Rx => rx_reclaim.push_local(frame_addr),
+                        CompletionPool::Tx => tx_reclaim.push_local(frame_addr),
                     }
                 }
                 Ok(())
@@ -2488,14 +2556,16 @@ fn tx_from_xdp_udp_context(
 #[cfg(test)]
 fn reclaim_completed_xdp_frame(
     frame_addr: u64,
-    first_tx_frame_addr: u64,
+    completion_reclaim: CompletionReclaim,
     rx_reclaim: &FrameReclaim,
     tx_pool: &mut XdpTxPool,
 ) {
-    if frame_addr < first_tx_frame_addr {
-        rx_reclaim.push_local(frame_addr);
-    } else {
-        tx_pool.reclaim_completed_frame(frame_addr);
+    match completion_reclaim
+        .classify(frame_addr)
+        .expect("test frame must be in the active UMEM range")
+    {
+        CompletionPool::Rx => rx_reclaim.push_local(frame_addr),
+        CompletionPool::Tx => tx_pool.reclaim_completed_frame(frame_addr),
     }
 }
 
@@ -3023,17 +3093,20 @@ mod tests {
         let tx_reclaim = FrameReclaim::new(Vec::new());
         let mut tx_pool = XdpTxPool::live(live_layout(), Rc::clone(&umem), Rc::clone(&tx_reclaim));
         let first_tx_frame_addr = umem.frame_offset(2);
+        let completion_reclaim = CompletionReclaim::LocalSplit {
+            first_tx_frame_addr,
+        };
 
         reclaim_completed_xdp_frame(
             umem.frame_addr_for_desc(umem.frame_offset(1) + 128)
                 .unwrap(),
-            first_tx_frame_addr,
+            completion_reclaim,
             &rx_reclaim,
             &mut tx_pool,
         );
         reclaim_completed_xdp_frame(
             umem.frame_addr_for_desc(umem.frame_offset(3) + 64).unwrap(),
-            first_tx_frame_addr,
+            completion_reclaim,
             &rx_reclaim,
             &mut tx_pool,
         );
@@ -3045,6 +3118,53 @@ mod tests {
         let mut tx_frames = Vec::new();
         tx_reclaim.drain_into(&mut tx_frames);
         assert_eq!(tx_frames, vec![umem.frame_offset(3)]);
+    }
+
+    #[test]
+    fn shared_completion_reclaim_uses_global_member_slices() {
+        let umem = Rc::new(Umem::new(2048, 8, HugePageSize::Default).unwrap());
+        let rx_reclaim = FrameReclaim::new(Vec::new());
+        let tx_reclaim = FrameReclaim::new(Vec::new());
+        let mut tx_pool = XdpTxPool::live(live_layout(), Rc::clone(&umem), Rc::clone(&tx_reclaim));
+        let completion_reclaim = CompletionReclaim::SharedMemberSlices {
+            frame_size: u64::from(umem.frame_size()),
+            frames_per_member: 4,
+            rx_frames_per_member: 2,
+            active_frames: 8,
+        };
+
+        reclaim_completed_xdp_frame(
+            umem.frame_offset(1),
+            completion_reclaim,
+            &rx_reclaim,
+            &mut tx_pool,
+        );
+        reclaim_completed_xdp_frame(
+            umem.frame_offset(3),
+            completion_reclaim,
+            &rx_reclaim,
+            &mut tx_pool,
+        );
+        reclaim_completed_xdp_frame(
+            umem.frame_offset(4),
+            completion_reclaim,
+            &rx_reclaim,
+            &mut tx_pool,
+        );
+        reclaim_completed_xdp_frame(
+            umem.frame_offset(6),
+            completion_reclaim,
+            &rx_reclaim,
+            &mut tx_pool,
+        );
+
+        let mut rx_frames = Vec::new();
+        rx_reclaim.drain_into(&mut rx_frames);
+        assert_eq!(rx_frames, vec![umem.frame_offset(1), umem.frame_offset(4)]);
+
+        let mut tx_frames = Vec::new();
+        tx_reclaim.drain_into(&mut tx_frames);
+        assert_eq!(tx_frames, vec![umem.frame_offset(3), umem.frame_offset(6)]);
     }
 
     #[test]

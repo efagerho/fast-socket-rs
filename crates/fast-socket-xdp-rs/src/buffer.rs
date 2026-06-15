@@ -276,7 +276,15 @@ impl HeapReclaim {
 
 impl FrameReclaim {
     pub(crate) fn new(frames: Vec<u64>) -> Rc<Self> {
-        let remote_capacity = frames.capacity();
+        Self::with_remote_capacity(frames, None)
+    }
+
+    pub(crate) fn new_with_remote_capacity(frames: Vec<u64>, remote_capacity: usize) -> Rc<Self> {
+        Self::with_remote_capacity(frames, Some(remote_capacity))
+    }
+
+    fn with_remote_capacity(frames: Vec<u64>, remote_capacity: Option<usize>) -> Rc<Self> {
+        let remote_capacity = remote_capacity.unwrap_or_else(|| frames.capacity());
         Rc::new(Self {
             owner: thread::current().id(),
             free: UnsafeCell::new(frames),
