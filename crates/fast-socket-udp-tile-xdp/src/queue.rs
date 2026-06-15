@@ -166,35 +166,10 @@ impl<T, W: WaitStrategy> Queue<T, W> {
         self.inner.is_empty()
     }
 
-    /// Returns the number of queued items.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Returns the queue capacity.
-    #[inline]
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
     /// Registers the calling thread as the consumer.
     #[inline]
     pub fn register_consumer(&self) {
         W::register_consumer(&self.state);
-    }
-
-    /// Runs the configured wait strategy if the queue remains empty.
-    #[inline]
-    pub fn wait_if_empty(&self) {
-        W::set_sleeping(&self.state);
-        W::fence_after_set_sleeping();
-        if self.is_empty() {
-            W::do_wait();
-        }
-        W::clear_sleeping(&self.state);
     }
 }
 
@@ -244,20 +219,6 @@ impl<T> SpscProducer<T> {
         self.queue.len()
     }
 
-    /// Returns `true` if the queue is empty.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    /// Returns the usable queue capacity.
-    #[inline]
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.queue.capacity()
-    }
-
     /// Returns the number of items that can be pushed without filling the queue.
     #[inline]
     #[must_use]
@@ -274,6 +235,7 @@ pub struct SpscConsumer<T> {
 impl<T> SpscConsumer<T> {
     /// Pops one item.
     #[inline]
+    #[cfg(test)]
     pub fn pop(&mut self) -> Option<T> {
         self.queue.pop()
     }
@@ -282,27 +244,6 @@ impl<T> SpscConsumer<T> {
     #[inline]
     pub fn pop_into(&mut self, count: usize, out: &mut Vec<T>) -> usize {
         self.queue.pop_into(count, out)
-    }
-
-    /// Returns the number of queued items.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
-    /// Returns `true` if the queue is empty.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    /// Returns the usable queue capacity.
-    #[inline]
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.queue.capacity()
     }
 }
 
@@ -345,6 +286,7 @@ impl<T> SpscQueue<T> {
     }
 
     #[inline]
+    #[cfg(test)]
     fn pop(&self) -> Option<T> {
         let head = self.head.0.load(Ordering::Relaxed);
         if head == self.tail.0.load(Ordering::Acquire) {
@@ -402,11 +344,6 @@ impl<T> SpscQueue<T> {
         } else {
             self.slots() - head + tail
         }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.head.0.load(Ordering::Acquire) == self.tail.0.load(Ordering::Acquire)
     }
 
     #[inline]

@@ -28,9 +28,8 @@ pub use fast_socket_udp_tile::{
     TileTxPacket, UdpNetworkTile, UdpNetworkTileHandle,
 };
 
-pub use queue::{
-    Park, Queue, Spin, SpscConsumer, SpscProducer, WaitStrategy, spsc_pair, wait_any_non_empty,
-};
+pub use queue::{Park, Spin};
+use queue::{Queue, SpscConsumer, SpscProducer, WaitStrategy, spsc_pair, wait_any_non_empty};
 
 type RxQueue<S, W> = Arc<Queue<TileRxBatch<S>, W>>;
 
