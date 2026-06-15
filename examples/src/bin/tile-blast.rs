@@ -14,10 +14,8 @@ use common::{
     write_sequence,
 };
 use fast_socket_rs::{BusyPollDriver, PacketBufferMut, QueueId};
-use fast_socket_udp_tile::{
-    AcceptAllClassifier, TileError, TileRxQueue, TileTxQueue, UdpNetworkTile,
-};
-use fast_socket_udp_tile_xdp::{Spin, UdpSocketSet, UdpTile};
+use fast_socket_udp_tile::{AcceptAllClassifier, TileError, UdpNetworkTile, UdpNetworkTileHandle};
+use fast_socket_udp_tile_xdp::{Spin, UdpSocketSet, UdpTile, UdpTileHandle};
 use fast_socket_xdp_rs::{
     InterfaceSelector, PortFilter, RouteSnapshot, XdpFactoryBuilder, XdpQueueLocalRouter,
     XdpRouteMonitor, XdpRouteMonitorHandle, XdpUdpAggregate, XdpUdpSocket,
@@ -28,6 +26,7 @@ const PAYLOAD_LEN: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 type XdpTile = UdpTile<MonitoredXdpAggregate, Spin, AcceptAllClassifier>;
+type XdpTileHandle = UdpTileHandle<MonitoredXdpAggregate, Spin, AcceptAllClassifier>;
 type XdpAggregate = XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter>;
 type XdpSocket = XdpUdpSocket<BusyPollDriver, XdpQueueLocalRouter>;
 
@@ -185,7 +184,15 @@ fn run_producers(
     let mut producers = Vec::with_capacity(lane_count);
 
     for lane_index in 0..lane_count {
-        let tiles = tiles.clone();
+        let handles = tiles
+            .iter()
+            .enumerate()
+            .map(|(tile_index, tile)| {
+                Arc::clone(tile)
+                    .lane_handle(lane_index)
+                    .ok_or_else(|| format!("tile {tile_index} has no handle for lane {lane_index}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let stop = Arc::clone(&stop);
         let queued = Arc::clone(&queued);
         let dropped = Arc::clone(&dropped);
@@ -194,7 +201,7 @@ fn run_producers(
         producers.push(thread::spawn(move || {
             if let Err(error) = run_lane(
                 lane_index,
-                tiles,
+                handles,
                 target,
                 payload_len,
                 &stop,
@@ -264,7 +271,7 @@ fn run_producers(
 
 fn run_lane(
     lane_index: usize,
-    tiles: Vec<Arc<XdpTile>>,
+    mut handles: Vec<XdpTileHandle>,
     target: SocketAddr,
     payload_len: usize,
     stop: &AtomicBool,
@@ -272,6 +279,11 @@ fn run_lane(
     dropped: &AtomicU64,
     next_sequence: &AtomicU64,
 ) -> Result<(), String> {
+    debug_assert!(
+        handles
+            .iter()
+            .all(|handle| handle.lane_index() == lane_index)
+    );
     let mut payload_bytes = payload(payload_len);
     let mut tx_buffers = Vec::with_capacity(BATCH_SIZE);
     let mut local_queued = 0u64;
@@ -279,17 +291,16 @@ fn run_lane(
 
     while !stop.load(Ordering::Relaxed) && !shutdown_requested() {
         let mut progressed = false;
-        for tile in &tiles {
-            drain_lane_rx(tile, lane_index);
+        for handle in &mut handles {
+            drain_lane_rx(handle);
             tx_buffers.clear();
-            let allocated = tile.alloc_tx_buffers(BATCH_SIZE, &mut tx_buffers);
+            let allocated = handle.alloc_tx_buffers(BATCH_SIZE, &mut tx_buffers);
             if allocated == 0 {
                 continue;
             }
             progressed = true;
             let base_sequence = next_sequence.fetch_add(allocated as u64, Ordering::Relaxed);
-            let queue = &tile.tx_queues()[lane_index];
-            let mut batch = tile.alloc_tx_batch();
+            let mut batch = handle.alloc_tx_batch();
 
             for (offset, mut buffer) in tx_buffers.drain(..).enumerate() {
                 write_sequence(&mut payload_bytes, base_sequence + offset as u64);
@@ -300,11 +311,11 @@ fn run_lane(
             }
 
             let batch_len = batch.len() as u64;
-            match queue.push_batch(batch) {
+            match handle.push_tx_batch(batch) {
                 Ok(()) => local_queued += batch_len,
                 Err(batch) => {
                     local_dropped += batch.len() as u64;
-                    tile.recycle_tx_batch(batch);
+                    handle.recycle_tx_batch(batch);
                 }
             }
         }
@@ -331,9 +342,9 @@ fn run_lane(
     Ok(())
 }
 
-fn drain_lane_rx(tile: &XdpTile, lane_index: usize) {
-    while let Some(batch) = tile.rx_queues()[lane_index].pop_batch() {
-        tile.recycle_rx_batch(batch);
+fn drain_lane_rx(handle: &XdpTileHandle) {
+    while let Some(batch) = handle.pop_rx_batch() {
+        handle.recycle_rx_batch(batch);
     }
 }
 

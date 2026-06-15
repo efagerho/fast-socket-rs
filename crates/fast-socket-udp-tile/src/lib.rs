@@ -31,8 +31,9 @@ pub const DEFAULT_TX_BUFFER_QUEUE_CAPACITY: usize = 1024;
 /// Refill starts when the preallocated TX-buffer queue drops below this count.
 pub const DEFAULT_TX_BUFFER_REFILL_WATERMARK: usize = 256;
 
-/// Maximum TX buffers to allocate during one refill pass by default.
-pub const DEFAULT_TX_BUFFER_REFILL_BATCH: usize = 64;
+/// Maximum TX buffers to allocate for one lane during one refill pass by
+/// default.
+pub const DEFAULT_TX_BUFFER_REFILL_BATCH: usize = 256;
 
 /// Stable index of one socket inside a tile-owned socket set.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -405,9 +406,9 @@ pub struct TileConfig {
     pub queue_capacity: usize,
     /// Receive batch size used for each socket pass.
     pub batch_size: usize,
-    /// Capacity of the cross-thread preallocated TX-buffer queue.
+    /// Capacity of each per-lane preallocated TX-buffer queue.
     pub tx_buffer_queue_capacity: usize,
-    /// Refill threshold for the preallocated TX-buffer queue.
+    /// Refill threshold for each per-lane preallocated TX-buffer queue.
     pub tx_buffer_refill_watermark: usize,
     /// Maximum TX buffers allocated during one refill pass.
     pub tx_buffer_refill_batch: usize,
@@ -543,10 +544,55 @@ where
     }
 }
 
+/// Per-lane handle used by application code to exchange UDP work with a tile.
+///
+/// Handles are `Send` so they can move into lane threads. The trait does not
+/// require `Sync`, which lets backend implementations encode single-consumer
+/// lane ownership in the concrete handle type.
+pub trait UdpNetworkTileHandle: Send + 'static {
+    /// Concrete socket type driven by the tile.
+    type Socket: UdpSocket;
+
+    /// Returns the lane index owned by this handle.
+    fn lane_index(&self) -> usize;
+
+    /// Pops one received packet batch from this lane.
+    fn pop_rx_batch(&self) -> Option<TileRxBatch<Self::Socket>>;
+
+    /// Pushes one transmit packet batch from this lane.
+    fn push_tx_batch(
+        &self,
+        batch: TileTxBatch<Self::Socket>,
+    ) -> Result<(), TileTxBatch<Self::Socket>>;
+
+    /// Pops up to `count` preallocated transmit buffers for this lane into
+    /// `out`.
+    fn alloc_tx_buffers(
+        &mut self,
+        count: usize,
+        out: &mut Vec<TileTxBuffer<Self::Socket>>,
+    ) -> usize;
+
+    /// Allocates an empty receive batch container.
+    fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket>;
+
+    /// Recycles an empty or discarded receive batch container.
+    fn recycle_rx_batch(&self, batch: TileRxBatch<Self::Socket>);
+
+    /// Allocates an empty transmit batch container.
+    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket>;
+
+    /// Recycles an empty or discarded transmit batch container.
+    fn recycle_tx_batch(&self, batch: TileTxBatch<Self::Socket>);
+}
+
 /// Public UDP tile interface.
 pub trait UdpNetworkTile: Send + Sync + 'static {
     /// Concrete socket type driven by this tile.
     type Socket: UdpSocket;
+
+    /// Concrete per-lane handle type.
+    type Handle: UdpNetworkTileHandle<Socket = Self::Socket>;
 
     /// Concrete tile-to-lane ingress queue type.
     type RxQueue: TileRxQueue<Self::Socket>;
@@ -554,8 +600,20 @@ pub trait UdpNetworkTile: Send + Sync + 'static {
     /// Concrete lane-to-tile egress queue type.
     type TxQueue: TileTxQueue<Self::Socket>;
 
-    /// Pops up to `count` preallocated transmit buffers into `out`.
-    fn alloc_tx_buffers(&self, count: usize, out: &mut Vec<TileTxBuffer<Self::Socket>>) -> usize;
+    /// Creates a handle for `lane_index`.
+    ///
+    /// Returns `None` when the lane index is outside the tile's configured
+    /// lane range.
+    fn lane_handle(self: Arc<Self>, lane_index: usize) -> Option<Self::Handle>;
+
+    /// Pops up to `count` preallocated transmit buffers for `lane_index` into
+    /// `out`.
+    fn alloc_tx_buffers(
+        &self,
+        lane_index: usize,
+        count: usize,
+        out: &mut Vec<TileTxBuffer<Self::Socket>>,
+    ) -> usize;
 
     /// Allocates an empty receive batch container.
     fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket>;
@@ -580,7 +638,7 @@ pub trait UdpNetworkTile: Send + Sync + 'static {
 
     /// Starts the tile worker thread.
     fn start(
-        self: std::sync::Arc<Self>,
+        self: Arc<Self>,
         tile_index: usize,
     ) -> Result<JoinHandle<Result<(), TileError>>, TileError>;
 }

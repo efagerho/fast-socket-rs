@@ -9,6 +9,7 @@
 
 mod queue;
 
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,16 +26,36 @@ use fast_socket_udp_tile::validate_socket_affinity;
 pub use fast_socket_udp_tile::{
     AcceptAllClassifier, IngressClassifier, IngressDecision, SocketIndex, SourceAddrClassifier,
     TileConfig, TileError, TileRxBatch, TileRxPacket, TileRxQueue, TileStats, TileTxBatch,
-    TileTxBuffer, TileTxPacket, TileTxQueue, UdpNetworkTile,
+    TileTxBuffer, TileTxPacket, TileTxQueue, UdpNetworkTile, UdpNetworkTileHandle,
 };
 
-pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty};
+pub use queue::{
+    Park, Queue, Spin, SpscConsumer, SpscProducer, WaitStrategy, spsc_pair, wait_any_non_empty,
+};
 
 /// Shorthand for a tile-to-lane ingress queue.
 pub type RxQueue<S, W> = Arc<Queue<TileRxBatch<S>, W>>;
 
 /// Shorthand for a lane-to-tile egress queue.
 pub type TxQueue<S, W> = Arc<Queue<TileTxBatch<S>, W>>;
+
+/// Lane-owned handle for an [`UdpTile`].
+///
+/// The handle is `Send` so it can move into a producer or lane thread. It is
+/// intentionally not `Sync`; each handle represents one lane's single-consumer
+/// view of the tile queues and buffer pool.
+pub struct UdpTileHandle<Set, W, C>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    tile: Arc<UdpTile<Set, W, C>>,
+    tx_buffer_consumer: SpscConsumer<TileTxBuffer<Set::Socket>>,
+    lane_index: usize,
+    _not_sync: PhantomData<UnsafeCell<()>>,
+}
 
 impl<S, W> TileRxQueue<S> for Queue<TileRxBatch<S>, W>
 where
@@ -103,7 +124,8 @@ where
     socket_factory: Mutex<Option<Box<dyn FnOnce() -> Set + Send + 'static>>>,
     rx_queues: Vec<RxQueue<Set::Socket, W>>,
     tx_queues: Vec<TxQueue<Set::Socket, W>>,
-    tx_buffer_queue: Arc<ArrayQueue<TileTxBuffer<Set::Socket>>>,
+    tx_buffer_producers: Mutex<Option<Vec<SpscProducer<TileTxBuffer<Set::Socket>>>>>,
+    tx_buffer_consumers: Mutex<Vec<Option<SpscConsumer<TileTxBuffer<Set::Socket>>>>>,
     rx_batch_pool: Arc<ArrayQueue<TileRxBatch<Set::Socket>>>,
     tx_batch_pool: Arc<ArrayQueue<TileTxBatch<Set::Socket>>>,
     classifier_drops: AtomicU64,
@@ -161,6 +183,12 @@ where
         let tx_queues = (0..lane_count)
             .map(|_| Queue::<TileTxBatch<Set::Socket>, W>::new(tx_queue_capacity))
             .collect();
+        let (tx_buffer_producers, tx_buffer_consumers): (Vec<_>, Vec<_>) = (0..lane_count)
+            .map(|_| {
+                let (producer, consumer) = spsc_pair(config.tx_buffer_queue_capacity);
+                (producer, Some(consumer))
+            })
+            .unzip();
         let rx_batch_pool_capacity = rx_queue_capacity
             .saturating_mul(lane_count)
             .saturating_add(lane_count)
@@ -173,7 +201,8 @@ where
             socket_factory: Mutex::new(Some(Box::new(factory))),
             rx_queues,
             tx_queues,
-            tx_buffer_queue: Arc::new(ArrayQueue::new(config.tx_buffer_queue_capacity)),
+            tx_buffer_producers: Mutex::new(Some(tx_buffer_producers)),
+            tx_buffer_consumers: Mutex::new(tx_buffer_consumers),
             rx_batch_pool: Arc::new(ArrayQueue::new(rx_batch_pool_capacity)),
             tx_batch_pool: Arc::new(ArrayQueue::new(tx_batch_pool_capacity)),
             classifier_drops: AtomicU64::new(0),
@@ -227,19 +256,39 @@ where
     C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
 {
     type Socket = Set::Socket;
+    type Handle = UdpTileHandle<Set, W, C>;
     type RxQueue = RxQueue<Set::Socket, W>;
     type TxQueue = TxQueue<Set::Socket, W>;
 
-    fn alloc_tx_buffers(&self, count: usize, out: &mut Vec<TileTxBuffer<Self::Socket>>) -> usize {
-        let mut allocated = 0usize;
-        for _ in 0..count {
-            let Some(buffer) = self.tx_buffer_queue.pop() else {
-                break;
-            };
-            out.push(buffer);
-            allocated += 1;
+    fn lane_handle(self: Arc<Self>, lane_index: usize) -> Option<Self::Handle> {
+        if lane_index >= self.rx_queues.len() {
+            return None;
         }
-        allocated
+        let tx_buffer_consumer = {
+            let mut consumers = self.tx_buffer_consumers.lock().ok()?;
+            consumers.get_mut(lane_index)?.take()?
+        };
+        Some(UdpTileHandle {
+            tile: self,
+            tx_buffer_consumer,
+            lane_index,
+            _not_sync: PhantomData,
+        })
+    }
+
+    fn alloc_tx_buffers(
+        &self,
+        lane_index: usize,
+        count: usize,
+        out: &mut Vec<TileTxBuffer<Self::Socket>>,
+    ) -> usize {
+        let Ok(mut consumers) = self.tx_buffer_consumers.lock() else {
+            return 0;
+        };
+        consumers
+            .get_mut(lane_index)
+            .and_then(Option::as_mut)
+            .map_or(0, |consumer| consumer.pop_into(count, out))
     }
 
     fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket> {
@@ -296,17 +345,73 @@ where
             .map_err(|_| TileError::FactoryPoisoned)?
             .take()
             .ok_or(TileError::AlreadyStarted)?;
+        let tx_buffer_producers = self
+            .tx_buffer_producers
+            .lock()
+            .map_err(|_| TileError::FactoryPoisoned)?
+            .take()
+            .ok_or(TileError::AlreadyStarted)?;
 
         thread::Builder::new()
             .name(format!("fastsock-udp-tile-{tile_index}"))
-            .spawn(move || run_tile(self, factory(), tile_index))
+            .spawn(move || run_tile(self, factory(), tx_buffer_producers, tile_index))
             .map_err(TileError::Spawn)
+    }
+}
+
+impl<Set, W, C> UdpNetworkTileHandle for UdpTileHandle<Set, W, C>
+where
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
+{
+    type Socket = Set::Socket;
+
+    fn lane_index(&self) -> usize {
+        self.lane_index
+    }
+
+    fn pop_rx_batch(&self) -> Option<TileRxBatch<Self::Socket>> {
+        self.tile.rx_queues[self.lane_index].pop_batch()
+    }
+
+    fn push_tx_batch(
+        &self,
+        batch: TileTxBatch<Self::Socket>,
+    ) -> Result<(), TileTxBatch<Self::Socket>> {
+        self.tile.tx_queues[self.lane_index].push_batch(batch)
+    }
+
+    fn alloc_tx_buffers(
+        &mut self,
+        count: usize,
+        out: &mut Vec<TileTxBuffer<Self::Socket>>,
+    ) -> usize {
+        self.tx_buffer_consumer.pop_into(count, out)
+    }
+
+    fn alloc_rx_batch(&self) -> TileRxBatch<Self::Socket> {
+        self.tile.alloc_rx_batch()
+    }
+
+    fn recycle_rx_batch(&self, batch: TileRxBatch<Self::Socket>) {
+        self.tile.recycle_rx_batch(batch);
+    }
+
+    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket> {
+        self.tile.alloc_tx_batch()
+    }
+
+    fn recycle_tx_batch(&self, batch: TileTxBatch<Self::Socket>) {
+        self.tile.recycle_tx_batch(batch);
     }
 }
 
 fn run_tile<Set, W, C>(
     tile: Arc<UdpTile<Set, W, C>>,
     mut socket_set: Set,
+    mut tx_buffer_producers: Vec<SpscProducer<TileTxBuffer<Set::Socket>>>,
     _tile_index: usize,
 ) -> Result<(), TileError>
 where
@@ -354,7 +459,12 @@ where
         progressed |= drain_lane_tx(&tile, &mut pending_tx);
         progressed |= flush_pending_tx(socket_set.sockets_mut(), &mut pending_tx)?;
         progressed |= drain_socket_completions(socket_set.sockets_mut())?;
-        progressed |= refill_tx_buffers(&tile, socket_set.sockets_mut(), &mut tx_alloc_scratch)?;
+        progressed |= refill_tx_buffers(
+            &tile,
+            &mut tx_buffer_producers,
+            socket_set.sockets_mut(),
+            &mut tx_alloc_scratch,
+        )?;
         progressed |= recv_from_sockets(&tile, socket_set.sockets_mut(), &mut rx, &mut pending_rx)?;
 
         if !progressed {
@@ -429,6 +539,7 @@ fn drain_socket_completions<S: UdpSocket>(sockets: &mut [S]) -> Result<bool, Til
 
 fn refill_tx_buffers<Set, W, C>(
     tile: &UdpTile<Set, W, C>,
+    producers: &mut [SpscProducer<TileTxBuffer<Set::Socket>>],
     sockets: &mut [Set::Socket],
     scratch: &mut Vec<UdpTxBufferMut<Set::Socket>>,
 ) -> Result<bool, TileError>
@@ -438,31 +549,41 @@ where
     <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
     C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
 {
-    if tile.tx_buffer_queue.len() >= tile.config.tx_buffer_refill_watermark {
-        return Ok(false);
-    }
-
     let mut progressed = false;
-    let per_socket = tile
-        .config
-        .tx_buffer_refill_batch
-        .div_ceil(sockets.len())
-        .max(1);
-    for (index, socket) in sockets.iter_mut().enumerate() {
-        if tile.tx_buffer_queue.len() >= tile.config.tx_buffer_queue_capacity {
-            break;
+    for producer in producers {
+        if producer.len() >= tile.config.tx_buffer_refill_watermark {
+            continue;
         }
-        scratch.clear();
-        let allocated = socket.allocate_tx_batch(scratch, per_socket)?;
-        progressed |= allocated != 0;
-        let source_socket = SocketIndex::new(index as u16);
-        for buffer in scratch.drain(..) {
-            if tile
-                .tx_buffer_queue
-                .push(TileTxBuffer::new(source_socket, buffer))
-                .is_err()
-            {
+        let target = tile
+            .config
+            .tx_buffer_refill_batch
+            .min(producer.remaining_capacity());
+        if target == 0 {
+            continue;
+        }
+        let per_socket = target.div_ceil(sockets.len()).max(1);
+        let mut remaining = target;
+        for (index, socket) in sockets.iter_mut().enumerate() {
+            if remaining == 0 {
                 break;
+            }
+            scratch.clear();
+            let request = remaining.min(per_socket);
+            let allocated = socket.allocate_tx_batch(scratch, request)?;
+            progressed |= allocated != 0;
+            let source_socket = SocketIndex::new(index as u16);
+            for buffer in scratch.drain(..) {
+                if producer
+                    .push(TileTxBuffer::new(source_socket, buffer))
+                    .is_err()
+                {
+                    remaining = 0;
+                    break;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
             }
         }
     }
