@@ -10,13 +10,13 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use fast_socket_rs::{
-    EcnCodepoint, Error, PacketBufferMut, QueueAffinity, SendError, UdpRecvMeta, UdpRxBuffer,
-    UdpSocket, UdpTransmit, UdpTxBuffer, UdpTxBufferMut,
+    BufferAccessError, BufferLayout, EcnCodepoint, Error, PacketBuffer, PacketBufferMut,
+    QueueAffinity, ReserveError, SendError, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTransmit,
+    UdpTxBuffer, UdpTxBufferMut,
 };
 
 /// Number of per-lane RX/TX queue slots used by default.
@@ -124,12 +124,54 @@ fn mix64(mut value: u64) -> u64 {
 
 /// A packet delivered from a network tile to one lane RX queue.
 pub struct TileRxPacket<S: UdpSocket> {
-    /// Backend receive metadata.
-    pub meta: S::RecvMeta,
-    /// UDP payload buffer.
-    pub packet: UdpRxBuffer<S>,
-    /// Socket that produced this packet.
-    pub source_socket: SocketIndex,
+    meta: S::RecvMeta,
+    packet: UdpRxBuffer<S>,
+    source_socket: SocketIndex,
+}
+
+impl<S: UdpSocket> TileRxPacket<S> {
+    /// Creates a tile receive packet from backend-owned parts.
+    ///
+    /// # Safety
+    ///
+    /// `source_socket` must identify the socket in the owning tile that
+    /// produced `packet`.
+    #[must_use]
+    pub unsafe fn new(
+        meta: S::RecvMeta,
+        packet: UdpRxBuffer<S>,
+        source_socket: SocketIndex,
+    ) -> Self {
+        Self {
+            meta,
+            packet,
+            source_socket,
+        }
+    }
+
+    /// Returns the socket that produced this packet.
+    #[must_use]
+    pub const fn source_socket(&self) -> SocketIndex {
+        self.source_socket
+    }
+
+    /// Borrows backend receive metadata.
+    #[must_use]
+    pub const fn meta(&self) -> &S::RecvMeta {
+        &self.meta
+    }
+
+    /// Borrows the UDP payload buffer.
+    #[must_use]
+    pub const fn packet(&self) -> &UdpRxBuffer<S> {
+        &self.packet
+    }
+
+    /// Splits this packet into its metadata, payload buffer, and source socket.
+    #[must_use]
+    pub fn into_parts(self) -> (S::RecvMeta, UdpRxBuffer<S>, SocketIndex) {
+        (self.meta, self.packet, self.source_socket)
+    }
 }
 
 impl<S> TileRxPacket<S>
@@ -211,8 +253,13 @@ pub struct TileTxBuffer<S: UdpSocket> {
 
 impl<S: UdpSocket> TileTxBuffer<S> {
     /// Creates a tile-owned transmit buffer wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `source_socket` must identify the socket in the owning tile that
+    /// allocated `buffer`.
     #[must_use]
-    pub fn new(source_socket: SocketIndex, buffer: UdpTxBufferMut<S>) -> Self {
+    pub unsafe fn new(source_socket: SocketIndex, buffer: UdpTxBufferMut<S>) -> Self {
         Self {
             source_socket,
             buffer,
@@ -234,12 +281,6 @@ impl<S: UdpSocket> TileTxBuffer<S> {
         &self.buffer
     }
 
-    /// Mutably borrows the packet buffer.
-    #[must_use]
-    pub fn buffer_mut(&mut self) -> &mut UdpTxBufferMut<S> {
-        &mut self.buffer
-    }
-
     /// Freezes this buffer into a tile transmit packet.
     #[must_use]
     pub fn freeze(self, destination: SocketAddr) -> TileTxPacket<S> {
@@ -251,34 +292,84 @@ impl<S: UdpSocket> TileTxBuffer<S> {
     pub fn into_parts(self) -> (SocketIndex, UdpTxBufferMut<S>) {
         (self.source_socket, self.buffer)
     }
-}
 
-impl<S: UdpSocket> Deref for TileTxBuffer<S> {
-    type Target = UdpTxBufferMut<S>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
+    /// Returns the total packet length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
     }
-}
 
-impl<S: UdpSocket> DerefMut for TileTxBuffer<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer
+    /// Returns `true` when the packet has no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Returns public prefix space currently available before the packet.
+    #[must_use]
+    pub fn headroom(&self) -> usize {
+        self.buffer.headroom()
+    }
+
+    /// Returns public suffix space currently available after the packet.
+    #[must_use]
+    pub fn tailroom(&self) -> usize {
+        self.buffer.tailroom()
+    }
+
+    /// Returns the layout used to allocate this buffer.
+    #[must_use]
+    pub fn layout(&self) -> &BufferLayout {
+        self.buffer.layout()
+    }
+
+    /// Iterates packet segments in packet-byte order.
+    pub fn segments(&self) -> <UdpTxBufferMut<S> as PacketBuffer>::Segments<'_> {
+        self.buffer.segments()
+    }
+
+    /// Reads exactly `dst.len()` bytes at `offset` across packet segments.
+    pub fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
+        self.buffer.read_at_exact(offset, dst)
+    }
+
+    /// Prepends bytes immediately before the current packet start.
+    pub fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
+        self.buffer.prepend(bytes)
+    }
+
+    /// Prepends bytes, relocating existing packet bytes when supported.
+    pub fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
+        self.buffer.prepend_relocating(bytes)
+    }
+
+    /// Appends bytes to the packet tail.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
+        self.buffer.extend_from_slice(bytes)
+    }
+
+    /// Appends bytes, relocating existing packet bytes when supported.
+    pub fn extend_from_slice_relocating(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError> {
+        self.buffer.extend_from_slice_relocating(bytes)
+    }
+
+    /// Trims bytes from the packet prefix.
+    pub fn trim_prefix(&mut self, len: usize) -> Result<(), BufferAccessError> {
+        self.buffer.trim_prefix(len)
+    }
+
+    /// Trims bytes from the packet suffix.
+    pub fn trim_suffix(&mut self, len: usize) -> Result<(), BufferAccessError> {
+        self.buffer.trim_suffix(len)
     }
 }
 
 /// A packet queued by a lane for network transmit.
 pub struct TileTxPacket<S: UdpSocket> {
-    /// UDP payload buffer.
-    pub packet: UdpTxBuffer<S>,
+    packet: UdpTxBuffer<S>,
     /// Remote destination address.
     pub destination: SocketAddr,
-    /// Socket that produced or allocated the packet's backing buffer.
-    ///
-    /// Backends that cannot transfer buffers between sockets use this as the
-    /// transmit socket. Backends with shareable backing memory may choose a
-    /// different target socket at submit time.
-    pub source_socket: SocketIndex,
+    source_socket: SocketIndex,
     /// Optional source IP selection.
     pub source_ip: Option<IpAddr>,
     /// Optional ECN codepoint.
@@ -288,9 +379,7 @@ pub struct TileTxPacket<S: UdpSocket> {
 }
 
 impl<S: UdpSocket> TileTxPacket<S> {
-    /// Creates a tile transmit packet for `destination`.
-    #[must_use]
-    pub const fn new(
+    const fn new(
         packet: UdpTxBuffer<S>,
         destination: SocketAddr,
         source_socket: SocketIndex,
@@ -303,6 +392,22 @@ impl<S: UdpSocket> TileTxPacket<S> {
             ecn: None,
             gso_segment_size: None,
         }
+    }
+
+    /// Borrows the UDP payload buffer.
+    #[must_use]
+    pub const fn packet(&self) -> &UdpTxBuffer<S> {
+        &self.packet
+    }
+
+    /// Socket that produced or allocated the packet's backing buffer.
+    ///
+    /// Backends that cannot transfer buffers between sockets use this as the
+    /// transmit socket. Backends with shareable backing memory may choose a
+    /// different target socket at submit time.
+    #[must_use]
+    pub const fn source_socket(&self) -> SocketIndex {
+        self.source_socket
     }
 
     /// Converts this tile packet into the core UDP transmit item.

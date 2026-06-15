@@ -488,7 +488,7 @@ where
         while let Some(mut batch) = queue.pop() {
             progressed = true;
             for packet in batch.drain() {
-                let index = usize::from(packet.source_socket.get());
+                let index = usize::from(packet.source_socket().get());
                 let Some(bucket) = pending_tx.get_mut(index) else {
                     tile.record_tx_drop();
                     continue;
@@ -573,10 +573,10 @@ where
             progressed |= allocated != 0;
             let source_socket = SocketIndex::new(index as u16);
             for buffer in scratch.drain(..) {
-                if producer
-                    .push(TileTxBuffer::new(source_socket, buffer))
-                    .is_err()
-                {
+                // SAFETY: this buffer was allocated from `socket`, whose
+                // stable tile index is `source_socket`.
+                let buffer = unsafe { TileTxBuffer::new(source_socket, buffer) };
+                if producer.push(buffer).is_err() {
                     remaining = 0;
                     break;
                 }
@@ -622,11 +622,11 @@ where
                         tile.record_rx_queue_drop();
                         continue;
                     }
-                    pending_rx[index].push(TileRxPacket {
-                        meta: item.meta,
-                        packet: item.packet,
-                        source_socket,
-                    });
+                    // SAFETY: this receive item came from `socket`, whose
+                    // stable tile index is `source_socket`.
+                    let packet =
+                        unsafe { TileRxPacket::new(item.meta, item.packet, source_socket) };
+                    pending_rx[index].push(packet);
                     if pending_rx[index].len() >= tile.config.batch_size {
                         flush_rx_batch(tile, index, pending_rx);
                     }

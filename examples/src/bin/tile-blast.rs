@@ -13,7 +13,7 @@ use common::{
     BoxError, install_shutdown_signal_handlers, interface_ipv4_addr, payload, shutdown_requested,
     write_sequence,
 };
-use fast_socket_rs::{BusyPollDriver, PacketBufferMut, QueueId};
+use fast_socket_rs::{BusyPollDriver, QueueId};
 use fast_socket_udp_tile::{AcceptAllClassifier, TileError, UdpNetworkTile, UdpNetworkTileHandle};
 use fast_socket_udp_tile_xdp::{Spin, UdpSocketSet, UdpTile, UdpTileHandle};
 use fast_socket_xdp_rs::{
