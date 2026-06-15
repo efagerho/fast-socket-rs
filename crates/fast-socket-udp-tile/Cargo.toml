@@ -1,0 +1,13 @@
+[package]
+name = "fast-socket-udp-tile"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+xdp = ["dep:fast-socket-xdp-rs"]
+
+[dependencies]
+crossbeam-queue = "0.3"
+fast-socket-rs = { path = "../fast-socket-rs" }
+fast-socket-xdp-rs = { path = "../fast-socket-xdp-rs", optional = true }
