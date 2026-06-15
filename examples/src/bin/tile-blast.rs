@@ -13,12 +13,13 @@ use common::{
     BoxError, install_shutdown_signal_handlers, interface_ipv4_addr, payload, shutdown_requested,
     write_sequence,
 };
-use fast_socket_udp_tile::{AcceptAllClassifier, UdpNetworkTileHandle};
+use fast_socket_udp_tile::{AcceptAllClassifier, TileConfig, UdpNetworkTileHandle};
 use fast_socket_udp_tile_xdp::{XdpUdpTileBuilder, XdpUdpTileHandle, XdpUdpTiles};
 
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 128;
 const PAYLOAD_LEN: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+const READY_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 
 type XdpTileHandle = XdpUdpTileHandle<AcceptAllClassifier>;
 type XdpTileSet = XdpUdpTiles<AcceptAllClassifier>;
@@ -33,6 +34,10 @@ struct Args {
     #[arg(long)]
     target: SocketAddrV4,
 
+    /// Source IPv4 address for the local socket address. Defaults to the IP on --device.
+    #[arg(long)]
+    source_ip: Option<Ipv4Addr>,
+
     /// Number of XDP tile threads. All NIC queues are split into this many
     /// contiguous worker plans. Must divide the queue count.
     #[arg(long, default_value_t = 1)]
@@ -45,6 +50,10 @@ struct Args {
     /// UDP payload length.
     #[arg(long, default_value_t = PAYLOAD_LEN)]
     payload_len: usize,
+
+    /// Stop after this many milliseconds instead of waiting for Ctrl-C.
+    #[arg(long)]
+    duration_ms: Option<u64>,
 }
 
 fn main() -> Result<(), BoxError> {
@@ -62,25 +71,37 @@ fn main() -> Result<(), BoxError> {
 
     run_tile_blast(
         &args.device,
+        args.source_ip,
         args.target,
         args.threads,
         args.lane_count,
         args.payload_len,
+        args.duration_ms.map(Duration::from_millis),
     )
 }
 
 fn run_tile_blast(
     device: &str,
+    source_ip: Option<Ipv4Addr>,
     target: SocketAddrV4,
     threads: usize,
     lane_count: usize,
     payload_len: usize,
+    duration: Option<Duration>,
 ) -> Result<(), BoxError> {
-    let local_ip = interface_ipv4_addr(device)?;
-    let local = SocketAddrV4::new(local_ip, kernel_assigned_udp_port(local_ip)?);
+    let source_ip = match source_ip {
+        Some(source_ip) => source_ip,
+        None => interface_ipv4_addr(device)?,
+    };
+    let local = SocketAddrV4::new(source_ip, kernel_assigned_udp_port(source_ip)?);
+    let config = TileConfig {
+        batch_size: BATCH_SIZE,
+        ..TileConfig::default()
+    };
     let tiles = XdpUdpTileBuilder::bind_device(device, local, lane_count)?
         .threads(threads)
         .classifier(AcceptAllClassifier)
+        .config(config)
         .build()?;
 
     eprintln!(
@@ -90,7 +111,7 @@ fn run_tile_blast(
         payload_len
     );
 
-    run_producers(tiles, target.into(), lane_count, payload_len)
+    run_producers(tiles, target.into(), lane_count, payload_len, duration)
 }
 
 fn run_producers(
@@ -98,13 +119,15 @@ fn run_producers(
     target: SocketAddr,
     lane_count: usize,
     payload_len: usize,
+    duration: Option<Duration>,
 ) -> Result<(), BoxError> {
     let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(AtomicBool::new(false));
     let queued = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
     let next_sequence = Arc::new(AtomicU64::new(0));
     let (error_tx, error_rx) = mpsc::channel::<String>();
-    let started = Instant::now();
+    let (ready_tx, ready_rx) = mpsc::channel::<usize>();
     let mut producers = Vec::with_capacity(lane_count);
 
     for lane_index in 0..lane_count {
@@ -112,11 +135,16 @@ fn run_producers(
             .lane_handles(lane_index)
             .ok_or_else(|| format!("no tile handles available for lane {lane_index}"))?;
         let stop = Arc::clone(&stop);
+        let start = Arc::clone(&start);
         let queued = Arc::clone(&queued);
         let dropped = Arc::clone(&dropped);
         let next_sequence = Arc::clone(&next_sequence);
         let error_tx = error_tx.clone();
+        let ready_tx = ready_tx.clone();
         producers.push(thread::spawn(move || {
+            if ready_tx.send(lane_index).is_err() || !wait_for_producer_start(&start, &stop) {
+                return;
+            }
             if let Err(error) = run_lane(
                 lane_index,
                 handles,
@@ -133,59 +161,128 @@ fn run_producers(
         }));
     }
     drop(error_tx);
+    drop(ready_tx);
 
+    if let Err(error) =
+        wait_for_producers_ready(lane_count, &ready_rx, &error_rx, &mut tiles, stop.as_ref())
+    {
+        stop.store(true, Ordering::Relaxed);
+        join_producers(producers)?;
+        return Err(error);
+    }
+
+    let started = Instant::now();
     let mut last_report = started;
-    let mut last_queued = 0u64;
+    let mut last_sent = tiles.stats().tx_packets;
+    start.store(true, Ordering::Release);
+
     while !shutdown_requested() && !stop.load(Ordering::Relaxed) {
         if let Ok(error) = error_rx.try_recv() {
             stop.store(true, Ordering::Relaxed);
+            join_producers(producers)?;
             return Err(error.into());
         }
         if let Err(error) = tiles.check_worker_threads() {
             stop.store(true, Ordering::Relaxed);
+            join_producers(producers)?;
             return Err(error.into());
         }
+        if duration.is_some_and(|duration| started.elapsed() >= duration) {
+            break;
+        }
 
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(100));
         let now = Instant::now();
         if now.duration_since(last_report) >= PROGRESS_INTERVAL {
-            let count = queued.load(Ordering::Relaxed);
-            let interval = now.duration_since(last_report).as_secs_f64();
-            let rate = (count - last_queued) as f64 / interval;
-            let lane_drops = dropped.load(Ordering::Relaxed);
             let stats = tiles.stats();
+            let sent = stats.tx_packets;
+            let queued_count = queued.load(Ordering::Relaxed);
+            let interval = now.duration_since(last_report).as_secs_f64();
+            let rate = (sent - last_sent) as f64 / interval;
+            let lane_drops = dropped.load(Ordering::Relaxed);
             eprintln!(
-                "tile-blast: {count} packets queued ({rate:.0} packets/s), lane drops {lane_drops}, tile drops {}",
+                "tile-blast: {sent} packets sent ({rate:.0} packets/s), {queued_count} packets queued, lane drops {lane_drops}, tile drops {}",
                 stats.classifier_drops + stats.rx_queue_drops + stats.tx_drops
             );
             last_report = now;
-            last_queued = count;
+            last_sent = sent;
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
-    for producer in producers {
-        if producer.join().is_err() {
-            return Err("tile-blast producer thread panicked".into());
-        }
-    }
-
-    let count = queued.load(Ordering::Relaxed);
     let elapsed = started.elapsed();
+    let final_stats = tiles.stats();
+    stop.store(true, Ordering::Relaxed);
+    join_producers(producers)?;
+
+    if let Ok(error) = error_rx.try_recv() {
+        return Err(error.into());
+    }
+
+    let sent = final_stats.tx_packets;
+    let queued_count = queued.load(Ordering::Relaxed);
     let rate = if elapsed.is_zero() {
         0.0
     } else {
-        count as f64 / elapsed.as_secs_f64()
+        sent as f64 / elapsed.as_secs_f64()
     };
-    println!("tile-blast: {count} packets queued in {elapsed:?} ({rate:.0} packets/s)");
+    println!(
+        "tile-blast: {sent} packets sent in {elapsed:?} ({rate:.0} packets/s), {queued_count} packets queued"
+    );
 
     let lane_drops = dropped.load(Ordering::Relaxed);
     if lane_drops > 0 {
         eprintln!("tile-blast: dropped {lane_drops} packets to full lane TX queues");
     }
-    let stats = tiles.stats();
-    if stats.classifier_drops + stats.rx_queue_drops + stats.tx_drops > 0 {
-        eprintln!("tile-blast: tile stats: {stats:?}");
+    if final_stats.classifier_drops + final_stats.rx_queue_drops + final_stats.tx_drops > 0 {
+        eprintln!("tile-blast: tile stats: {final_stats:?}");
+    }
+    Ok(())
+}
+
+fn wait_for_producers_ready(
+    lane_count: usize,
+    ready_rx: &mpsc::Receiver<usize>,
+    error_rx: &mpsc::Receiver<String>,
+    tiles: &mut XdpTileSet,
+    stop: &AtomicBool,
+) -> Result<(), BoxError> {
+    let mut ready = 0usize;
+    while ready < lane_count {
+        if let Ok(error) = error_rx.try_recv() {
+            return Err(error.into());
+        }
+        if let Err(error) = tiles.check_worker_threads() {
+            return Err(error.into());
+        }
+        if shutdown_requested() || stop.load(Ordering::Relaxed) {
+            return Err("tile-blast stopped before producers were ready".into());
+        }
+        match ready_rx.recv_timeout(READY_WAIT_INTERVAL) {
+            Ok(_) => ready += 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("tile-blast producer setup failed before all lanes were ready".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_producer_start(start: &AtomicBool, stop: &AtomicBool) -> bool {
+    while !start.load(Ordering::Acquire) {
+        if stop.load(Ordering::Relaxed) || shutdown_requested() {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+    true
+}
+
+fn join_producers(producers: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError> {
+    for producer in producers {
+        if producer.join().is_err() {
+            return Err("tile-blast producer thread panicked".into());
+        }
     }
     Ok(())
 }

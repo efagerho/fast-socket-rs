@@ -356,6 +356,7 @@ where
     classifier_drops: AtomicU64,
     rx_queue_drops: AtomicU64,
     tx_drops: AtomicU64,
+    tx_packets: AtomicU64,
     classifier: C,
     config: TileConfig,
     _marker: PhantomData<fn() -> (Set, W)>,
@@ -433,6 +434,7 @@ where
             classifier_drops: AtomicU64::new(0),
             rx_queue_drops: AtomicU64::new(0),
             tx_drops: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
             classifier,
             config,
             _marker: PhantomData,
@@ -454,6 +456,10 @@ where
 
     fn record_tx_drop(&self) {
         self.tx_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_tx_packets(&self, count: usize) {
+        self.tx_packets.fetch_add(count as u64, Ordering::Relaxed);
     }
 
     fn alloc_rx_batch(&self) -> TileRxBatch<Set::Socket> {
@@ -524,6 +530,7 @@ where
             classifier_drops: self.classifier_drops.load(Ordering::Relaxed),
             rx_queue_drops: self.rx_queue_drops.load(Ordering::Relaxed),
             tx_drops: self.tx_drops.load(Ordering::Relaxed),
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
         }
     }
 
@@ -651,10 +658,10 @@ where
 
         progressed |= socket_set.poll_maintenance();
         progressed |= drain_socket_completions(socket_set.sockets_mut())?;
-        progressed |= flush_pending_tx(socket_set.sockets_mut(), &mut pending_tx)?;
+        progressed |= flush_pending_tx(&tile, socket_set.sockets_mut(), &mut pending_tx)?;
         tx_admission.reset(&pending_tx);
         progressed |= drain_lane_tx(&tile, &mut pending_tx, &mut deferred_tx, &mut tx_admission);
-        progressed |= flush_pending_tx(socket_set.sockets_mut(), &mut pending_tx)?;
+        progressed |= flush_pending_tx(&tile, socket_set.sockets_mut(), &mut pending_tx)?;
         progressed |= refill_tx_buffers(
             &tile,
             &mut tx_buffer_producers,
@@ -799,12 +806,16 @@ impl TxAdmission {
     }
 }
 
-fn flush_pending_tx<S>(
-    sockets: &mut [S],
-    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<S>>>>],
+fn flush_pending_tx<Set, W, C>(
+    tile: &UdpTile<Set, W, C>,
+    sockets: &mut [Set::Socket],
+    pending_tx: &mut [Vec<TxSlot<UdpTransmit<UdpTxBuffer<Set::Socket>>>>],
 ) -> Result<bool, TileError>
 where
-    S: UdpSocket,
+    Set: UdpSocketSet + 'static,
+    W: WaitStrategy,
+    <Set::Socket as UdpSocket>::RecvMeta: Send + 'static,
+    C: IngressClassifier<<Set::Socket as UdpSocket>::RecvMeta, UdpRxBuffer<Set::Socket>>,
 {
     let mut progressed = false;
     for (socket, pending) in sockets.iter_mut().zip(pending_tx.iter_mut()) {
@@ -812,11 +823,13 @@ where
             match socket.send(pending.as_mut_slice()) {
                 Ok(0) => break,
                 Ok(accepted) => {
+                    tile.record_tx_packets(accepted);
                     pending.drain(..accepted);
                     progressed = true;
                 }
                 Err(error) => {
                     if error.accepted > 0 {
+                        tile.record_tx_packets(error.accepted);
                         pending.drain(..error.accepted);
                     }
                     return Err(TileError::Send(error));
@@ -838,7 +851,10 @@ fn has_deferred_tx<S: UdpSocket>(deferred_tx: &[Option<TileTxBatch<S>>]) -> bool
 fn drain_socket_completions<S: UdpSocket>(sockets: &mut [S]) -> Result<bool, TileError> {
     let mut progressed = false;
     for socket in sockets {
-        progressed |= socket.drain_tx_completions()? != 0;
+        let completed = socket.drain_tx_completions()?;
+        if completed != 0 {
+            progressed = true;
+        }
     }
     Ok(progressed)
 }

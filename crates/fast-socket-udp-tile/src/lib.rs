@@ -555,6 +555,8 @@ pub struct TileStats {
     /// Transmit packets dropped because they referenced an invalid source
     /// socket.
     pub tx_drops: u64,
+    /// Transmit packets accepted by tile-owned sockets.
+    pub tx_packets: u64,
 }
 
 /// Errors returned by tile runtimes.

@@ -52,7 +52,8 @@ impl XdpRouteMonitorHandle {
     /// the generation matches what we last saw, nothing has been published
     /// since our last call and we return zero.
     pub fn apply_updates(&mut self, routes: &mut XdpLocalRoutes) -> usize {
-        let Some(versioned) = self.shared.load_full() else {
+        let versioned = self.shared.load();
+        let Some(versioned) = versioned.as_ref() else {
             return 0;
         };
         if self.last_seen_generation == versioned.generation {
