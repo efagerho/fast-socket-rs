@@ -1,9 +1,0 @@
-[package]
-name = "fast-socket-udp-tile-os"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-fast-socket-os-rs = { path = "../fast-socket-os-rs" }
-fast-socket-rs = { path = "../fast-socket-rs" }
-fast-socket-udp-tile = { path = "../fast-socket-udp-tile" }

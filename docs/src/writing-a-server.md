@@ -4,13 +4,14 @@ An application writer has two main ways to build a UDP server with this
 workspace:
 
 - drive a socket directly through the core `UdpSocket` API;
-- use UDP tiles and let a tile worker own the sockets.
+- use the Tokio actor wrapper from `fast-socket-async-rs`.
 
 Both choices use the same packet ownership model. Sockets own packet pools,
 received packets arrive in owned buffers, transmit packets are frozen buffers in
 `TxSlot`s, and sockets must outlive buffers handed out by their pools.
 
-The difference is where the worker loop lives.
+The difference is where the worker loop lives and how application tasks share
+the socket.
 
 ## Choosing an API
 
@@ -19,13 +20,13 @@ threads. The application decides which thread owns each socket, when the thread
 pins itself, how it waits or busy-polls, when route maintenance runs, how
 transmit back-pressure is handled, and when completions are drained.
 
-Use tiles when the server wants a network worker to own those details. The tile
-runtime drives one or more sockets, classifies receive packets into application
-lanes, keeps per-lane transmit-buffer queues filled, accepts transmit work from
-lanes, and handles the socket polling mode.
+Use the async actor when a Tokio application wants ordinary async tasks to share
+one wait-driven socket without putting a mutex around the socket hot path. The
+actor owns the socket, drives receive, send, completion draining, and waiting,
+and exposes bounded async queues plus RAII packet wrappers to the application.
 
-Direct sockets are lower level and more flexible. Tiles are higher level and
-usually easier to compose with application worker threads.
+Direct sockets are lower level and more flexible. The actor is higher level and
+usually easier to compose with Tokio tasks.
 
 ## Direct Socket Servers
 
@@ -166,103 +167,71 @@ where
 }
 ```
 
-## Tile Servers
+## Tokio Actor Servers
 
-A UDP tile moves the socket loop into a dedicated worker. Application lanes use
-handles instead of calling `UdpSocket::recv` or `UdpSocket::send` directly.
+The async actor moves the socket loop into one Tokio task. Application tasks use
+an `AsyncUdpHandle` for allocation and transmit, and a single `AsyncUdpRx` for
+receiving actor-delivered batches.
 
-The tile worker:
+The actor:
 
-- owns the socket set;
+- owns one wait-driven socket;
 - drains socket completions;
-- receives from sockets into batches;
-- classifies received packets to lane RX queues;
-- refills per-lane transmit-buffer queues;
-- drains lane TX queues and submits packets to sockets;
-- parks or spins according to the socket polling mode.
+- receives into reusable batches;
+- publishes `ActorRxBatch` values through a bounded async queue;
+- allocates mutable `ActorTxBuffer` values on request;
+- accepts filled buffers or frozen `ActorTxPacket` values for transmit;
+- waits on the socket wake fd and command queue when no work is ready.
 
-The application lane:
+The application:
 
-- pops `TileRxBatch` values;
-- processes or forwards `TileRxPacket` values;
-- allocates `TileTxBuffer` values from its lane handle when it needs fresh
-  transmit storage;
-- pushes filled buffers with shared `TileTxMeta`, or pushes frozen
-  `TileTxPacket` values when each packet has distinct metadata.
+- calls `recv_batch` on the receive stream;
+- processes `ActorRxPacket` values without copying payload bytes;
+- requests mutable transmit buffers with `alloc_tx_batch`;
+- fills those buffers and submits them with `send_tx_buffers`, or freezes them
+  into `ActorTxPacket` values when per-packet metadata differs.
 
-This shape is useful when socket ownership should stay pinned to NIC queues or
-UMEM owner threads, while application work is split across one or more lanes.
-The bounded queues make back-pressure explicit: push methods return how much
-work was accepted and leave unaccepted work in the caller's vector.
+Each actor-owned packet wrapper carries a small lease. The lease keeps the
+actor's socket alive until the wrapper is dropped or submitted back to the
+actor, which presents the socket/buffer lifetime rule as ordinary Rust
+ownership to async code.
 
-This skeleton reflects received packets from one lane handle:
+This skeleton reflects received packets through the actor:
 
 ```rust,ignore
+use fast_socket_async_rs::{ActorTxPacket, AsyncUdpHandle, AsyncUdpRx};
 use fast_socket_rs::{PacketBufferMut, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTxBuffer};
-use fast_socket_udp_tile::{TileTxPacket, UdpNetworkTileHandle};
 
-fn reflect_lane<H>(
-    handle: &mut H,
-    tx_packets: &mut Vec<TileTxPacket<H::Socket>>,
-) -> (usize, usize)
+async fn reflect_actor<S>(
+    handle: AsyncUdpHandle<S>,
+    mut rx: AsyncUdpRx<S>,
+    tx_packets: &mut Vec<ActorTxPacket<S>>,
+) -> Result<(), Box<dyn std::error::Error>>
 where
-    H: UdpNetworkTileHandle,
-    H::Socket: UdpSocket<RecvMeta = UdpRecvMeta>,
-    UdpRxBuffer<H::Socket>: PacketBufferMut<Frozen = UdpTxBuffer<H::Socket>>,
+    S: UdpSocket<RecvMeta = UdpRecvMeta> + 'static,
+    S::Driver: fast_socket_rs::WaitDrivenDriverKind,
+    S::RecvMeta: 'static,
+    UdpRxBuffer<S>: PacketBufferMut<Frozen = UdpTxBuffer<S>>,
 {
-    let mut queued = 0;
-    let mut dropped = 0;
+    loop {
+        let mut batch = rx.recv_batch().await?;
 
-    while let Some(mut batch) = handle.pop_rx_batch() {
         tx_packets.clear();
         for packet in batch.drain() {
-            let mut tx = packet.into_transmit(packet.meta().source);
-            tx.source_port = packet.meta().destination_port;
+            let mut tx = packet.into_transmit(packet.meta.source);
+            tx.source_port = packet.meta.destination_port;
             tx_packets.push(tx);
         }
-        handle.recycle_rx_batch(batch);
 
-        queued += handle.push_tx_packets(tx_packets);
-        if !tx_packets.is_empty() {
-            dropped += tx_packets.len();
-            tx_packets.clear();
-        }
+        handle.send_tx_packets(tx_packets).await?;
     }
-
-    (queued, dropped)
 }
 ```
 
-The backend tile crates provide the common construction paths. AF_XDP tiles can
-discover queues, seed routes, install UDP port filters, start route monitoring,
-and create one tile worker per worker plan:
-
-```rust,ignore
-use fast_socket_udp_tile::SourceAddrClassifier;
-use fast_socket_udp_tile_xdp::XdpUdpTileBuilder;
-
-let mut tiles = XdpUdpTileBuilder::bind_device(device, local, lane_count)?
-    .threads(threads)
-    .classifier(SourceAddrClassifier)
-    .build()?;
-
-let lane_handles = tiles.lane_handles(0).expect("lane exists");
-```
-
-OS tiles wrap repeated `SO_REUSEPORT` sockets and use parked wait-driven tile
-workers:
-
-```rust,ignore
-use std::sync::Arc;
-
-use fast_socket_udp_tile_os::{OsUdpTileBuilder, UdpNetworkTile};
-
-let tile = OsUdpTileBuilder::reuse_port(bind_addr, socket_count, lane_count)
-    .build();
-
-let lane0 = Arc::clone(&tile).lane_handle(0).expect("lane exists");
-let worker = Arc::clone(&tile).start(0)?;
-```
+Use `spawn_udp_actor` when the socket is `Send` and can run on the Tokio
+runtime's worker threads. Use `spawn_udp_actor_local` inside a Tokio `LocalSet`
+for queue-local sockets that intentionally are not `Send`, such as wait-driven
+AF_XDP sockets.
 
 ## Tradeoffs
 
@@ -272,14 +241,14 @@ tightly tuned, the server needs IP packet sockets as well as UDP sockets, or the
 application wants exact control over waiting, spinning, completion draining, and
 maintenance.
 
-Choose tiles when the application wants to separate network ownership from
-application lanes. Tiles reduce repeated socket-loop code, centralize
-back-pressure points, keep transmit buffers preallocated for lanes, and hide
-backend worker details behind lane handles.
+Choose the async actor when the application is already Tokio-shaped and needs
+cloneable handles over one wait-driven socket. The actor reduces repeated
+socket-loop code, centralizes back-pressure points, and keeps packet buffers
+loaned instead of copied into async-friendly byte containers.
 
-The tile cost is an extra queueing layer and less direct control over exactly
-when socket operations occur. The direct-socket cost is that the application has
-to write and maintain the loop correctly.
+The actor cost is an extra async queueing layer and less direct control over
+exactly when socket operations occur. The direct-socket cost is that the
+application has to write and maintain the loop correctly.
 
 In both designs, reuse batches and vectors, handle partial transmit acceptance,
 drain completions regularly, and keep sockets alive until all buffers from their

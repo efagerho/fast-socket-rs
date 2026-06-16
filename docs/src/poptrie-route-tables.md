@@ -133,10 +133,10 @@ whole. The fastest shared-table option is usually the `arc-swap` crate
 (`arc_swap` in code): readers load the current `Arc` with one cheap atomic
 operation while writers swap in a complete replacement.
 
-A tiled design can avoid synchronization entirely by keeping each Poptrie table
-owned by the worker thread that uses it. Route updates are delivered to that
-tile's owner, and packet processing reads ordinary thread-local state with no
-atomic load on the lookup path.
+A worker-local design can avoid synchronization entirely by keeping each
+Poptrie table owned by the worker thread that uses it. Route updates are
+delivered to that worker, and packet processing reads ordinary thread-local
+state with no atomic load on the lookup path.
 
 The public API is safe. Internally, the lookup path uses unchecked indexing into
 private arrays because the builder creates and validates the required invariants.

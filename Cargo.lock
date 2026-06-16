@@ -472,8 +472,6 @@ dependencies = [
  "fast-socket-benchmarks",
  "fast-socket-os-rs",
  "fast-socket-rs",
- "fast-socket-udp-tile",
- "fast-socket-udp-tile-xdp",
  "fast-socket-xdp-rs",
  "libc",
  "tokio",
@@ -493,33 +491,6 @@ name = "fast-socket-rs"
 version = "0.1.0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "fast-socket-udp-tile"
-version = "0.1.0"
-dependencies = [
- "crossbeam-queue",
- "fast-socket-rs",
- "libc",
-]
-
-[[package]]
-name = "fast-socket-udp-tile-os"
-version = "0.1.0"
-dependencies = [
- "fast-socket-os-rs",
- "fast-socket-rs",
- "fast-socket-udp-tile",
-]
-
-[[package]]
-name = "fast-socket-udp-tile-xdp"
-version = "0.1.0"
-dependencies = [
- "fast-socket-rs",
- "fast-socket-udp-tile",
- "fast-socket-xdp-rs",
 ]
 
 [[package]]

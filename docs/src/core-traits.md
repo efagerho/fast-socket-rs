@@ -5,7 +5,7 @@ polling, routing, and the socket APIs that move packets between an application
 and a backend.
 
 This chapter is a map of the current public surface. Backend-specific builders
-and tile APIs are covered in later chapters.
+and async integration layers are covered in later chapters.
 
 ## Packet Buffers
 
@@ -95,9 +95,8 @@ descriptor, which lets a caller integrate the socket into a poll loop.
 Busy-poll drivers are for workers that repeatedly probe the socket. The core
 `BusyPollDriver` does not sleep; its `wait` method returns a spurious outcome.
 
-The marker traits `WaitDrivenDriverKind` and `BusyPollDriverKind` are used by
-the tile runtime to pair parked tiles with wait-driven sockets and spinning
-tiles with busy-poll sockets.
+The marker traits `WaitDrivenDriverKind` and `BusyPollDriverKind` let generic
+code select wait-driven or busy-poll socket loops at compile time.
 
 ## UDP Sockets
 

@@ -9,8 +9,6 @@ fast-socket-benchmarks = { path = "../benchmarks" }
 fast-socket-async-rs = { path = "../crates/fast-socket-async-rs" }
 fast-socket-os-rs = { path = "../crates/fast-socket-os-rs" }
 fast-socket-rs = { path = "../crates/fast-socket-rs" }
-fast-socket-udp-tile = { path = "../crates/fast-socket-udp-tile" }
-fast-socket-udp-tile-xdp = { path = "../crates/fast-socket-udp-tile-xdp" }
 fast-socket-xdp-rs = { path = "../crates/fast-socket-xdp-rs" }
 libc = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
@@ -28,13 +26,5 @@ name = "custom-router"
 path = "src/bin/custom-router.rs"
 
 [[bin]]
-name = "tile-blast"
-path = "src/bin/tile-blast.rs"
-
-[[bin]]
 name = "tokio-blast"
 path = "src/bin/tokio-blast.rs"
-
-[[bin]]
-name = "tile-pong-server"
-path = "src/bin/tile-pong-server.rs"

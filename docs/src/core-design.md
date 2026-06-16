@@ -2,7 +2,7 @@
 
 `fast-socket-rs` is a small set of packet ownership and socket-driving
 abstractions. Backend crates implement those abstractions for operating-system
-UDP sockets, AF_XDP queues, and higher-level UDP tiles.
+UDP sockets and AF_XDP queues.
 
 The common design goal is simple: keep the packet path explicit. Applications
 should be able to see where packet memory comes from, who owns it, when a socket
@@ -102,15 +102,15 @@ when an application wants the same packet API without requiring kernel bypass.
 types. It owns queue-local UMEM pools, raw rings, route snapshots, and XDP
 egress handles. It can be opened in busy-poll or wait-driven form.
 
-`fast-socket-udp-tile` is an application-facing layer over UDP sockets. A tile
-worker owns one or more sockets and exchanges packets with application lanes
-through bounded queues. Backend tile crates provide convenient OS and AF_XDP
-builders.
+`fast-socket-async-rs` is an application-facing Tokio layer over wait-driven UDP
+sockets. An actor task owns a socket, lends real socket buffers to async
+application code, and keeps the socket alive while any borrowed packet buffers
+remain outstanding.
 
 This layering gives application writers a choice. They can work directly with a
-socket trait and control the worker loop themselves, or they can use tiles and
-let the tile runtime own socket polling, transmit buffering, lane routing, and
-thread pinning.
+socket trait and control the worker loop themselves, or they can use the async
+actor when a Tokio application needs cloneable handles over one wait-driven
+socket.
 
 ## Specialization Points
 
@@ -120,10 +120,10 @@ from the packet path.
 
 An application that only talks to a fixed peer can use a router or egress
 resolver that returns a precomputed answer. An AF_XDP UDP router can cache and
-borrow prebuilt L2 headers. A tile classifier can send flows to stable lanes so
-application state stays local. A backend can expose `RawDevice` facts such as
-queue affinity, NUMA placement, capabilities, and counters without forcing those
-concerns into every packet operation.
+borrow prebuilt L2 headers. A worker-local classifier can keep flows on stable
+application tasks so state stays local. A backend can expose `RawDevice` facts
+such as queue affinity, NUMA placement, capabilities, and counters without
+forcing those concerns into every packet operation.
 
 These escape hatches are not separate fast and slow APIs. They are the same
 traits with more specific associated types and implementations.
