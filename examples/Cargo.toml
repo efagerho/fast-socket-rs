@@ -2,6 +2,7 @@
 name = "fast-socket-examples"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -14,17 +15,37 @@ libc = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [[bin]]
-name = "blast"
-path = "src/bin/blast.rs"
+name = "udp-echo"
+path = "src/bin/udp-echo.rs"
 
 [[bin]]
-name = "pong-server"
-path = "src/bin/pong-server.rs"
+name = "udp-pong"
+path = "src/bin/udp-pong.rs"
 
 [[bin]]
-name = "custom-router"
-path = "src/bin/custom-router.rs"
+name = "udp-discard"
+path = "src/bin/udp-discard.rs"
 
 [[bin]]
-name = "tokio-blast"
-path = "src/bin/tokio-blast.rs"
+name = "udp-proxy"
+path = "src/bin/udp-proxy.rs"
+
+[[bin]]
+name = "udp-tokio-echo"
+path = "src/bin/udp-tokio-echo.rs"
+
+[[bin]]
+name = "udp-tokio-pong"
+path = "src/bin/udp-tokio-pong.rs"
+
+[[bin]]
+name = "udp-tokio-discard"
+path = "src/bin/udp-tokio-discard.rs"
+
+[[bin]]
+name = "udp-tokio-proxy"
+path = "src/bin/udp-tokio-proxy.rs"
+
+[[bin]]
+name = "udp-xdp-static-route-blast"
+path = "src/bin/udp-xdp-static-route-blast.rs"

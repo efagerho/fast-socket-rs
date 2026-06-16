@@ -42,10 +42,15 @@ in `docs/src/SUMMARY.md`.
 List the example binaries:
 
 ```sh
-cargo run -p fast-socket-examples --bin pong-server -- --help
-cargo run -p fast-socket-examples --bin blast -- --help
-cargo run -p fast-socket-examples --bin tokio-blast -- --help
-cargo run -p fast-socket-examples --bin custom-router -- --help
+cargo run -p fast-socket-examples --bin udp-echo -- --help
+cargo run -p fast-socket-examples --bin udp-pong -- --help
+cargo run -p fast-socket-examples --bin udp-discard -- --help
+cargo run -p fast-socket-examples --bin udp-proxy -- --help
+cargo run -p fast-socket-examples --bin udp-tokio-echo -- --help
+cargo run -p fast-socket-examples --bin udp-tokio-pong -- --help
+cargo run -p fast-socket-examples --bin udp-tokio-discard -- --help
+cargo run -p fast-socket-examples --bin udp-tokio-proxy -- --help
+cargo run -p fast-socket-examples --bin udp-xdp-static-route-blast -- --help
 ```
 
 The AF_XDP examples require Linux, an appropriate NIC/interface setup, and the
@@ -57,7 +62,7 @@ Start with:
 
 - `docs/src/core-design.md` for the ownership and batching model;
 - `docs/src/core-traits.md` for the current public trait surface;
-- `docs/src/writing-a-server.md` for direct socket loops versus the Tokio actor;
+- `docs/src/writing-a-server.md` for direct socket loops versus the Tokio actor.
 
 ## License
 
