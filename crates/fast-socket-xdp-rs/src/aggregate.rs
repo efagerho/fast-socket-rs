@@ -195,6 +195,12 @@ impl<D, R> XdpUdpAggregate<D, R> {
         &mut self.members
     }
 
+    /// Consumes the aggregate and returns its member sockets.
+    #[must_use]
+    pub fn into_members(self) -> Vec<XdpUdpSocket<D, R>> {
+        self.members
+    }
+
     /// Returns whether this aggregate's members were opened over one shared UMEM.
     #[must_use]
     pub const fn members_share_umem(&self) -> bool {

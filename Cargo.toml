@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/fast-socket-rs",
+    "crates/fast-socket-async-rs",
     "crates/fast-socket-udp-tile",
     "crates/fast-socket-udp-tile-os",
     "crates/fast-socket-udp-tile-xdp",

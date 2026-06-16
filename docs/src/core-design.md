@@ -1,101 +1,129 @@
 # Core Design
 
-`fast-socket-rs` is designed around one main idea: the packet fast path should do
-as little work as possible. The library should make it practical to build network
-programs where receiving, preparing, and submitting packets can stay close to the
-hardware without paying for unnecessary copies, allocations, or runtime
-indirection.
+`fast-socket-rs` is a small set of packet ownership and socket-driving
+abstractions. Backend crates implement those abstractions for operating-system
+UDP sockets, AF_XDP queues, and higher-level UDP tiles.
 
-The default implementation should be fast enough for general use, but the design
-also leaves room for applications that know more than a general-purpose stack can
-know. When a program can prove stronger assumptions about its traffic, peers, or
-deployment environment, it should be able to move that knowledge into the type
-system or compile-time configuration and remove work from the hot path.
+The common design goal is simple: keep the packet path explicit. Applications
+should be able to see where packet memory comes from, who owns it, when a socket
+is driven, and where back-pressure can occur.
 
-## No Copies on Kernel Bypass Backends
+## Packet Ownership
 
-For kernel bypass backends, packet buffers are treated as the unit of ownership.
-The goal is to pass those buffers through the receive, processing, and transmit
-paths without copying packet contents.
+Packets are owned buffer values. A socket owns receive and transmit pools, and
+those pools hand out buffers that can move through the application before they
+are dropped or submitted back to a socket.
 
-This matters because memory bandwidth is often the real bottleneck in high packet
-rate systems. A copy that looks small in isolation becomes expensive when it is
-performed tens of millions of times per second. The library therefore prefers
-APIs that let packet data stay in backend-owned or pool-owned buffers while the
-application mutates metadata and headers in place.
+On receive, a backend fills a mutable receive buffer from the socket's receive
+pool and returns it in a `RecvBatch`. On transmit, application code builds a
+packet in a mutable transmit buffer, freezes it, wraps it in a transmit item,
+and submits it through `TxSlot`.
 
-The design assumes sockets outlive any buffers handed out by their pools. That
-lets the API keep buffer movement cheap without adding defensive ownership checks
-to every operation in the fast path.
+The crate-wide lifetime rule is that sockets and their pools outlive every
+buffer they hand out. This is part of the performance contract: backends can
+make buffer movement cheap because they do not need to protect every packet
+operation with defensive owner checks.
 
-## No Heap Allocations for Packet Processing
+Live sockets are still meant to be driven by their owning worker thread unless a
+backend documents stronger guarantees. Buffers are `Send`, so applications can
+move owned packet buffers to other threads, but the socket object itself remains
+the thing that owns polling, completion draining, and pool reuse.
 
-Packet processing should not require heap allocation. Allocation adds latency,
-creates allocator contention, and makes performance harder to reason about under
-load.
+## Reused Hot-Path Storage
 
-Instead, the design favors preallocated packet pools, fixed-capacity structures,
-and caller-provided storage. The hot path should be able to operate on buffers,
-descriptors, and stack-local state that already exist before packets arrive.
+The core APIs avoid requiring allocation in the packet loop. Receive uses
+caller-provided `RecvBatch` storage with fixed item capacity. Transmit uses
+caller-owned `Vec<TxSlot<_>>` storage so applications can retain unaccepted
+packets and retry them according to their own policy.
 
-## Compile-Time Specialization
+Sockets own their packet pools. `BufferLayout` describes the memory facts for
+those pools: payload capacity, public headroom and tailroom, link-layer
+headroom, alignment, chunk size, stride, and maximum segment count. Operating
+system sockets use heap-backed single-segment buffers; AF_XDP sockets use
+layouts that describe UMEM frame constraints and L2 headroom.
 
-Runtime checks are useful at the edges of a system, but they are expensive when
-they sit inside the loop that handles every packet. `fast-socket-rs` therefore
-prefers marker traits and type-level capabilities when a decision can be made at
-compile time.
+The API does not promise that every backend is zero-copy. The OS backend still
+copies across the kernel boundary because ordinary UDP sockets do. The shared
+abstractions are shaped so that, after a backend has placed bytes in a packet
+buffer, application code does not need extra packet-object copies to process or
+forward them.
 
-Marker traits let the library describe what a backend, socket, buffer, route
-provider, or neighbor provider can do. Generic code can then be monomorphized for
-the concrete combination used by the application. The compiler sees the exact
-types involved and can inline, eliminate dead branches, and produce code that is
-closer to a hand-written fast path for that configuration.
+## Batch Submission
 
-This approach keeps the default APIs expressive while avoiding a design where
-every transmit or receive operation repeatedly asks questions that were already
-answered when the program was compiled.
+Transmit is prefix-based. A socket accepts slots in order, takes ownership of
+each accepted packet by changing its `TxSlot` to `Taken`, and reports how many
+leading slots were accepted. If an error happens after partial progress,
+`SendError::accepted` tells the caller exactly which prefix is gone and which
+tail still belongs to the caller.
 
-## Fast Tx Submission
+This model fits both system-call backends and ring-based backends. A Linux OS
+socket can translate a prefix into `sendmmsg` work. An AF_XDP socket can
+translate a prefix into descriptors. The application sees the same ownership
+rule either way.
 
-Submitting a transmit buffer to the NIC should take as few clock cycles as
-possible. By the time a packet reaches the final submission step, the library
-should already know the buffer layout, the backend-specific descriptor format,
-and the minimum metadata needed by the NIC.
+Completions are explicit. Sockets expose `drain_tx_completions` because some
+backends cannot reuse transmit buffers until hardware or the kernel reports
+that transmission finished. `UdpSocket::allocate_tx_batch` is a convenience
+helper that allocates transmit buffers and drains completions once when the pool
+is empty, but applications that use the direct socket API still decide when that
+work runs.
 
-The Tx path is therefore designed to avoid late work. It should not copy packet
-contents, allocate temporary state, perform avoidable dispatch, or recompute
-headers that the application could have prepared earlier. The ideal submission
-path is a small amount of pointer, length, and descriptor bookkeeping followed by
-the backend's enqueue operation.
+TODO: We should still optimize batch buffer allocation.
 
-The library's abstractions are judged by this path. If an abstraction makes Tx
-submission clearer but costs extra work per packet, it needs to justify that cost
-or provide a way to specialize it away.
+## Compile-Time Shape
 
-## Escape Hatches for Maximum Performance
+The core traits use associated types for the pieces that define a socket's
+packet path:
 
-The default configuration should be broadly useful. It should handle ordinary
-routing and neighbor discovery without asking every application to become its own
-network stack. Today, the default routing table can already push past 20 million
-packets per second on a single core.
+- receive and transmit pools;
+- receive metadata;
+- polling driver;
+- IP family and egress handle for complete IP datagram sockets.
 
-Some programs, however, know enough about their environment to do even less work.
-For those programs, the library should expose compile-time and type-level escape
-hatches that replace general mechanisms with specialized ones.
+Those associated types let generic worker code be monomorphized for the exact
+backend and packet representation in use. The same pattern appears in routing:
+`RouteTable`, `NeighborTable`, and `EgressResolver` let general code use normal
+routing state while specialized applications can provide static or precomputed
+answers.
 
-For example, an application may only talk to a single peer. Another application
-may know that it only sends IP packets on the local subnet to the default
-gateway. In both cases, the program can cache a single L2 header and reuse it
-for outgoing packets.
+Polling is also type-shaped. Every socket has a `PollDriver` with a compile-time
+`PollMode`. A worker can choose a wait-driven or busy-poll loop once at startup
+instead of branching on the polling regime for every packet.
 
-That optimization can be expressed by overriding the default routing table and
-neighbor discovery mechanism. Instead of resolving routes and neighbors through
-the general path, the application supplies specialized implementations whose
-answer is already known. Once those implementations are part of the concrete
-socket type, monomorphization lets the compiler remove the unused generality from
-the hot path.
+## Backends and Layers
 
-These escape hatches are not meant to make the common case harder. They are a way
-to keep the general case ergonomic while still giving performance-critical
-applications a path to encode their deployment assumptions directly into the
-generated code.
+The core crate defines traits; backend crates decide how to implement them.
+
+`fast-socket-os-rs` implements `UdpSocket` on top of nonblocking OS UDP
+sockets. It is wait-driven, portable across supported Unix platforms, and useful
+when an application wants the same packet API without requiring kernel bypass.
+
+`fast-socket-xdp-rs` implements AF_XDP-shaped `IpPacketSocket` and `UdpSocket`
+types. It owns queue-local UMEM pools, raw rings, route snapshots, and XDP
+egress handles. It can be opened in busy-poll or wait-driven form.
+
+`fast-socket-udp-tile` is an application-facing layer over UDP sockets. A tile
+worker owns one or more sockets and exchanges packets with application lanes
+through bounded queues. Backend tile crates provide convenient OS and AF_XDP
+builders.
+
+This layering gives application writers a choice. They can work directly with a
+socket trait and control the worker loop themselves, or they can use tiles and
+let the tile runtime own socket polling, transmit buffering, lane routing, and
+thread pinning.
+
+## Specialization Points
+
+The default path is intended to be usable without writing a network stack. At
+the same time, the APIs expose places where deployment knowledge can remove work
+from the packet path.
+
+An application that only talks to a fixed peer can use a router or egress
+resolver that returns a precomputed answer. An AF_XDP UDP router can cache and
+borrow prebuilt L2 headers. A tile classifier can send flows to stable lanes so
+application state stays local. A backend can expose `RawDevice` facts such as
+queue affinity, NUMA placement, capabilities, and counters without forcing those
+concerns into every packet operation.
+
+These escape hatches are not separate fast and slow APIs. They are the same
+traits with more specific associated types and implementations.

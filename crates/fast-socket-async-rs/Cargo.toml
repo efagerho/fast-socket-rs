@@ -1,0 +1,11 @@
+[package]
+name = "fast-socket-async-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fast-socket-rs = { path = "../fast-socket-rs" }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "sync"] }

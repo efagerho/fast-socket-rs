@@ -32,7 +32,7 @@ A default route is just an inserted prefix with length `0`.
 For example, an IPv4 table can store route IDs that index a side table of
 next-hop information:
 
-```rust
+```rust,ignore
 use std::net::Ipv4Addr;
 
 use fast_socket_rs::RouteId;
@@ -111,7 +111,7 @@ slot resolves immediately to the longest prefix known for that address range.
 
 That makes the recommended route-update pattern simple:
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 
 use poptrie::Ipv4Poptrie;
@@ -154,7 +154,7 @@ uses more memory but skips more trie levels. The direct table alone costs:
 
 The built-in aliases use `DIRECT_BITS = 14`, so the direct table is 64 KiB:
 
-```rust
+```rust,ignore
 use poptrie::{Ipv4Poptrie, Ipv6Poptrie};
 
 type V4Routes<V> = Ipv4Poptrie<V>;

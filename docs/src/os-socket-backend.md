@@ -87,8 +87,16 @@ path can make progress on without changing the application-facing code.
 Each `OsUdpSocket` owns separate receive and transmit `OsBufferPool` instances.
 The pools are slab-backed. Packet buffers are `Send`, so an application can move
 an owned buffer to another worker thread and let that thread drop it. To keep
-that safe, each buffer holds an `Arc` to shared reclaim state and returns storage
-through a mutex-protected free list.
+the owner-thread path free of mutexes and per-buffer reference-count traffic,
+each buffer holds raw pointers into pool-owned reclaim state. Owner-thread drops
+return storage to a local free list; cross-thread drops enter a bounded MPSC
+remote reclaim queue that the owner drains before reuse.
+
+This relies on the core lifetime contract: the socket and its pools must outlive
+every buffer they hand out. Debug builds, and release builds with the
+`buffer-guard` feature enabled, check a lightweight owner-generation token on
+buffer access and reclaim. Release builds without that feature compile those
+checks away.
 
 The pool stores reusable `Vec<u8>` allocations. When it needs more storage, it
 grows by slabs of up to 64 backing buffers. Each backing allocation uses the
@@ -104,15 +112,16 @@ Allocation follows a small fixed pattern:
    offset.
 
 When an `OsPacketBufMut` or frozen `OsPacketBuf` is dropped, its backing storage
-is pushed back onto the same pool's free list. The live socket itself is still
-single-thread owned and should be driven by one worker, but buffer storage can be
-reclaimed from any thread. This trades one synchronized operation on drop or pool
-allocation for a safe trait-level guarantee that socket buffers are movable
-owned values.
+is returned to the same pool. If the drop happens on the socket owner thread,
+the storage goes straight to the local free list. If the drop happens on another
+thread, the storage goes through the remote reclaim queue. The live socket
+itself is still single-thread owned and should be driven by one worker, but
+buffer storage can be reclaimed from any thread as long as the socket outlives
+those buffers.
 
 Pool size is configurable independently for receive and transmit:
 
-```rust
+```rust,ignore
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use fast_socket_os_rs::OsUdpSocketBuilder;
