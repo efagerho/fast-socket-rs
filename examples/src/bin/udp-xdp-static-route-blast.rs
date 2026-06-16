@@ -256,6 +256,5 @@ fn send_batch(
 
     let accepted = socket.send(batch.as_mut_slice())?;
     socket.drain_tx_completions()?;
-    socket.notify_tx()?;
     Ok(accepted)
 }
