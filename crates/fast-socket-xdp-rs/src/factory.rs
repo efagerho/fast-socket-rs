@@ -825,6 +825,22 @@ impl XdpWorkerPlan {
     ) -> io::Result<XdpIpPacketAggregate<BusyPollDriver>> {
         XdpIpPacketAggregate::open_busy_poll(self.config, &self.queues)
     }
+
+    /// Opens this worker's wait-driven IP-packet aggregate, pinning the current
+    /// thread to [`Self::cpu`] first.
+    pub fn open_ip_packet_wait_driven(
+        self,
+    ) -> io::Result<XdpIpPacketAggregate<XdpWaitDrivenDriver>> {
+        pin_current_thread_to_cpu(self.cpu)?;
+        self.open_ip_packet_wait_driven_unpinned()
+    }
+
+    /// Opens this worker's wait-driven IP-packet aggregate **without** pinning.
+    pub fn open_ip_packet_wait_driven_unpinned(
+        self,
+    ) -> io::Result<XdpIpPacketAggregate<XdpWaitDrivenDriver>> {
+        XdpIpPacketAggregate::open_wait_driven(self.config, &self.queues)
+    }
 }
 
 /// Resolves an interface selector to an index (helper for callers).

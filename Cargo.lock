@@ -457,10 +457,12 @@ name = "fast-socket-benchmarks"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fast-socket-async-rs",
  "fast-socket-os-rs",
  "fast-socket-rs",
  "fast-socket-xdp-rs",
  "libc",
+ "tokio",
 ]
 
 [[package]]

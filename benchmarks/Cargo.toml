@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+fast-socket-async-rs = { path = "../crates/fast-socket-async-rs" }
 fast-socket-rs = { path = "../crates/fast-socket-rs" }
 fast-socket-os-rs = { path = "../crates/fast-socket-os-rs" }
 # `unstable-internals` exposes the raw AF_XDP socket/UMEM primitives the
 # `xdp-shared-umem-probe` hardware probe drives directly.
 fast-socket-xdp-rs = { path = "../crates/fast-socket-xdp-rs", features = ["unstable-internals"] }
 libc = "0.2"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
