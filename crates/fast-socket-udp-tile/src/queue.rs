@@ -1,196 +1,177 @@
-//! Bounded tile queues with compile-time wait strategies.
+//! Bounded tile queues with compile-time tile polling modes.
 
 use std::cell::UnsafeCell;
+use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread::{self, Thread};
-use std::time::Duration;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_queue::ArrayQueue;
+use fast_socket_rs::{BusyPollDriverKind, PollDriver, WaitDrivenDriverKind};
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// Compile-time wait strategy for tile queues.
+/// Tile worker polling mode.
 ///
-/// [`Spin`] compiles to pure polling. [`Park`] records the consumer thread and
-/// lets producers unpark it after a successful push.
-pub trait WaitStrategy: sealed::Sealed + Send + Sync + 'static {
-    /// Per-queue state used by this strategy.
+/// [`Spin`] is for busy-poll sockets. [`Park`] is for wait-driven sockets and
+/// sleeps on socket wake handles plus per-lane transmit wake handles.
+pub trait TilePollMode: sealed::Sealed + Send + Sync + 'static {
+    /// Per-lane wake state used by this mode.
     type State: Default + Send + Sync + 'static;
+
+    /// Concrete polling mode kind.
+    const KIND: TilePollModeKind;
 
     /// Called by a producer after a successful push.
     fn on_push(state: &Self::State);
 
-    /// Called by the consumer thread before entering its worker loop.
-    fn register_consumer(state: &Self::State);
-
-    /// Marks the consumer as about to sleep.
-    fn set_sleeping(state: &Self::State);
-
-    /// Clears the sleeping flag after waking or after the empty re-check.
-    fn clear_sleeping(state: &Self::State);
-
-    /// Performs one bounded idle wait.
-    fn do_wait();
-
-    /// Orders `set_sleeping` before the empty re-check.
-    fn fence_after_set_sleeping();
+    /// Returns the fd that wakes a parked tile worker for this lane.
+    fn wake_fd(state: &Self::State) -> Option<RawFd>;
 }
 
-/// Busy-spin wait strategy.
+/// Concrete tile polling mode kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TilePollModeKind {
+    /// Busy-polling tile loop.
+    Spin,
+    /// Wait-driven tile loop.
+    Park,
+}
+
+/// Marker trait implemented when a socket driver supports a tile polling mode.
+pub trait TilePollModeDriver<M: TilePollMode>: PollDriver {}
+
+impl<D> TilePollModeDriver<Spin> for D where D: BusyPollDriverKind {}
+
+impl<D> TilePollModeDriver<Park> for D where D: WaitDrivenDriverKind {}
+
+/// Busy-poll tile mode.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Spin;
 
 impl sealed::Sealed for Spin {}
 
-impl WaitStrategy for Spin {
+impl TilePollMode for Spin {
     type State = ();
+
+    const KIND: TilePollModeKind = TilePollModeKind::Spin;
 
     #[inline(always)]
     fn on_push(_: &()) {}
 
     #[inline(always)]
-    fn register_consumer(_: &()) {}
-
-    #[inline(always)]
-    fn set_sleeping(_: &()) {}
-
-    #[inline(always)]
-    fn clear_sleeping(_: &()) {}
-
-    #[inline(always)]
-    fn do_wait() {
-        std::hint::spin_loop();
+    fn wake_fd(_: &()) -> Option<RawFd> {
+        None
     }
-
-    #[inline(always)]
-    fn fence_after_set_sleeping() {}
 }
 
-/// Park/unpark wait strategy.
+/// Wait-driven tile mode.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Park;
 
 impl sealed::Sealed for Park {}
 
-/// Per-queue state used by [`Park`].
+/// Per-lane wake state used by [`Park`].
 pub struct ParkState {
-    sleeping: AtomicBool,
-    consumer: OnceLock<Thread>,
+    fd: OwnedFd,
 }
 
 impl Default for ParkState {
     fn default() -> Self {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            panic!(
+                "failed to create UDP tile eventfd wake handle: {}",
+                io::Error::last_os_error()
+            );
+        }
         Self {
-            sleeping: AtomicBool::new(false),
-            consumer: OnceLock::new(),
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
         }
     }
 }
 
-impl WaitStrategy for Park {
+impl TilePollMode for Park {
     type State = ParkState;
+
+    const KIND: TilePollModeKind = TilePollModeKind::Park;
 
     #[inline(always)]
     fn on_push(state: &ParkState) {
-        if state.sleeping.load(Ordering::SeqCst)
-            && let Some(thread) = state.consumer.get()
-        {
-            thread.unpark();
+        let value = 1u64;
+        let rc = unsafe {
+            libc::write(
+                state.fd.as_raw_fd(),
+                std::ptr::addr_of!(value).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EAGAIN)) {
+                debug_assert!(false, "failed to signal UDP tile eventfd: {error}");
+            }
         }
     }
 
     #[inline(always)]
-    fn register_consumer(state: &ParkState) {
-        let _ = state.consumer.set(thread::current());
-    }
-
-    #[inline(always)]
-    fn set_sleeping(state: &ParkState) {
-        state.sleeping.store(true, Ordering::SeqCst);
-    }
-
-    #[inline(always)]
-    fn clear_sleeping(state: &ParkState) {
-        state.sleeping.store(false, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    fn do_wait() {
-        thread::park_timeout(Duration::from_micros(50));
-    }
-
-    #[inline(always)]
-    fn fence_after_set_sleeping() {
-        std::sync::atomic::fence(Ordering::SeqCst);
+    fn wake_fd(state: &ParkState) -> Option<RawFd> {
+        Some(state.fd.as_raw_fd())
     }
 }
 
-/// A bounded multi-producer/single-consumer queue used between tiles.
-pub struct Queue<T, W: WaitStrategy> {
+pub(crate) struct Queue<T> {
     inner: ArrayQueue<T>,
+}
+
+impl<T> Queue<T> {
+    #[must_use]
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: ArrayQueue::new(capacity.max(1)),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn push(&self, item: T) -> Result<(), T> {
+        self.inner.push(item)
+    }
+
+    #[inline]
+    pub(crate) fn pop(&self) -> Option<T> {
+        self.inner.pop()
+    }
+}
+
+pub(crate) struct Wake<W: TilePollMode> {
     state: W::State,
 }
 
-impl<T, W: WaitStrategy> Queue<T, W> {
-    /// Creates a reference-counted bounded queue.
+impl<W: TilePollMode> Wake<W> {
     #[must_use]
-    pub fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: ArrayQueue::new(capacity.max(1)),
             state: W::State::default(),
         })
     }
 
-    /// Pushes one item, returning it when the queue is full.
     #[inline]
-    pub fn push(&self, item: T) -> Result<(), T> {
-        self.inner.push(item)?;
+    pub(crate) fn notify(&self) {
         W::on_push(&self.state);
-        Ok(())
     }
 
-    /// Pops one item.
     #[inline]
-    pub fn pop(&self) -> Option<T> {
-        self.inner.pop()
-    }
-
-    /// Returns `true` if the queue is empty.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Registers the calling thread as the consumer.
-    #[inline]
-    pub fn register_consumer(&self) {
-        W::register_consumer(&self.state);
+    pub(crate) fn wake_fd(&self) -> Option<RawFd> {
+        W::wake_fd(&self.state)
     }
 }
 
-/// Waits until at least one queue is non-empty, or until the strategy's bounded
-/// idle wait returns.
-pub fn wait_any_non_empty<T, W: WaitStrategy>(queues: &[Arc<Queue<T, W>>]) {
-    for queue in queues {
-        W::set_sleeping(&queue.state);
-    }
-    W::fence_after_set_sleeping();
-    if queues.iter().all(|queue| queue.is_empty()) {
-        W::do_wait();
-    }
-    for queue in queues {
-        W::clear_sleeping(&queue.state);
-    }
-}
-
-/// Creates a bounded single-producer/single-consumer queue endpoint pair.
 #[must_use]
-pub fn spsc_pair<T>(capacity: usize) -> (SpscProducer<T>, SpscConsumer<T>) {
+pub(crate) fn spsc_pair<T>(capacity: usize) -> (SpscProducer<T>, SpscConsumer<T>) {
     let queue = Arc::new(SpscQueue::new(capacity));
     (
         SpscProducer {
@@ -200,50 +181,56 @@ pub fn spsc_pair<T>(capacity: usize) -> (SpscProducer<T>, SpscConsumer<T>) {
     )
 }
 
-/// Producer endpoint for a bounded single-producer/single-consumer queue.
-pub struct SpscProducer<T> {
+pub(crate) struct SpscProducer<T> {
     queue: Arc<SpscQueue<T>>,
 }
 
 impl<T> SpscProducer<T> {
-    /// Pushes one item, returning it when the queue is full.
     #[inline]
-    pub fn push(&mut self, item: T) -> Result<(), T> {
+    pub(crate) fn push(&mut self, item: T) -> Result<(), T> {
         self.queue.push(item)
     }
 
-    /// Returns the number of queued items.
+    #[inline]
+    pub(crate) unsafe fn push_many_from<U, F>(&mut self, source: &mut Vec<U>, map: F) -> usize
+    where
+        F: FnMut(U) -> T,
+    {
+        unsafe { self.queue.push_many_from(source, map) }
+    }
+
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
 
-    /// Returns the number of items that can be pushed without filling the queue.
     #[inline]
     #[must_use]
-    pub fn remaining_capacity(&self) -> usize {
+    pub(crate) fn remaining_capacity(&self) -> usize {
         self.queue.remaining_capacity()
     }
 }
 
-/// Consumer endpoint for a bounded single-producer/single-consumer queue.
-pub struct SpscConsumer<T> {
+pub(crate) struct SpscConsumer<T> {
     queue: Arc<SpscQueue<T>>,
 }
 
 impl<T> SpscConsumer<T> {
-    /// Pops one item.
     #[inline]
-    #[cfg(test)]
-    pub fn pop(&mut self) -> Option<T> {
+    pub(crate) fn pop(&mut self) -> Option<T> {
         self.queue.pop()
     }
 
-    /// Pops up to `count` items directly into `out`.
     #[inline]
-    pub fn pop_into(&mut self, count: usize, out: &mut Vec<T>) -> usize {
+    pub(crate) fn pop_into(&mut self, count: usize, out: &mut Vec<T>) -> usize {
         self.queue.pop_into(count, out)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
 
@@ -286,7 +273,50 @@ impl<T> SpscQueue<T> {
     }
 
     #[inline]
-    #[cfg(test)]
+    unsafe fn push_many_from<U, F>(&self, source: &mut Vec<U>, mut map: F) -> usize
+    where
+        F: FnMut(U) -> T,
+    {
+        let len = source.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut tail = self.tail.0.load(Ordering::Relaxed);
+        let head = self.head.0.load(Ordering::Acquire);
+        let available = if tail >= head {
+            self.slots() - 1 - (tail - head)
+        } else {
+            head - tail - 1
+        };
+        let accepted = len.min(available);
+        if accepted == 0 {
+            return 0;
+        }
+
+        let source_ptr = source.as_mut_ptr();
+        for index in 0..accepted {
+            let item = unsafe { source_ptr.add(index).read() };
+            unsafe {
+                (*self.buffer[tail].get()).write(map(item));
+            }
+            tail = self.next(tail);
+        }
+
+        let remaining = len - accepted;
+        if remaining != 0 {
+            unsafe {
+                ptr::copy(source_ptr.add(accepted), source_ptr, remaining);
+            }
+        }
+        unsafe {
+            source.set_len(remaining);
+        }
+        self.tail.0.store(tail, Ordering::Release);
+        accepted
+    }
+
+    #[inline]
     fn pop(&self) -> Option<T> {
         let head = self.head.0.load(Ordering::Relaxed);
         if head == self.tail.0.load(Ordering::Acquire) {
@@ -347,6 +377,11 @@ impl<T> SpscQueue<T> {
     }
 
     #[inline]
+    fn is_empty(&self) -> bool {
+        self.head.0.load(Ordering::Acquire) == self.tail.0.load(Ordering::Acquire)
+    }
+
+    #[inline]
     fn capacity(&self) -> usize {
         self.slots() - 1
     }
@@ -390,7 +425,7 @@ mod tests {
 
     #[test]
     fn queue_returns_item_when_full() {
-        let queue = Queue::<u32, Spin>::new(1);
+        let queue = Queue::<u32>::new(1);
         assert_eq!(queue.push(1), Ok(()));
         assert_eq!(queue.push(2), Err(2));
         assert_eq!(queue.pop(), Some(1));
@@ -413,6 +448,18 @@ mod tests {
         let mut out = vec![0];
         assert_eq!(consumer.pop_into(4, &mut out), 2);
         assert_eq!(out, [0, 1, 2]);
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn spsc_queue_pushes_many_from_vec() {
+        let (mut producer, mut consumer) = spsc_pair(2);
+        let mut source = vec![1, 2, 3];
+        let accepted = unsafe { producer.push_many_from(&mut source, |value| value * 10) };
+        assert_eq!(accepted, 2);
+        assert_eq!(source, [3]);
+        assert_eq!(consumer.pop(), Some(10));
+        assert_eq!(consumer.pop(), Some(20));
         assert_eq!(consumer.pop(), None);
     }
 }

@@ -37,7 +37,8 @@ pub use ip_packet::{
     IpPacketTxItem, IpVersion, TxOffload,
 };
 pub use policy::{
-    BusyPollDriver, IpFamily, Mixed, PollDriver, PollMode, V4Only, V6Only, WaitOutcome, WakeHandle,
+    BusyPollDriver, BusyPollDriverKind, IpFamily, Mixed, PollDriver, PollMode, V4Only, V6Only,
+    WaitDrivenDriverKind, WaitOutcome, WakeHandle,
 };
 pub use route::{
     EgressResolver, LinkAddr, LinkAddrParseError, NeighborId, NeighborTable, RouteHop, RouteId,

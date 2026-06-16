@@ -348,7 +348,7 @@ fn wait_for_workers_ready(
 fn signal_worker_ready(ready_tx: &mpsc::Sender<u32>, cpu: u32) -> Result<(), BoxError> {
     ready_tx
         .send(cpu)
-        .map_err(|error| format!("signal worker readiness: {error}").into())
+        .map_err(|error| format!("signal worker ready state: {error}").into())
 }
 
 fn wait_for_worker_start(start: &AtomicBool, stop: &AtomicBool) -> bool {

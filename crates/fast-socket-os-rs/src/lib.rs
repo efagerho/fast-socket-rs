@@ -930,6 +930,8 @@ impl PollDriver for OsWaitDrivenDriver {
     }
 }
 
+impl fast_socket_rs::WaitDrivenDriverKind for OsWaitDrivenDriver {}
+
 fn bind_udp_socket(
     addr: SocketAddr,
     reuse_port: bool,

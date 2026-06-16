@@ -45,30 +45,30 @@ pub type XdpIpPacketRecvMeta = IpPacketRecvMeta;
 /// Busy-poll AF_XDP IP packet socket.
 pub type BusyPollXdpIpPacketSocket = XdpIpPacketSocket<BusyPollDriver>;
 
-/// Readiness-driven AF_XDP IP packet socket.
-pub type ReadinessXdpIpPacketSocket = XdpIpPacketSocket<XdpReadinessDriver>;
+/// Wait-driven AF_XDP IP packet socket.
+pub type WaitDrivenXdpIpPacketSocket = XdpIpPacketSocket<XdpWaitDrivenDriver>;
 
 /// Busy-poll AF_XDP UDP socket.
 pub type BusyPollXdpUdpSocket<R = XdpQueueLocalRouter> = XdpUdpSocket<BusyPollDriver, R>;
 
-/// Readiness-driven AF_XDP UDP socket.
-pub type ReadinessXdpUdpSocket<R = XdpQueueLocalRouter> = XdpUdpSocket<XdpReadinessDriver, R>;
+/// Wait-driven AF_XDP UDP socket.
+pub type WaitDrivenXdpUdpSocket<R = XdpQueueLocalRouter> = XdpUdpSocket<XdpWaitDrivenDriver, R>;
 
-/// Readiness-driven polling driver backed by an AF_XDP fd clone.
+/// Wait-driven polling driver backed by an AF_XDP fd clone.
 #[derive(Debug)]
-pub struct XdpReadinessDriver {
+pub struct XdpWaitDrivenDriver {
     fd: OwnedFd,
 }
 
-impl XdpReadinessDriver {
-    /// Creates a readiness driver from an owned fd.
+impl XdpWaitDrivenDriver {
+    /// Creates a wait-driven driver from an owned fd.
     #[must_use]
     pub const fn new(fd: OwnedFd) -> Self {
         Self { fd }
     }
 }
 
-impl PollDriver for XdpReadinessDriver {
+impl PollDriver for XdpWaitDrivenDriver {
     const MODE: PollMode = PollMode::WaitDriven;
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error> {
@@ -79,6 +79,8 @@ impl PollDriver for XdpReadinessDriver {
         Some(WakeHandle::from_fd(self.fd.as_fd()))
     }
 }
+
+impl fast_socket_rs::WaitDrivenDriverKind for XdpWaitDrivenDriver {}
 
 /// AF_XDP IP packet socket state.
 #[derive(Debug)]
@@ -848,17 +850,42 @@ impl XdpIpPacketSocket<BusyPollDriver> {
     }
 }
 
-impl XdpIpPacketSocket<XdpReadinessDriver> {
-    /// Creates a readiness-driven AF_XDP IP packet socket from config.
-    pub fn new_readiness(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
+impl XdpIpPacketSocket<XdpWaitDrivenDriver> {
+    /// Creates a wait-driven AF_XDP IP packet socket from config.
+    pub fn new_wait_driven(config: XdpIpPacketSocketConfig) -> std::io::Result<Self> {
         let opened = LiveXdpState::open(&config)?;
         let fd = opened.state.raw.try_clone_fd()?;
-        let driver = XdpReadinessDriver::new(fd);
+        let driver = XdpWaitDrivenDriver::new(fd);
         let mut socket = construct_state(config, driver);
         socket.rx_pool = opened.rx_pool;
         socket.tx_pool = opened.tx_pool;
         socket.live = Some(opened.state);
         Ok(socket)
+    }
+
+    /// Opens one wait-driven member socket per queue over a single shared UMEM.
+    ///
+    /// This is the wait-driven counterpart to
+    /// [`XdpIpPacketSocket::open_shared_busy_poll`]. Each member owns a cloned
+    /// AF_XDP fd through its wait driver so callers can poll every queue fd
+    /// while all members still share one NUMA-local UMEM.
+    pub fn open_shared_wait_driven(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+    ) -> std::io::Result<Vec<Self>> {
+        let opened = LiveXdpState::open_shared_members(&config, queues)?;
+        let mut sockets = Vec::with_capacity(opened.len());
+        for (member, queue) in opened.into_iter().zip(queues.iter()) {
+            let fd = member.state.raw.try_clone_fd()?;
+            let mut member_config = config.clone();
+            member_config.queue_id = *queue;
+            let mut socket = construct_state(member_config, XdpWaitDrivenDriver::new(fd));
+            socket.rx_pool = member.rx_pool;
+            socket.tx_pool = member.tx_pool;
+            socket.live = Some(member.state);
+            sockets.push(socket);
+        }
+        Ok(sockets)
     }
 }
 
@@ -1577,6 +1604,79 @@ impl<R> XdpUdpSocket<BusyPollDriver, R> {
         mut make_router: impl FnMut() -> R,
     ) -> std::io::Result<Vec<Self>> {
         let ip_members = XdpIpPacketSocket::open_shared_busy_poll(config, queues)?;
+        let mut sockets = Vec::with_capacity(ip_members.len());
+        for ip in ip_members {
+            sockets.push(Self::from_ip_socket_accepting(
+                ip,
+                local_addr,
+                accepted_ports.clone(),
+                make_router(),
+            ));
+        }
+        Ok(sockets)
+    }
+}
+
+impl XdpUdpSocket<XdpWaitDrivenDriver, XdpQueueLocalRouter> {
+    /// Opens one wait-driven UDP member socket per queue over a single shared
+    /// UMEM. Each member gets its own queue-local router seeded from
+    /// `config.route_snapshot`.
+    pub fn open_shared_wait_driven(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+    ) -> std::io::Result<Vec<Self>> {
+        Self::open_shared_wait_driven_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::single(local_addr.port()),
+        )
+    }
+
+    pub(crate) fn open_shared_wait_driven_accepting(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        accepted_ports: XdpUdpAcceptedPorts,
+    ) -> std::io::Result<Vec<Self>> {
+        let snapshot = config.route_snapshot.clone();
+        Self::open_shared_wait_driven_with_accepting(
+            config,
+            queues,
+            local_addr,
+            accepted_ports,
+            move || XdpQueueLocalRouter::new(snapshot.clone()),
+        )
+    }
+}
+
+impl<R> XdpUdpSocket<XdpWaitDrivenDriver, R> {
+    /// Opens one wait-driven UDP member socket per queue over a single shared
+    /// UMEM, building each member's router with `make_router`.
+    pub fn open_shared_wait_driven_with(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        make_router: impl FnMut() -> R,
+    ) -> std::io::Result<Vec<Self>> {
+        Self::open_shared_wait_driven_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::single(local_addr.port()),
+            make_router,
+        )
+    }
+
+    pub(crate) fn open_shared_wait_driven_with_accepting(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        accepted_ports: XdpUdpAcceptedPorts,
+        mut make_router: impl FnMut() -> R,
+    ) -> std::io::Result<Vec<Self>> {
+        let ip_members = XdpIpPacketSocket::open_shared_wait_driven(config, queues)?;
         let mut sockets = Vec::with_capacity(ip_members.len());
         for ip in ip_members {
             sockets.push(Self::from_ip_socket_accepting(

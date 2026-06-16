@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use common::{BoxError, install_shutdown_signal_handlers, interface_ipv4_addr, shutdown_requested};
-use fast_socket_udp_tile::{SourceAddrClassifier, UdpNetworkTileHandle};
+use fast_socket_udp_tile::{SourceAddrClassifier, TileTxPacket, UdpNetworkTileHandle};
 use fast_socket_udp_tile_xdp::{XdpUdpTileBuilder, XdpUdpTileHandle, XdpUdpTiles};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 type XdpTileHandle = XdpUdpTileHandle<SourceAddrClassifier>;
+type XdpTileSocket = <XdpTileHandle as UdpNetworkTileHandle>::Socket;
 type XdpTileSet = XdpUdpTiles<SourceAddrClassifier>;
 
 #[derive(Debug, Parser)]
@@ -143,7 +144,7 @@ fn run_lanes(mut tiles: XdpTileSet, lane_count: usize) -> Result<(), BoxError> {
 
 fn run_lane(
     lane_index: usize,
-    handles: Vec<XdpTileHandle>,
+    mut handles: Vec<XdpTileHandle>,
     stop: &AtomicBool,
     reflected: &AtomicU64,
     dropped: &AtomicU64,
@@ -155,11 +156,12 @@ fn run_lane(
     );
     let mut local_reflected = 0u64;
     let mut local_dropped = 0u64;
+    let mut tx_packets = Vec::new();
 
     while !stop.load(Ordering::Relaxed) && !shutdown_requested() {
         let mut progressed = false;
-        for handle in &handles {
-            let (queued, queue_drops) = reflect_rx_batches(handle);
+        for handle in &mut handles {
+            let (queued, queue_drops) = reflect_rx_batches(handle, &mut tx_packets);
             progressed |= queued != 0 || queue_drops != 0;
             local_reflected += queued as u64;
             local_dropped += queue_drops as u64;
@@ -186,33 +188,32 @@ fn run_lane(
     }
 }
 
-fn reflect_rx_batches(handle: &XdpTileHandle) -> (usize, usize) {
+fn reflect_rx_batches(
+    handle: &mut XdpTileHandle,
+    tx_packets: &mut Vec<TileTxPacket<XdpTileSocket>>,
+) -> (usize, usize) {
     let mut queued = 0usize;
     let mut dropped = 0usize;
 
     while let Some(mut rx_batch) = handle.pop_rx_batch() {
-        let mut tx_batch = handle.alloc_tx_batch();
+        tx_packets.clear();
         for packet in rx_batch.drain() {
             let destination = packet.meta().source;
             let source_port = packet.meta().destination_port;
             let mut transmit = packet.into_transmit(destination);
             transmit.source_port = source_port;
-            tx_batch.push(transmit);
+            tx_packets.push(transmit);
         }
         handle.recycle_rx_batch(rx_batch);
 
-        if tx_batch.is_empty() {
-            handle.recycle_tx_batch(tx_batch);
+        if tx_packets.is_empty() {
             continue;
         }
 
-        let batch_len = tx_batch.len();
-        match handle.push_tx_batch(tx_batch) {
-            Ok(()) => queued += batch_len,
-            Err(tx_batch) => {
-                dropped += tx_batch.len();
-                handle.recycle_tx_batch(tx_batch);
-            }
+        queued += handle.push_tx_packets(tx_packets);
+        if !tx_packets.is_empty() {
+            dropped += tx_packets.len();
+            tx_packets.clear();
         }
     }
 

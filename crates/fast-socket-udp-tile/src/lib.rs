@@ -1,11 +1,14 @@
 //! UDP network-tile contracts for `fast-socket-rs` sockets.
 //!
-//! This crate intentionally contains only the shared tile interface and common
-//! packet/classifier types. Backend crates such as `fast-socket-udp-tile-os`
-//! and `fast-socket-udp-tile-xdp` own the concrete queueing, batching, wakeup,
-//! completion-drain, and worker-affinity policy.
+//! This crate contains the shared tile interface, packet/classifier types, and
+//! backend-neutral worker runtime. Backend crates such as
+//! `fast-socket-udp-tile-os` and `fast-socket-udp-tile-xdp` provide socket-set
+//! wrappers, setup builders, and re-exports for application code.
 
 #![deny(missing_docs)]
+
+mod queue;
+mod runtime;
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -18,6 +21,9 @@ use fast_socket_rs::{
     QueueAffinity, ReserveError, SendError, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTransmit,
     UdpTxBuffer, UdpTxBufferMut,
 };
+
+pub use queue::{Park, Spin, TilePollMode, TilePollModeDriver, TilePollModeKind};
+pub use runtime::{UdpSocketSet, UdpTile, UdpTileHandle};
 
 /// Number of per-lane RX/TX queue slots used by default.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -427,66 +433,38 @@ impl<S: UdpSocket> TileTxPacket<S> {
     }
 }
 
-/// A batch of packets queued by a lane for network transmit.
-pub struct TileTxBatch<S: UdpSocket> {
-    packets: Vec<TileTxPacket<S>>,
+/// Transmit metadata applied to a batch of tile-owned UDP buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TileTxMeta {
+    /// Remote destination address.
+    pub destination: SocketAddr,
+    /// Optional source IP selection.
+    pub source_ip: Option<IpAddr>,
+    /// Optional source UDP port selection.
+    pub source_port: Option<u16>,
+    /// Optional ECN codepoint.
+    pub ecn: Option<EcnCodepoint>,
+    /// Optional UDP segmentation size.
+    pub gso_segment_size: Option<NonZeroU16>,
 }
 
-impl<S: UdpSocket> TileTxBatch<S> {
-    /// Creates an empty transmit batch with room for `capacity` packets.
+impl TileTxMeta {
+    /// Creates metadata for a UDP transmit batch.
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub const fn new(destination: SocketAddr) -> Self {
         Self {
-            packets: Vec::with_capacity(capacity),
+            destination,
+            source_ip: None,
+            source_port: None,
+            ecn: None,
+            gso_segment_size: None,
         }
     }
+}
 
-    /// Returns the number of packets in this batch.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.packets.len()
-    }
-
-    /// Returns `true` when this batch has no packets.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
-    }
-
-    /// Returns the currently allocated packet capacity.
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.packets.capacity()
-    }
-
-    /// Reserves capacity for at least `additional` more packets.
-    pub fn reserve(&mut self, additional: usize) {
-        self.packets.reserve(additional);
-    }
-
-    /// Adds one packet to the end of this batch.
-    pub fn push(&mut self, packet: TileTxPacket<S>) {
-        self.packets.push(packet);
-    }
-
-    /// Removes the last packet from this batch.
-    pub fn pop(&mut self) -> Option<TileTxPacket<S>> {
-        self.packets.pop()
-    }
-
-    /// Iterates packets in this batch without consuming them.
-    pub fn iter(&self) -> std::slice::Iter<'_, TileTxPacket<S>> {
-        self.packets.iter()
-    }
-
-    /// Drops every packet in this batch while keeping the allocation.
-    pub fn clear(&mut self) {
-        self.packets.clear();
-    }
-
-    /// Drains every packet in this batch while keeping the allocation.
-    pub fn drain(&mut self) -> std::vec::Drain<'_, TileTxPacket<S>> {
-        self.packets.drain(..)
+impl From<SocketAddr> for TileTxMeta {
+    fn from(destination: SocketAddr) -> Self {
+        Self::new(destination)
     }
 }
 
@@ -584,6 +562,10 @@ pub enum TileError {
     Pin(std::io::Error),
     /// Worker thread spawning failed.
     Spawn(std::io::Error),
+    /// A wait-driven tile socket did not expose a wake handle.
+    MissingWakeHandle,
+    /// Waiting for tile work failed.
+    Wait(std::io::Error),
     /// A socket operation failed.
     Socket(Error),
     /// A send operation failed after accepting part of a batch.
@@ -605,6 +587,10 @@ impl fmt::Display for TileError {
             ),
             Self::Pin(error) => write!(f, "UDP tile thread pinning failed: {error}"),
             Self::Spawn(error) => write!(f, "UDP tile worker spawn failed: {error}"),
+            Self::MissingWakeHandle => {
+                f.write_str("UDP tile wait-driven socket did not expose a wake handle")
+            }
+            Self::Wait(error) => write!(f, "UDP tile wait failed: {error}"),
             Self::Socket(error) => write!(f, "UDP tile socket operation failed: {error}"),
             Self::Send(error) => write!(f, "UDP tile send failed: {error}"),
         }
@@ -614,7 +600,7 @@ impl fmt::Display for TileError {
 impl std::error::Error for TileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Pin(error) | Self::Spawn(error) => Some(error),
+            Self::Pin(error) | Self::Spawn(error) | Self::Wait(error) => Some(error),
             Self::Socket(error) => Some(error),
             Self::Send(error) => Some(error),
             _ => None,
@@ -643,11 +629,23 @@ pub trait UdpNetworkTileHandle: Send + 'static {
     /// Pops one received packet batch from this lane.
     fn pop_rx_batch(&self) -> Option<TileRxBatch<Self::Socket>>;
 
-    /// Pushes one transmit packet batch from this lane.
-    fn push_tx_batch(
-        &self,
-        batch: TileTxBatch<Self::Socket>,
-    ) -> Result<(), TileTxBatch<Self::Socket>>;
+    /// Pushes filled transmit buffers from this lane using shared metadata.
+    ///
+    /// Returns the number of buffers accepted by the tile. Accepted buffers are
+    /// removed from `buffers`; any remaining buffers stay in `buffers` and are
+    /// still owned by the caller.
+    fn push_tx_buffers(
+        &mut self,
+        buffers: &mut Vec<TileTxBuffer<Self::Socket>>,
+        meta: TileTxMeta,
+    ) -> usize;
+
+    /// Pushes frozen transmit packets from this lane.
+    ///
+    /// Returns the number of packets accepted by the tile. Accepted packets are
+    /// removed from `packets`; any remaining packets stay in `packets` and are
+    /// still owned by the caller.
+    fn push_tx_packets(&mut self, packets: &mut Vec<TileTxPacket<Self::Socket>>) -> usize;
 
     /// Pops up to `count` preallocated transmit buffers for this lane into
     /// `out`.
@@ -662,12 +660,6 @@ pub trait UdpNetworkTileHandle: Send + 'static {
 
     /// Recycles an empty or discarded receive batch container.
     fn recycle_rx_batch(&self, batch: TileRxBatch<Self::Socket>);
-
-    /// Allocates an empty transmit batch container.
-    fn alloc_tx_batch(&self) -> TileTxBatch<Self::Socket>;
-
-    /// Recycles an empty or discarded transmit batch container.
-    fn recycle_tx_batch(&self, batch: TileTxBatch<Self::Socket>);
 }
 
 /// Public UDP tile interface.

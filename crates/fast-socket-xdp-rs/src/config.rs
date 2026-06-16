@@ -11,8 +11,8 @@ use crate::program::{AttachMode, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
 use crate::route::RouteSnapshot;
 use crate::socket::{
-    BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
-    ReadinessXdpUdpSocket, XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpAcceptedPorts,
+    BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, WaitDrivenXdpIpPacketSocket,
+    WaitDrivenXdpUdpSocket, XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpAcceptedPorts,
     XdpUdpRouter, XdpUdpSocket,
 };
 
@@ -214,9 +214,9 @@ impl XdpIpPacketSocketBuilder {
         XdpIpPacketSocket::new_busy_poll(self.config)
     }
 
-    /// Builds a readiness-driven AF_XDP IP packet socket.
-    pub fn open_readiness(self) -> io::Result<ReadinessXdpIpPacketSocket> {
-        XdpIpPacketSocket::new_readiness(self.config)
+    /// Builds a wait-driven AF_XDP IP packet socket.
+    pub fn open_wait_driven(self) -> io::Result<WaitDrivenXdpIpPacketSocket> {
+        XdpIpPacketSocket::new_wait_driven(self.config)
     }
 
     /// Returns the accumulated configuration.
@@ -403,12 +403,12 @@ impl<R> XdpUdpSocketBuilder<R> {
         ))
     }
 
-    /// Builds a readiness-driven AF_XDP UDP socket.
-    pub fn open_readiness(self) -> io::Result<ReadinessXdpUdpSocket<R>>
+    /// Builds a wait-driven AF_XDP UDP socket.
+    pub fn open_wait_driven(self) -> io::Result<WaitDrivenXdpUdpSocket<R>>
     where
         R: XdpUdpRouter,
     {
-        let ip = XdpIpPacketSocket::new_readiness(self.config)?;
+        let ip = XdpIpPacketSocket::new_wait_driven(self.config)?;
         Ok(XdpUdpSocket::from_ip_socket_accepting(
             ip,
             self.local_addr,

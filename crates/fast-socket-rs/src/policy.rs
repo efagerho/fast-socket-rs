@@ -100,6 +100,12 @@ pub trait PollDriver {
     fn wake_handle(&self) -> Option<WakeHandle<'_>>;
 }
 
+/// Marker trait for drivers that are intended to be polled continuously.
+pub trait BusyPollDriverKind: PollDriver {}
+
+/// Marker trait for drivers that can wait on an external event source.
+pub trait WaitDrivenDriverKind: PollDriver {}
+
 /// Busy-poll driver for sockets that own a worker core.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BusyPollDriver;
@@ -125,6 +131,8 @@ impl PollDriver for BusyPollDriver {
         None
     }
 }
+
+impl BusyPollDriverKind for BusyPollDriver {}
 
 /// Type-level IP family policy used by IP packet sockets and packet policies.
 pub trait IpFamily {

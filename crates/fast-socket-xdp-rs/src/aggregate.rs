@@ -24,6 +24,7 @@ use fast_socket_rs::{
 use crate::config::XdpIpPacketSocketConfig;
 use crate::socket::{
     XdpIpPacketSocket, XdpQueueLocalRouter, XdpUdpAcceptedPorts, XdpUdpRouter, XdpUdpSocket,
+    XdpWaitDrivenDriver,
 };
 
 /// One logical AF_XDP IP-packet socket fed by 1..N NIC queues.
@@ -91,6 +92,20 @@ impl XdpIpPacketAggregate<BusyPollDriver> {
     /// [`XdpIpPacketSocket::open_shared_busy_poll`].
     pub fn open_busy_poll(config: XdpIpPacketSocketConfig, queues: &[QueueId]) -> io::Result<Self> {
         Self::from_shared_umem_members(XdpIpPacketSocket::open_shared_busy_poll(config, queues)?)
+    }
+}
+
+impl XdpIpPacketAggregate<XdpWaitDrivenDriver> {
+    /// Opens one wait-driven aggregate over `queues`, all sharing a single
+    /// UMEM.
+    ///
+    /// `config.frame_count` is the per-member frame count. See
+    /// [`XdpIpPacketSocket::open_shared_wait_driven`].
+    pub fn open_wait_driven(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpIpPacketSocket::open_shared_wait_driven(config, queues)?)
     }
 }
 
@@ -249,6 +264,54 @@ impl XdpUdpAggregate<BusyPollDriver, XdpQueueLocalRouter> {
     }
 }
 
+impl XdpUdpAggregate<XdpWaitDrivenDriver, XdpQueueLocalRouter> {
+    /// Opens one wait-driven UDP aggregate over `queues`, all sharing a single
+    /// UMEM. `config.frame_count` is the per-member frame count. See
+    /// [`XdpUdpSocket::open_shared_wait_driven`].
+    pub fn open_wait_driven(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven(
+            config, queues, local_addr,
+        )?)
+    }
+
+    /// Opens one wait-driven UDP aggregate accepting the given UDP destination
+    /// ports in the userspace UDP parser.
+    pub fn open_wait_driven_accepting_ports(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        ports: impl IntoIterator<Item = u16>,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::ports(ports.into_iter().collect()),
+        )?)
+    }
+
+    /// Opens one wait-driven UDP aggregate accepting an inclusive UDP
+    /// destination port range in the userspace UDP parser.
+    pub fn open_wait_driven_accepting_port_range(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        start: u16,
+        end: u16,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::range(start, end),
+        )?)
+    }
+}
+
 impl<R> XdpUdpAggregate<BusyPollDriver, R> {
     /// Opens one busy-poll UDP aggregate over `queues` (single shared UMEM)
     /// with a caller-supplied [`XdpUdpRouter`] built per member by
@@ -296,6 +359,62 @@ impl<R> XdpUdpAggregate<BusyPollDriver, R> {
         make_router: impl FnMut() -> R,
     ) -> io::Result<Self> {
         Self::from_shared_umem_members(XdpUdpSocket::open_shared_busy_poll_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::range(start, end),
+            make_router,
+        )?)
+    }
+}
+
+impl<R> XdpUdpAggregate<XdpWaitDrivenDriver, R> {
+    /// Opens one wait-driven UDP aggregate over `queues` (single shared UMEM)
+    /// with a caller-supplied [`XdpUdpRouter`](crate::XdpUdpRouter) built per
+    /// member by `make_router`.
+    pub fn open_wait_driven_with(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven_with(
+            config,
+            queues,
+            local_addr,
+            make_router,
+        )?)
+    }
+
+    /// Opens one wait-driven UDP aggregate with a custom router while accepting
+    /// the given UDP destination ports in the userspace UDP parser.
+    pub fn open_wait_driven_with_accepting_ports(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        ports: impl IntoIterator<Item = u16>,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven_with_accepting(
+            config,
+            queues,
+            local_addr,
+            XdpUdpAcceptedPorts::ports(ports.into_iter().collect()),
+            make_router,
+        )?)
+    }
+
+    /// Opens one wait-driven UDP aggregate with a custom router while accepting
+    /// an inclusive UDP destination port range in the userspace UDP parser.
+    pub fn open_wait_driven_with_accepting_port_range(
+        config: XdpIpPacketSocketConfig,
+        queues: &[QueueId],
+        local_addr: SocketAddrV4,
+        start: u16,
+        end: u16,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<Self> {
+        Self::from_shared_umem_members(XdpUdpSocket::open_shared_wait_driven_with_accepting(
             config,
             queues,
             local_addr,

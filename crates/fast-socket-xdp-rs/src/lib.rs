@@ -86,8 +86,8 @@ pub use route::{RouteSnapshot, XdpLocalRoutes};
 pub use route_monitor::{XdpRouteMonitor, XdpRouteMonitorHandle};
 #[cfg(target_os = "linux")]
 pub use socket::{
-    BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, ReadinessXdpIpPacketSocket,
-    ReadinessXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalRouter,
+    BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, WaitDrivenXdpIpPacketSocket,
+    WaitDrivenXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalRouter,
     XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
 };
 /// Unstable low-level AF_XDP building blocks.

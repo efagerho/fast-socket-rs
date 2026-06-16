@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-crossbeam-queue = "0.3"
 fast-socket-rs = { path = "../fast-socket-rs" }
 fast-socket-udp-tile = { path = "../fast-socket-udp-tile" }
 fast-socket-xdp-rs = { path = "../fast-socket-xdp-rs" }

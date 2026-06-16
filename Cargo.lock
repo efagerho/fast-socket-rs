@@ -489,14 +489,15 @@ dependencies = [
 name = "fast-socket-udp-tile"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "fast-socket-rs",
+ "libc",
 ]
 
 [[package]]
 name = "fast-socket-udp-tile-os"
 version = "0.1.0"
 dependencies = [
- "crossbeam-queue",
  "fast-socket-os-rs",
  "fast-socket-rs",
  "fast-socket-udp-tile",
@@ -506,7 +507,6 @@ dependencies = [
 name = "fast-socket-udp-tile-xdp"
 version = "0.1.0"
 dependencies = [
- "crossbeam-queue",
  "fast-socket-rs",
  "fast-socket-udp-tile",
  "fast-socket-xdp-rs",

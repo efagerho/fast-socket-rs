@@ -81,7 +81,7 @@ fn run_threaded(
     payload_len: usize,
     limit: RunLimit,
 ) -> Result<(), BoxError> {
-    // Start barrier: each worker opens its socket, signals readiness, then
+    // Start barrier: each worker opens its socket, signals ready state, then
     // spins on `start` until main has seen every signal. Only then does main
     // capture `started`. Without this the per-thread socket-open time leaks
     // into the elapsed wall clock and biases pps low.

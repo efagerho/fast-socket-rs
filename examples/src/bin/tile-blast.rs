@@ -8,21 +8,23 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use common::{
     BoxError, install_shutdown_signal_handlers, interface_ipv4_addr, payload, shutdown_requested,
     write_sequence,
 };
-use fast_socket_udp_tile::{AcceptAllClassifier, TileConfig, UdpNetworkTileHandle};
-use fast_socket_udp_tile_xdp::{XdpUdpTileBuilder, XdpUdpTileHandle, XdpUdpTiles};
+use fast_socket_udp_tile::{
+    AcceptAllClassifier, TileConfig, TileStats, TileTxMeta, UdpNetworkTileHandle,
+};
+use fast_socket_udp_tile_xdp::{
+    ParkXdpUdpTileHandle, ParkXdpUdpTiles, TileWorkerError, XdpUdpTileBuilder, XdpUdpTileHandle,
+    XdpUdpTiles,
+};
 
 const BATCH_SIZE: usize = 128;
 const PAYLOAD_LEN: usize = 64;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const READY_WAIT_INTERVAL: Duration = Duration::from_millis(100);
-
-type XdpTileHandle = XdpUdpTileHandle<AcceptAllClassifier>;
-type XdpTileSet = XdpUdpTiles<AcceptAllClassifier>;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -46,6 +48,11 @@ struct Args {
     /// Number of application producer lanes feeding each tile.
     #[arg(long, default_value_t = 1)]
     lane_count: usize,
+
+    /// Tile/socket polling mode: spin uses busy-poll XDP sockets, park uses
+    /// wait-driven XDP sockets and sleeps on RX/TX wake fds.
+    #[arg(long, value_enum, default_value_t = TilePollModeArg::Spin)]
+    poll_mode: TilePollModeArg,
 
     /// UDP payload length.
     #[arg(long, default_value_t = PAYLOAD_LEN)]
@@ -75,9 +82,25 @@ fn main() -> Result<(), BoxError> {
         args.target,
         args.threads,
         args.lane_count,
+        args.poll_mode,
         args.payload_len,
         args.duration_ms.map(Duration::from_millis),
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TilePollModeArg {
+    Spin,
+    Park,
+}
+
+impl TilePollModeArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spin => "spin",
+            Self::Park => "park",
+        }
+    }
 }
 
 fn run_tile_blast(
@@ -86,6 +109,7 @@ fn run_tile_blast(
     target: SocketAddrV4,
     threads: usize,
     lane_count: usize,
+    poll_mode: TilePollModeArg,
     payload_len: usize,
     duration: Option<Duration>,
 ) -> Result<(), BoxError> {
@@ -98,29 +122,90 @@ fn run_tile_blast(
         batch_size: BATCH_SIZE,
         ..TileConfig::default()
     };
-    let tiles = XdpUdpTileBuilder::bind_device(device, local, lane_count)?
-        .threads(threads)
-        .classifier(AcceptAllClassifier)
-        .config(config)
-        .build()?;
-
-    eprintln!(
-        "tile-blast xdp: {} tile thread(s), {} producer lane(s), sending {}-byte UDP payloads from {local} to {target}",
-        tiles.len(),
-        lane_count,
-        payload_len
-    );
-
-    run_producers(tiles, target.into(), lane_count, payload_len, duration)
+    match poll_mode {
+        TilePollModeArg::Spin => {
+            let tiles = XdpUdpTileBuilder::bind_device(device, local, lane_count)?
+                .threads(threads)
+                .classifier(AcceptAllClassifier)
+                .config(config)
+                .build()?;
+            eprintln!(
+                "tile-blast xdp {}: {} tile thread(s), {} producer lane(s), sending {}-byte UDP payloads from {local} to {target}",
+                poll_mode.as_str(),
+                tiles.len(),
+                lane_count,
+                payload_len
+            );
+            run_producers(tiles, target.into(), lane_count, payload_len, duration)
+        }
+        TilePollModeArg::Park => {
+            let tiles = XdpUdpTileBuilder::bind_device(device, local, lane_count)?
+                .threads(threads)
+                .classifier(AcceptAllClassifier)
+                .config(config)
+                .build_park()?;
+            eprintln!(
+                "tile-blast xdp {}: {} tile thread(s), {} producer lane(s), sending {}-byte UDP payloads from {local} to {target}",
+                poll_mode.as_str(),
+                tiles.len(),
+                lane_count,
+                payload_len
+            );
+            run_producers(tiles, target.into(), lane_count, payload_len, duration)
+        }
+    }
 }
 
-fn run_producers(
-    mut tiles: XdpTileSet,
+trait TileSet {
+    type Handle: UdpNetworkTileHandle;
+
+    fn lane_handles(&mut self, lane_index: usize) -> Option<Vec<Self::Handle>>;
+    fn stats(&self) -> TileStats;
+    fn check_worker_threads(&mut self) -> Result<(), TileWorkerError>;
+}
+
+impl TileSet for XdpUdpTiles<AcceptAllClassifier> {
+    type Handle = XdpUdpTileHandle<AcceptAllClassifier>;
+
+    fn lane_handles(&mut self, lane_index: usize) -> Option<Vec<Self::Handle>> {
+        self.lane_handles(lane_index)
+    }
+
+    fn stats(&self) -> TileStats {
+        self.stats()
+    }
+
+    fn check_worker_threads(&mut self) -> Result<(), TileWorkerError> {
+        self.check_worker_threads()
+    }
+}
+
+impl TileSet for ParkXdpUdpTiles<AcceptAllClassifier> {
+    type Handle = ParkXdpUdpTileHandle<AcceptAllClassifier>;
+
+    fn lane_handles(&mut self, lane_index: usize) -> Option<Vec<Self::Handle>> {
+        self.lane_handles(lane_index)
+    }
+
+    fn stats(&self) -> TileStats {
+        self.stats()
+    }
+
+    fn check_worker_threads(&mut self) -> Result<(), TileWorkerError> {
+        self.check_worker_threads()
+    }
+}
+
+fn run_producers<T>(
+    mut tiles: T,
     target: SocketAddr,
     lane_count: usize,
     payload_len: usize,
     duration: Option<Duration>,
-) -> Result<(), BoxError> {
+) -> Result<(), BoxError>
+where
+    T: TileSet,
+{
     let stop = Arc::new(AtomicBool::new(false));
     let start = Arc::new(AtomicBool::new(false));
     let queued = Arc::new(AtomicU64::new(0));
@@ -243,7 +328,7 @@ fn wait_for_producers_ready(
     lane_count: usize,
     ready_rx: &mpsc::Receiver<usize>,
     error_rx: &mpsc::Receiver<String>,
-    tiles: &mut XdpTileSet,
+    tiles: &mut impl TileSet,
     stop: &AtomicBool,
 ) -> Result<(), BoxError> {
     let mut ready = 0usize;
@@ -289,7 +374,7 @@ fn join_producers(producers: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError
 
 fn run_lane(
     lane_index: usize,
-    mut handles: Vec<XdpTileHandle>,
+    mut handles: Vec<impl UdpNetworkTileHandle>,
     target: SocketAddr,
     payload_len: usize,
     stop: &AtomicBool,
@@ -318,23 +403,19 @@ fn run_lane(
             }
             progressed = true;
             let base_sequence = next_sequence.fetch_add(allocated as u64, Ordering::Relaxed);
-            let mut batch = handle.alloc_tx_batch();
 
-            for (offset, mut buffer) in tx_buffers.drain(..).enumerate() {
+            for (offset, buffer) in tx_buffers.iter_mut().enumerate() {
                 write_sequence(&mut payload_bytes, base_sequence + offset as u64);
                 buffer
                     .extend_from_slice(&payload_bytes)
                     .map_err(|error| error.to_string())?;
-                batch.push(buffer.freeze(target));
             }
 
-            let batch_len = batch.len() as u64;
-            match handle.push_tx_batch(batch) {
-                Ok(()) => local_queued += batch_len,
-                Err(batch) => {
-                    local_dropped += batch.len() as u64;
-                    handle.recycle_tx_batch(batch);
-                }
+            let accepted = handle.push_tx_buffers(&mut tx_buffers, TileTxMeta::new(target));
+            local_queued += accepted as u64;
+            if !tx_buffers.is_empty() {
+                local_dropped += tx_buffers.len() as u64;
+                tx_buffers.clear();
             }
         }
 
@@ -360,7 +441,7 @@ fn run_lane(
     Ok(())
 }
 
-fn drain_lane_rx(handle: &XdpTileHandle) {
+fn drain_lane_rx(handle: &impl UdpNetworkTileHandle) {
     while let Some(batch) = handle.pop_rx_batch() {
         handle.recycle_rx_batch(batch);
     }

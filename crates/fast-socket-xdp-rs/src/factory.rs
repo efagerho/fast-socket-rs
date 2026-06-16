@@ -37,7 +37,7 @@ use crate::interface::{
 use crate::program::{AttachMode, XdpProgramConfig, XdpProgramHandle};
 use crate::raw_socket::{RingSizes, XdpMode};
 use crate::route::RouteSnapshot;
-use crate::socket::XdpQueueLocalRouter;
+use crate::socket::{XdpQueueLocalRouter, XdpWaitDrivenDriver};
 
 /// Selects the interface a factory binds to.
 #[derive(Clone, Debug)]
@@ -687,6 +687,51 @@ impl XdpWorkerPlan {
         }
     }
 
+    /// Opens this worker's wait-driven UDP aggregate, pinning the current
+    /// thread to [`Self::cpu`] first so the UMEM, rings, and scratch are
+    /// NUMA-local.
+    pub fn open_udp_wait_driven(
+        self,
+        local: SocketAddrV4,
+    ) -> io::Result<XdpUdpAggregate<XdpWaitDrivenDriver, XdpQueueLocalRouter>> {
+        pin_current_thread_to_cpu(self.cpu)?;
+        self.open_udp_wait_driven_unpinned(local)
+    }
+
+    /// Opens this worker's wait-driven UDP aggregate **without** pinning
+    /// (caller must pin to [`Self::cpu`] first to stay NUMA-local).
+    pub fn open_udp_wait_driven_unpinned(
+        self,
+        local: SocketAddrV4,
+    ) -> io::Result<XdpUdpAggregate<XdpWaitDrivenDriver, XdpQueueLocalRouter>> {
+        let mut config = self.config;
+        match self.port_filter {
+            PortFilter::AllIp => {
+                config.bind_udp_port = Some(local.port());
+                XdpUdpAggregate::open_wait_driven(config, &self.queues, local)
+            }
+            PortFilter::UdpPorts(ports) => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_wait_driven_accepting_ports(
+                    config,
+                    &self.queues,
+                    local,
+                    ports,
+                )
+            }
+            PortFilter::UdpPortRange { start, end } => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_wait_driven_accepting_port_range(
+                    config,
+                    &self.queues,
+                    local,
+                    start,
+                    end,
+                )
+            }
+        }
+    }
+
     /// Opens this worker's UDP aggregate with a caller-supplied
     /// [`XdpUdpRouter`](crate::XdpUdpRouter) built per member by `make_router`,
     /// pinning to [`Self::cpu`] first. Use when the default queue-local router
@@ -716,6 +761,46 @@ impl XdpWorkerPlan {
             PortFilter::UdpPortRange { start, end } => {
                 config.bind_udp_port = None;
                 XdpUdpAggregate::open_busy_poll_with_accepting_port_range(
+                    config,
+                    &self.queues,
+                    local,
+                    start,
+                    end,
+                    make_router,
+                )
+            }
+        }
+    }
+
+    /// Opens this worker's wait-driven UDP aggregate with a caller-supplied
+    /// [`XdpUdpRouter`](crate::XdpUdpRouter) built per member by `make_router`,
+    /// pinning to [`Self::cpu`] first. Use when the default queue-local router
+    /// is not wanted.
+    pub fn open_udp_wait_driven_with_router<R>(
+        self,
+        local: SocketAddrV4,
+        make_router: impl FnMut() -> R,
+    ) -> io::Result<XdpUdpAggregate<XdpWaitDrivenDriver, R>> {
+        pin_current_thread_to_cpu(self.cpu)?;
+        let mut config = self.config;
+        match self.port_filter {
+            PortFilter::AllIp => {
+                config.bind_udp_port = Some(local.port());
+                XdpUdpAggregate::open_wait_driven_with(config, &self.queues, local, make_router)
+            }
+            PortFilter::UdpPorts(ports) => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_wait_driven_with_accepting_ports(
+                    config,
+                    &self.queues,
+                    local,
+                    ports,
+                    make_router,
+                )
+            }
+            PortFilter::UdpPortRange { start, end } => {
+                config.bind_udp_port = None;
+                XdpUdpAggregate::open_wait_driven_with_accepting_port_range(
                     config,
                     &self.queues,
                     local,
