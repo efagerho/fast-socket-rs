@@ -412,10 +412,9 @@ enum CompletionReclaim {
         first_tx_frame_addr: u64,
     },
     SharedMemberSlices {
-        frame_shift: u32,
-        member_frame_mask: u32,
-        rx_frames_per_member: u32,
-        active_frames: u32,
+        member_byte_mask: u64,
+        rx_member_byte_len: u64,
+        active_byte_len: u64,
     },
 }
 
@@ -457,11 +456,11 @@ impl CompletionReclaim {
             ));
         }
 
+        let frame_size = u64::from(frame_size);
         Ok(Self::SharedMemberSlices {
-            frame_shift: frame_size.trailing_zeros(),
-            member_frame_mask: frames_per_member - 1,
-            rx_frames_per_member,
-            active_frames,
+            member_byte_mask: u64::from(frames_per_member) * frame_size - 1,
+            rx_member_byte_len: u64::from(rx_frames_per_member) * frame_size,
+            active_byte_len: u64::from(active_frames) * frame_size,
         })
     }
 }
@@ -494,32 +493,54 @@ fn reclaim_shared_member_slice_completions(
     completions: &[u64],
     frame_mask: u64,
     umem_len: u64,
-    frame_shift: u32,
-    member_frame_mask: u32,
-    rx_frames_per_member: u32,
-    active_frames: u32,
+    member_byte_mask: u64,
+    rx_member_byte_len: u64,
+    active_byte_len: u64,
     rx_free: &mut Vec<u64>,
     tx_free: &mut Vec<u64>,
 ) -> Result<(), Error> {
+    let mut rx_len = rx_free.len();
+    let mut tx_len = tx_free.len();
+    let rx_capacity = rx_free.capacity();
+    let tx_capacity = tx_free.capacity();
+    let rx_ptr = rx_free.as_mut_ptr();
+    let tx_ptr = tx_free.as_mut_ptr();
+    let mut corrupt = false;
+
     for &addr in completions {
         let frame_addr = addr & !frame_mask;
-        if frame_addr >= umem_len {
-            return Err(ring_corrupt_error());
+        if frame_addr >= umem_len || frame_addr >= active_byte_len {
+            corrupt = true;
+            break;
         }
-        let Ok(frame_index) = u32::try_from(frame_addr >> frame_shift) else {
-            return Err(ring_corrupt_error());
-        };
-        if frame_index >= active_frames {
-            return Err(ring_corrupt_error());
-        }
-        let member_frame = frame_index & member_frame_mask;
-        if member_frame < rx_frames_per_member {
-            unsafe { push_reclaimed_frame_unchecked(rx_free, frame_addr) };
+        let member_offset = frame_addr & member_byte_mask;
+        if member_offset < rx_member_byte_len {
+            debug_assert!(rx_len < rx_capacity);
+            // SAFETY: completion reclaim only returns frames previously removed
+            // from this owner-local free list, so capacity is already available.
+            unsafe {
+                rx_ptr.add(rx_len).write(frame_addr);
+            }
+            rx_len += 1;
         } else {
-            unsafe { push_reclaimed_frame_unchecked(tx_free, frame_addr) };
+            debug_assert!(tx_len < tx_capacity);
+            // SAFETY: completion reclaim only returns frames previously removed
+            // from this owner-local free list, so capacity is already available.
+            unsafe {
+                tx_ptr.add(tx_len).write(frame_addr);
+            }
+            tx_len += 1;
         }
     }
-    Ok(())
+    unsafe {
+        rx_free.set_len(rx_len);
+        tx_free.set_len(tx_len);
+    }
+    if corrupt {
+        Err(ring_corrupt_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[inline(always)]
@@ -1161,19 +1182,17 @@ impl<D> XdpIpPacketSocket<D> {
                         )?;
                     }
                     CompletionReclaim::SharedMemberSlices {
-                        frame_shift,
-                        member_frame_mask,
-                        rx_frames_per_member,
-                        active_frames,
+                        member_byte_mask,
+                        rx_member_byte_len,
+                        active_byte_len,
                     } => {
                         reclaim_shared_member_slice_completions(
                             first,
                             frame_mask,
                             umem_len,
-                            frame_shift,
-                            member_frame_mask,
-                            rx_frames_per_member,
-                            active_frames,
+                            member_byte_mask,
+                            rx_member_byte_len,
+                            active_byte_len,
                             rx_free,
                             tx_free,
                         )?;
@@ -1181,10 +1200,9 @@ impl<D> XdpIpPacketSocket<D> {
                             second,
                             frame_mask,
                             umem_len,
-                            frame_shift,
-                            member_frame_mask,
-                            rx_frames_per_member,
-                            active_frames,
+                            member_byte_mask,
+                            rx_member_byte_len,
+                            active_byte_len,
                             rx_free,
                             tx_free,
                         )?;
@@ -3576,15 +3594,12 @@ fn reclaim_completed_xdp_frame(
             first_tx_frame_addr,
         } => frame_addr < first_tx_frame_addr,
         CompletionReclaim::SharedMemberSlices {
-            frame_shift,
-            member_frame_mask,
-            rx_frames_per_member,
-            active_frames,
+            member_byte_mask,
+            rx_member_byte_len,
+            active_byte_len,
         } => {
-            let frame_index =
-                u32::try_from(frame_addr >> frame_shift).expect("test frame index must fit u32");
-            assert!(frame_index < active_frames);
-            frame_index & member_frame_mask < rx_frames_per_member
+            assert!(frame_addr < active_byte_len);
+            frame_addr & member_byte_mask < rx_member_byte_len
         }
     };
     if is_rx {
