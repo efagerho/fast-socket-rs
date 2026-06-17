@@ -19,7 +19,9 @@ use fast_socket_rs::{
     UdpTransmit, V4Only, WaitOutcome, WakeHandle,
 };
 
-use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
+use crate::buffer::{
+    FrameReclaim, XdpEndpointHeaderPatch, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool,
+};
 use crate::config::XdpIpPacketSocketConfig;
 use crate::egress::{
     ETHERNET_HEADER_LEN, ETHERTYPE_IPV4, ETHERTYPE_IPV6, ResolvedL2, VLAN_ETHERTYPE,
@@ -2270,6 +2272,13 @@ where
             .as_ref()
             .expect("endpoint cache was refreshed before send");
         let l2_len = cache.l2_len;
+        let header_patch = XdpEndpointHeaderPatch::new(
+            l2_len + 2,
+            l2_len + 10,
+            l2_len + IPV4_MIN_HEADER_LEN + 4,
+            (IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) as u16,
+            UDP_HEADER_LEN as u16,
+        );
 
         if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
@@ -2319,13 +2328,10 @@ where
                     &cache.header,
                     l2_len,
                     info.mtu,
+                    info.payload_len,
+                    header_patch,
                     limit,
-                    |index, header, payload| {
-                        let payload_len = fill_payload(index, payload);
-                        validate_xdp_udp_endpoint_payload(info, payload_len)?;
-                        patch_xdp_udp_endpoint_header_lengths(header, l2_len, payload_len)?;
-                        Ok(payload_len)
-                    },
+                    |index, payload| fill_payload(index, payload),
                 )
                 .map_err(|kind| SendError { accepted: 0, kind })?;
 

@@ -228,6 +228,81 @@ pub(crate) struct XdpPreparedTxBatch {
     pub(crate) tx_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct XdpEndpointHeaderPatch {
+    total_len_offset: usize,
+    checksum_offset: usize,
+    transport_len_offset: usize,
+    total_len_base: u16,
+    transport_len_base: u16,
+}
+
+impl XdpEndpointHeaderPatch {
+    pub(crate) const fn new(
+        total_len_offset: usize,
+        checksum_offset: usize,
+        transport_len_offset: usize,
+        total_len_base: u16,
+        transport_len_base: u16,
+    ) -> Self {
+        Self {
+            total_len_offset,
+            checksum_offset,
+            transport_len_offset,
+            total_len_base,
+            transport_len_base,
+        }
+    }
+
+    fn required_header_len(self) -> Option<usize> {
+        self.total_len_offset
+            .max(self.checksum_offset)
+            .max(self.transport_len_offset)
+            .checked_add(2)
+    }
+
+    #[inline(always)]
+    unsafe fn patch(self, header: *mut u8, payload_len: usize) {
+        let total_len = self.total_len_base + payload_len as u16;
+        let transport_len = self.transport_len_base + payload_len as u16;
+        // SAFETY: caller validated that all offsets plus two bytes fit inside
+        // the copied header.
+        let old_total_len = unsafe { read_be_u16(header.add(self.total_len_offset)) };
+        // SAFETY: see above.
+        let old_checksum = unsafe { read_be_u16(header.add(self.checksum_offset)) };
+        let checksum = ipv4_checksum_replace_word(old_checksum, old_total_len, total_len);
+        // SAFETY: see above.
+        unsafe {
+            write_be_u16(header.add(self.total_len_offset), total_len);
+            write_be_u16(header.add(self.checksum_offset), checksum);
+            write_be_u16(header.add(self.transport_len_offset), transport_len);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn read_be_u16(ptr: *const u8) -> u16 {
+    // SAFETY: caller guarantees two readable bytes.
+    u16::from_be_bytes(unsafe { [ptr.read(), ptr.add(1).read()] })
+}
+
+#[inline(always)]
+unsafe fn write_be_u16(ptr: *mut u8, value: u16) {
+    let [hi, lo] = value.to_be_bytes();
+    // SAFETY: caller guarantees two writable bytes.
+    unsafe {
+        ptr.write(hi);
+        ptr.add(1).write(lo);
+    }
+}
+
+#[inline(always)]
+fn ipv4_checksum_replace_word(checksum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+
 // SAFETY: the `free` vectors are accessed only by the owner thread. Buffers
 // dropped on other threads push into `remote`, which is a bounded MPSC queue;
 // the owner drains `remote` back into `free` before allocation/reuse.
@@ -330,6 +405,31 @@ impl FrameReclaim {
             f(free.pop().expect("count is bounded by free.len()"));
         }
         count
+    }
+
+    pub(crate) fn pop_many_try_with<E>(
+        &self,
+        max: usize,
+        mut f: impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        if max == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: pool allocation is owner-thread only.
+        let free = unsafe { &mut *self.free.get() };
+        if free.len() < max {
+            drain_remote(&self.remote, free);
+        }
+        let count = max.min(free.len());
+        for _ in 0..count {
+            let frame = free.pop().expect("count is bounded by free.len()");
+            if let Err(error) = f(frame) {
+                free.push(frame);
+                return Err(error);
+            }
+        }
+        Ok(count)
     }
 
     pub(crate) fn push(&self, addr: u64) {
@@ -652,11 +752,13 @@ impl XdpTxPool {
         header: &[u8],
         l2_len: usize,
         payload_capacity: usize,
+        expected_payload_len: Option<usize>,
+        header_patch: XdpEndpointHeaderPatch,
         max: usize,
-        mut prepare_frame: F,
+        mut fill_payload: F,
     ) -> Result<XdpPreparedTxBatch, Error>
     where
-        F: FnMut(usize, &mut [u8], &mut [u8]) -> Result<usize, Error>,
+        F: FnMut(usize, &mut [u8]) -> usize,
     {
         if max == 0 {
             return Ok(XdpPreparedTxBatch {
@@ -683,7 +785,19 @@ impl XdpTxPool {
         {
             return Err(Error::InvalidPacket);
         }
-        let _max_desc_len = u32::try_from(max_frame_len).map_err(|_| Error::InvalidPacket)?;
+        let header_len = header.len();
+        let Some(required_header_len) = header_patch.required_header_len() else {
+            return Err(Error::InvalidPacket);
+        };
+        if required_header_len > header_len {
+            return Err(Error::InvalidPacket);
+        }
+        let header_len_u32 = u32::try_from(header_len).map_err(|_| Error::InvalidPacket)?;
+        let payload_len_limit = payload_capacity.min(
+            u16::MAX
+                .checked_sub(header_patch.total_len_base)
+                .ok_or(Error::InvalidPacket)? as usize,
+        );
         let l3_header_len = header
             .len()
             .checked_sub(l2_len)
@@ -694,46 +808,43 @@ impl XdpTxPool {
         let start_len = out.len();
         let mut written = 0usize;
         let mut tx_bytes = 0u64;
-        while written < max {
-            let Some(frame_addr) = live.reclaim.pop() else {
-                break;
-            };
 
+        let result = live.reclaim.pop_many_try_with(max, |frame_addr| {
             // SAFETY: frame addresses come from this pool's live reclaim list,
             // and bounds above prove the header and payload-capacity slices fit.
             let payload_len = unsafe {
                 let frame = umem_base.add(frame_addr as usize);
-                ptr::copy_nonoverlapping(header.as_ptr(), frame.add(header_start), header.len());
-                let header = slice::from_raw_parts_mut(frame.add(header_start), header.len());
+                let header_dst = frame.add(header_start);
+                ptr::copy_nonoverlapping(header.as_ptr(), header_dst, header_len);
                 let payload = slice::from_raw_parts_mut(frame.add(payload_start), payload_capacity);
-                prepare_frame(written, header, payload)
-            };
-            let payload_len = match payload_len {
-                Ok(payload_len) if payload_len <= payload_capacity => payload_len,
-                Ok(_) => {
-                    live.reclaim.push_local(frame_addr);
-                    for desc in out.drain(start_len..) {
-                        live.reclaim.push_local(desc.addr - header_start as u64);
-                    }
+                let payload_len = fill_payload(written, payload);
+                if let Some(expected) = expected_payload_len
+                    && payload_len != expected
+                {
+                    return Err(Error::InvalidPacket);
+                }
+                if payload_len > payload_len_limit {
                     return Err(Error::OversizeForMtu);
                 }
-                Err(error) => {
-                    live.reclaim.push_local(frame_addr);
-                    for desc in out.drain(start_len..) {
-                        live.reclaim.push_local(desc.addr - header_start as u64);
-                    }
-                    return Err(error);
-                }
+                header_patch.patch(header_dst, payload_len);
+                payload_len
             };
-            let desc_len = u32::try_from(header.len() + payload_len)
-                .expect("payload length was bounded by max_desc_len");
-            tx_bytes = tx_bytes.saturating_add((l3_header_len + payload_len) as u64);
+
+            let desc_len = header_len_u32 + payload_len as u32;
+            tx_bytes += (l3_header_len + payload_len) as u64;
             out.push(XdpDesc {
                 addr: frame_addr + header_start as u64,
                 len: desc_len,
                 options: 0,
             });
             written += 1;
+            Ok(())
+        });
+        if let Err(error) = result {
+            for desc in out.drain(start_len..) {
+                live.reclaim.push_local(desc.addr - header_start as u64);
+            }
+            return Err(error);
         }
 
         Ok(XdpPreparedTxBatch {
@@ -1530,7 +1641,11 @@ mod tests {
         let umem = Rc::new(Umem::new(2048, 4, HugePageSize::Default).unwrap());
         let reclaim = FrameReclaim::new(vec![umem.frame_offset(0), umem.frame_offset(1)]);
         let mut pool = XdpTxPool::live(layout(), Rc::clone(&umem), Rc::clone(&reclaim));
-        let header = [0xab; 42];
+        let mut header = [0xab; 42];
+        header[16..18].copy_from_slice(&28u16.to_be_bytes());
+        header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
+        header[38..40].copy_from_slice(&8u16.to_be_bytes());
+        let header_patch = XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8);
         let payload_capacity = 8;
         let payload_lens = [3usize, 5];
         let mut descs = Vec::new();
@@ -1541,11 +1656,13 @@ mod tests {
                 &header,
                 14,
                 payload_capacity,
+                None,
+                header_patch,
                 2,
-                |index, _header, payload| {
+                |index, payload| {
                     let payload_len = payload_lens[index];
                     payload[..payload_len].fill(index as u8 + 1);
-                    Ok(payload_len)
+                    payload_len
                 },
             )
             .expect("live pool can prepare direct endpoint batch");
@@ -1556,7 +1673,14 @@ mod tests {
         for (index, desc) in descs.iter().enumerate() {
             let payload_len = payload_lens[index];
             assert_eq!(desc.len as usize, header.len() + payload_len);
-            assert_eq!(umem.slice_at(desc.addr, header.len()), &header);
+            let written_header = umem.slice_at(desc.addr, header.len());
+            let mut expected_header = header;
+            expected_header[16..18].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
+            expected_header[38..40].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+            assert_eq!(&written_header[..16], &expected_header[..16]);
+            assert_eq!(&written_header[16..18], &expected_header[16..18]);
+            assert_ne!(&written_header[24..26], &header[24..26]);
+            assert_eq!(&written_header[38..40], &expected_header[38..40]);
             assert_eq!(
                 umem.slice_at(desc.addr + header.len() as u64, payload_len),
                 vec![index as u8 + 1; payload_len]
@@ -1564,6 +1688,45 @@ mod tests {
         }
 
         assert!(pool.allocate().is_none());
+    }
+
+    #[test]
+    fn live_tx_pool_endpoint_batch_error_reclaims_prepared_frames() {
+        let umem = Rc::new(Umem::new(2048, 4, HugePageSize::Default).unwrap());
+        let reclaim = FrameReclaim::new(vec![umem.frame_offset(0), umem.frame_offset(1)]);
+        let mut pool = XdpTxPool::live(layout(), Rc::clone(&umem), Rc::clone(&reclaim));
+        let mut header = [0xab; 42];
+        header[16..18].copy_from_slice(&28u16.to_be_bytes());
+        header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
+        header[38..40].copy_from_slice(&8u16.to_be_bytes());
+        let header_patch = XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8);
+        let mut descs = Vec::new();
+
+        let error = pool
+            .prepare_endpoint_batch(
+                &mut descs,
+                &header,
+                14,
+                8,
+                None,
+                header_patch,
+                2,
+                |index, payload| {
+                    if index == 0 {
+                        payload[..3].fill(1);
+                        3
+                    } else {
+                        9
+                    }
+                },
+            )
+            .expect_err("oversize payload rejects the batch");
+
+        assert!(matches!(error, Error::OversizeForMtu));
+        assert!(descs.is_empty());
+
+        let mut buffers = Vec::new();
+        assert_eq!(pool.allocate_many(&mut buffers, 2), 2);
     }
 
     #[test]
