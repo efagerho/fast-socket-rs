@@ -2365,6 +2365,7 @@ where
             .expect("endpoint cache was refreshed before send");
         let l2_len = cache.l2_len;
         let header_patch = XdpEndpointHeaderPatch::new(
+            &cache.header,
             l2_len + 2,
             l2_len + 10,
             l2_len + IPV4_MIN_HEADER_LEN + 4,

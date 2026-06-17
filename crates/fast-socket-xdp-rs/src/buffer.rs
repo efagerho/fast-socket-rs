@@ -235,23 +235,32 @@ pub(crate) struct XdpEndpointHeaderPatch {
     transport_len_offset: u16,
     total_len_base: u16,
     transport_len_base: u16,
+    old_total_len: u16,
+    old_checksum: u16,
 }
 
 impl XdpEndpointHeaderPatch {
     pub(crate) fn new(
+        header: &[u8],
         total_len_offset: usize,
         checksum_offset: usize,
         transport_len_offset: usize,
         total_len_base: u16,
         transport_len_base: u16,
     ) -> Option<Self> {
-        Some(Self {
+        let patch = Self {
             total_len_offset: u16::try_from(total_len_offset).ok()?,
             checksum_offset: u16::try_from(checksum_offset).ok()?,
             transport_len_offset: u16::try_from(transport_len_offset).ok()?,
             total_len_base,
             transport_len_base,
-        })
+            old_total_len: read_be_u16_from_slice(header, total_len_offset)?,
+            old_checksum: read_be_u16_from_slice(header, checksum_offset)?,
+        };
+        if patch.required_header_len()? > header.len() {
+            return None;
+        }
+        Some(patch)
     }
 
     fn required_header_len(self) -> Option<usize> {
@@ -272,10 +281,7 @@ impl XdpEndpointHeaderPatch {
         let total_len_ptr = unsafe { header.add(usize::from(self.total_len_offset)) };
         let checksum_ptr = unsafe { header.add(usize::from(self.checksum_offset)) };
         let transport_len_ptr = unsafe { header.add(usize::from(self.transport_len_offset)) };
-        let old_total_len = unsafe { read_be_u16(total_len_ptr) };
-        // SAFETY: see above.
-        let old_checksum = unsafe { read_be_u16(checksum_ptr) };
-        let checksum = ipv4_checksum_replace_word(old_checksum, old_total_len, total_len);
+        let checksum = ipv4_checksum_replace_word(self.old_checksum, self.old_total_len, total_len);
         // SAFETY: see above.
         unsafe {
             write_be_u16(total_len_ptr, total_len);
@@ -286,9 +292,9 @@ impl XdpEndpointHeaderPatch {
 }
 
 #[inline(always)]
-unsafe fn read_be_u16(ptr: *const u8) -> u16 {
-    // SAFETY: caller guarantees two readable bytes.
-    u16::from_be_bytes(unsafe { [ptr.read(), ptr.add(1).read()] })
+fn read_be_u16_from_slice(bytes: &[u8], offset: usize) -> Option<u16> {
+    let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 #[inline(always)]
@@ -1724,8 +1730,8 @@ mod tests {
         header[16..18].copy_from_slice(&28u16.to_be_bytes());
         header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
         header[38..40].copy_from_slice(&8u16.to_be_bytes());
-        let header_patch =
-            XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8).expect("test patch offsets fit");
+        let header_patch = XdpEndpointHeaderPatch::new(&header, 16, 24, 38, 28, 8)
+            .expect("test patch offsets fit");
         let payload_capacity = 8;
         let payload_lens = [3usize, 5];
         let mut descs = Vec::new();
@@ -1779,8 +1785,8 @@ mod tests {
         header[16..18].copy_from_slice(&28u16.to_be_bytes());
         header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
         header[38..40].copy_from_slice(&8u16.to_be_bytes());
-        let header_patch =
-            XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8).expect("test patch offsets fit");
+        let header_patch = XdpEndpointHeaderPatch::new(&header, 16, 24, 38, 28, 8)
+            .expect("test patch offsets fit");
         let mut descs = Vec::new();
 
         let error = pool
