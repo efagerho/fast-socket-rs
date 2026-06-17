@@ -158,8 +158,8 @@ caller-provided slice and still belong to the caller.
 ## UDP Sockets
 
 `UdpSocket` is the core trait for UDP payload sockets. Its associated types
-select the receive buffer, mutable transmit buffer, polling driver, and receive
-metadata.
+select the receive buffer, mutable transmit buffer, polling driver, receive
+metadata, and prepared endpoint handle.
 
 For normal OS backends, a concrete `UdpSocket` maps to one OS socket. For
 kernel-bypass backends, it usually maps to one NIC queue.
@@ -174,6 +174,7 @@ where
     type TxBufferMut: PacketBufferMut + Send;
     type Driver: PollDriver;
     type RecvMeta;
+    type Endpoint;
 
     fn socket_id(&self) -> SocketId;
     fn mtu(&self) -> usize;
@@ -196,9 +197,29 @@ where
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError>;
+    fn prepare_udp_endpoint(
+        &mut self,
+        spec: UdpEndpointSpec,
+    ) -> Result<Self::Endpoint, Error>;
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec;
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo;
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized;
     fn send_all(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized;
+    fn send_all_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError>
     where
         Self: Sized;
@@ -222,6 +243,16 @@ to workers, choosing NUMA-local memory, and applying thread-affinity hints.
 
 Some methods accept `Vec`s as output storage. Callers are expected to reuse those
 vectors and clear them between calls so the packet loop does not allocate.
+
+Prepared UDP endpoints let applications move fixed destination and metadata
+selection out of the per-packet transmit item. `UdpEndpointSpec` names the
+remote peer plus optional source IP, source port, ECN, GSO segment size, and
+fixed payload length. `prepare_udp_endpoint` returns a socket-specific
+`Endpoint`, and `send_to_udp_endpoint` submits `UdpEndpointTransmit` slots that
+only carry payload buffers. Backends that do not have a specialized endpoint
+fast path can use `GenericUdpEndpoint`, `prepare_generic_udp_endpoint`, and
+`send_generic_udp_endpoint` to delegate through the normal `UdpSocket::send`
+path while preserving prefix ownership semantics.
 
 ## IP Packet Sockets
 

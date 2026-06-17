@@ -4,7 +4,8 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId, TxSlot,
+    Error, PacketBuffer, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError,
+    SocketId, TxSlot,
 };
 
 /// Explicit Congestion Notification codepoint.
@@ -87,6 +88,85 @@ impl<B> UdpTransmit<B> {
     }
 }
 
+/// Request used to prepare a socket-specific UDP endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpEndpointSpec {
+    /// Remote destination address.
+    pub destination: SocketAddr,
+    /// Optional source IP selection.
+    pub source_ip: Option<IpAddr>,
+    /// Optional source UDP port selection.
+    pub source_port: Option<u16>,
+    /// Optional ECN codepoint.
+    pub ecn: Option<EcnCodepoint>,
+    /// Optional UDP segmentation size.
+    pub gso_segment_size: Option<NonZeroU16>,
+    /// Optional fixed UDP payload length.
+    pub payload_len: Option<usize>,
+}
+
+impl UdpEndpointSpec {
+    /// Creates a variable-length endpoint request for a destination address.
+    #[must_use]
+    pub const fn new(destination: SocketAddr) -> Self {
+        Self {
+            destination,
+            source_ip: None,
+            source_port: None,
+            ecn: None,
+            gso_segment_size: None,
+            payload_len: None,
+        }
+    }
+}
+
+/// One UDP payload submitted through a prepared endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpEndpointTransmit<B> {
+    /// Packet payload buffer.
+    pub packet: B,
+}
+
+impl<B> UdpEndpointTransmit<B> {
+    /// Creates an endpoint transmit item.
+    #[must_use]
+    pub const fn new(packet: B) -> Self {
+        Self { packet }
+    }
+}
+
+/// Prepared UDP endpoint limits and offload information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpEndpointInfo {
+    /// Maximum UDP payload length accepted without segmentation.
+    pub mtu: usize,
+    /// Fixed payload length, when the endpoint was prepared for one.
+    pub payload_len: Option<usize>,
+    /// UDP segmentation size, when configured for the endpoint.
+    pub gso_segment_size: Option<NonZeroU16>,
+}
+
+/// Generic prepared UDP endpoint used by backends without a specialized path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenericUdpEndpoint {
+    spec: UdpEndpointSpec,
+    info: UdpEndpointInfo,
+}
+
+impl GenericUdpEndpoint {
+    /// Returns the original endpoint request.
+    #[must_use]
+    pub const fn spec(&self) -> &UdpEndpointSpec {
+        &self.spec
+    }
+
+    /// Returns endpoint limits and offload information.
+    #[must_use]
+    pub const fn info(&self) -> UdpEndpointInfo {
+        self.info
+    }
+}
+
 /// Capability flags for a UDP socket.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UdpCapabilities {
@@ -107,6 +187,161 @@ pub type UdpTxBufferMut<S> = <S as UdpSocket>::TxBufferMut;
 /// Mutable receive buffer type delivered by a UDP socket.
 pub type UdpRxBuffer<S> = <S as UdpSocket>::RxBuffer;
 
+/// Prepares a correctness-first generic UDP endpoint for `socket`.
+///
+/// Backends can use this as their mandatory endpoint implementation while
+/// reserving specialized endpoint handles for later optimization.
+pub fn prepare_generic_udp_endpoint<S>(
+    socket: &S,
+    spec: UdpEndpointSpec,
+) -> Result<GenericUdpEndpoint, Error>
+where
+    S: UdpSocket,
+{
+    let info = validate_udp_endpoint_spec(socket.mtu(), socket.capabilities(), &spec)?;
+    Ok(GenericUdpEndpoint { spec, info })
+}
+
+/// Sends a batch through a generic endpoint by delegating to [`UdpSocket::send`].
+///
+/// Accepted endpoint slots are consumed in order. If the delegated send path
+/// accepts only a prefix, unaccepted packets are restored to their original
+/// endpoint slots.
+pub fn send_generic_udp_endpoint<S>(
+    socket: &mut S,
+    endpoint: &mut GenericUdpEndpoint,
+    batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<S>>>],
+) -> Result<usize, SendError>
+where
+    S: UdpSocket,
+{
+    let mut prefix_len = 0usize;
+    let mut deferred_error = None;
+    while prefix_len < batch.len() {
+        let Some(tx) = batch[prefix_len].as_ref() else {
+            deferred_error = Some(Error::InvalidBatch);
+            break;
+        };
+        if let Err(error) = validate_udp_endpoint_packet(endpoint.info, tx.packet.len()) {
+            deferred_error = Some(error);
+            break;
+        }
+        prefix_len += 1;
+    }
+
+    if prefix_len == 0 {
+        return match deferred_error {
+            Some(kind) => Err(SendError { accepted: 0, kind }),
+            None => Ok(0),
+        };
+    }
+
+    let mut converted = Vec::with_capacity(prefix_len);
+    for slot in batch.iter_mut().take(prefix_len) {
+        let tx = slot.take().expect("validated ready endpoint slot");
+        converted.push(TxSlot::Ready(UdpTransmit {
+            packet: tx.packet,
+            destination: endpoint.spec.destination,
+            source_ip: endpoint.spec.source_ip,
+            source_port: endpoint.spec.source_port,
+            ecn: endpoint.spec.ecn,
+            gso_segment_size: endpoint.spec.gso_segment_size,
+        }));
+    }
+
+    match socket.send(&mut converted) {
+        Ok(accepted) => {
+            restore_unaccepted_endpoint_slots::<S>(batch, &mut converted, accepted);
+            if accepted < prefix_len {
+                return Ok(accepted);
+            }
+            match deferred_error {
+                Some(kind) => Err(SendError {
+                    accepted: prefix_len,
+                    kind,
+                }),
+                None => Ok(prefix_len),
+            }
+        }
+        Err(SendError { accepted, kind }) => {
+            restore_unaccepted_endpoint_slots::<S>(batch, &mut converted, accepted);
+            Err(SendError { accepted, kind })
+        }
+    }
+}
+
+fn validate_udp_endpoint_spec(
+    mtu: usize,
+    capabilities: UdpCapabilities,
+    spec: &UdpEndpointSpec,
+) -> Result<UdpEndpointInfo, Error> {
+    if let Some(source) = spec.source_ip
+        && !same_ip_family(source, spec.destination.ip())
+    {
+        return Err(Error::InvalidPacket);
+    }
+
+    if let Some(segment_size) = spec.gso_segment_size {
+        if !capabilities.gso {
+            return Err(Error::InvalidPacket);
+        }
+        if usize::from(segment_size.get()) > mtu {
+            return Err(Error::OversizeForMtu);
+        }
+        if let (Some(payload_len), Some(max_segments)) =
+            (spec.payload_len, capabilities.max_gso_segments)
+        {
+            let segments = payload_len.div_ceil(usize::from(segment_size.get()));
+            if segments > usize::from(max_segments.get()) {
+                return Err(Error::OversizeForMtu);
+            }
+        }
+    } else if let Some(payload_len) = spec.payload_len
+        && payload_len > mtu
+    {
+        return Err(Error::OversizeForMtu);
+    }
+
+    Ok(UdpEndpointInfo {
+        mtu,
+        payload_len: spec.payload_len,
+        gso_segment_size: spec.gso_segment_size,
+    })
+}
+
+fn validate_udp_endpoint_packet(info: UdpEndpointInfo, payload_len: usize) -> Result<(), Error> {
+    if let Some(expected) = info.payload_len
+        && payload_len != expected
+    {
+        return Err(Error::InvalidPacket);
+    }
+    if info.gso_segment_size.is_none() && payload_len > info.mtu {
+        return Err(Error::OversizeForMtu);
+    }
+    Ok(())
+}
+
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+fn restore_unaccepted_endpoint_slots<S>(
+    batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<S>>>],
+    converted: &mut [TxSlot<UdpTransmit<UdpTxBuffer<S>>>],
+    accepted: usize,
+) where
+    S: UdpSocket,
+{
+    for (slot, converted) in batch.iter_mut().zip(converted.iter_mut()).skip(accepted) {
+        if let Some(tx) = converted.take() {
+            *slot = TxSlot::Ready(UdpEndpointTransmit::new(tx.packet));
+        }
+    }
+}
+
 /// High-level UDP socket interface.
 pub trait UdpSocket
 where
@@ -124,6 +359,9 @@ where
 
     /// Receive metadata type delivered by this socket.
     type RecvMeta;
+
+    /// Socket-specific prepared UDP endpoint handle.
+    type Endpoint;
 
     /// Returns the logical identity of this socket.
     fn socket_id(&self) -> SocketId;
@@ -165,6 +403,25 @@ where
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError>;
 
+    /// Prepares a socket-owned transmit plan for one UDP metadata shape.
+    fn prepare_udp_endpoint(&mut self, spec: UdpEndpointSpec) -> Result<Self::Endpoint, Error>;
+
+    /// Returns the original endpoint request used to build this handle.
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec;
+
+    /// Returns endpoint limits and offload information.
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo;
+
+    /// Sends a batch through a prepared endpoint, consuming accepted slots in
+    /// order.
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized;
+
     /// Sends `batch` to completion, draining TX completions on partial
     /// acceptance so the next `send` has transmit capacity.
     ///
@@ -180,6 +437,40 @@ where
         let mut total = 0usize;
         while total < batch.len() {
             match self.send(&mut batch[total..]) {
+                Ok(0) => {
+                    if let Err(error) = self.drain_tx_completions() {
+                        return Err(SendError {
+                            accepted: total,
+                            kind: error,
+                        });
+                    }
+                    core::hint::spin_loop();
+                }
+                Ok(n) => total += n,
+                Err(SendError { accepted, kind }) => {
+                    return Err(SendError {
+                        accepted: total + accepted,
+                        kind,
+                    });
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Sends `batch` through `endpoint` to completion, draining TX completions
+    /// on partial acceptance so the next endpoint send has transmit capacity.
+    fn send_all_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized,
+    {
+        let mut total = 0usize;
+        while total < batch.len() {
+            match self.send_to_udp_endpoint(endpoint, &mut batch[total..]) {
                 Ok(0) => {
                     if let Err(error) = self.drain_tx_completions() {
                         return Err(SendError {

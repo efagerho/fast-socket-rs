@@ -24,9 +24,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use fast_socket_rs::{
-    BufferLayout, DeviceError, DeviceErrorKind, Error, IfIndex, PacketBuffer, PollDriver, PollMode,
-    QueueAffinity, QueueId, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
+    BufferLayout, DeviceError, DeviceErrorKind, Error, GenericUdpEndpoint, IfIndex, PacketBuffer,
+    PollDriver, PollMode, QueueAffinity, QueueId, RecvBatch, SendError, SocketId, TxSlot,
+    UdpCapabilities, UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive,
     UdpRecvMeta, UdpSocket, UdpTransmit, UdpTxBufferMut, WaitOutcome, WakeHandle,
+    prepare_generic_udp_endpoint, send_generic_udp_endpoint,
 };
 
 pub use buffer::{OsBufferPool, OsPacketBuf, OsPacketBufMut};
@@ -516,6 +518,7 @@ impl UdpSocket for OsUdpSocket {
     type TxBufferMut = OsPacketBufMut;
     type Driver = OsWaitDrivenDriver;
     type RecvMeta = UdpRecvMeta;
+    type Endpoint = GenericUdpEndpoint;
 
     fn socket_id(&self) -> SocketId {
         SocketId::new(self.queue_id.get())
@@ -569,6 +572,26 @@ impl UdpSocket for OsUdpSocket {
 
     fn send(&mut self, batch: &mut [TxSlot<UdpTransmit<OsPacketBuf>>]) -> Result<usize, SendError> {
         self.send_impl(batch)
+    }
+
+    fn prepare_udp_endpoint(&mut self, spec: UdpEndpointSpec) -> Result<Self::Endpoint, Error> {
+        prepare_generic_udp_endpoint(self, spec)
+    }
+
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec {
+        endpoint.spec()
+    }
+
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo {
+        endpoint.info()
+    }
+
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<OsPacketBuf>>],
+    ) -> Result<usize, SendError> {
+        send_generic_udp_endpoint(self, endpoint, batch)
     }
 
     fn recv(

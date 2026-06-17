@@ -1110,6 +1110,7 @@ mod tests {
         type TxBufferMut = TestBuf;
         type Driver = TestWaitDriver;
         type RecvMeta = UdpRecvMeta;
+        type Endpoint = fast_socket_rs::GenericUdpEndpoint;
 
         fn socket_id(&self) -> SocketId {
             SocketId::new(0)
@@ -1153,6 +1154,32 @@ mod tests {
                 self.sent.lock().expect("sent lock").push(tx.packet.bytes);
             }
             Ok(batch.len())
+        }
+
+        fn prepare_udp_endpoint(
+            &mut self,
+            spec: fast_socket_rs::UdpEndpointSpec,
+        ) -> Result<Self::Endpoint, Error> {
+            fast_socket_rs::prepare_generic_udp_endpoint(self, spec)
+        }
+
+        fn udp_endpoint_spec<'a>(
+            &self,
+            endpoint: &'a Self::Endpoint,
+        ) -> &'a fast_socket_rs::UdpEndpointSpec {
+            endpoint.spec()
+        }
+
+        fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> fast_socket_rs::UdpEndpointInfo {
+            endpoint.info()
+        }
+
+        fn send_to_udp_endpoint(
+            &mut self,
+            endpoint: &mut Self::Endpoint,
+            batch: &mut [TxSlot<fast_socket_rs::UdpEndpointTransmit<TestBuf>>],
+        ) -> Result<usize, SendError> {
+            fast_socket_rs::send_generic_udp_endpoint(self, endpoint, batch)
         }
 
         fn recv(

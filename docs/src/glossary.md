@@ -226,6 +226,7 @@ where
     type TxBufferMut: PacketBufferMut + Send;
     type Driver: PollDriver;
     type RecvMeta;
+    type Endpoint;
 
     fn socket_id(&self) -> SocketId;
     fn mtu(&self) -> usize;
@@ -244,6 +245,19 @@ where
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError>;
+    fn prepare_udp_endpoint(
+        &mut self,
+        spec: UdpEndpointSpec,
+    ) -> Result<Self::Endpoint, Error>;
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec;
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo;
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized;
     fn send_all(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
@@ -258,6 +272,13 @@ where
     fn notify_tx(&mut self) -> Result<(), Error>;
 }
 ```
+
+### `UdpEndpointSpec`
+
+`UdpEndpointSpec` describes a prepared UDP transmit shape: destination address
+plus optional source IP, source port, ECN, GSO segment size, and fixed payload
+length. A `UdpSocket` turns it into its associated `Endpoint` type and later
+sends `UdpEndpointTransmit` slots through that handle.
 
 ### `IpPacketSocket`
 

@@ -12,10 +12,12 @@ use std::time::Duration;
 use fast_socket_rs::OwnedPacketBuffer;
 use fast_socket_rs::{
     BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, EgressResolver,
-    Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion,
-    NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode, QueueAffinity, QueueId,
-    RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
+    Error, GenericUdpEndpoint, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
+    IpPacketTransmit, IpVersion, NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode,
+    QueueAffinity, QueueId, RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot,
+    UdpCapabilities, UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive,
     UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
+    prepare_generic_udp_endpoint, send_generic_udp_endpoint,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -2189,6 +2191,7 @@ where
     type TxBufferMut = XdpPacketBufMut;
     type Driver = D;
     type RecvMeta = UdpRecvMeta;
+    type Endpoint = GenericUdpEndpoint;
 
     fn socket_id(&self) -> SocketId {
         IpPacketSocket::socket_id(&self.ip)
@@ -2236,6 +2239,26 @@ where
             return self.send_udp_test(batch);
         }
         self.send_udp_inner(batch)
+    }
+
+    fn prepare_udp_endpoint(&mut self, spec: UdpEndpointSpec) -> Result<Self::Endpoint, Error> {
+        prepare_generic_udp_endpoint(self, spec)
+    }
+
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec {
+        endpoint.spec()
+    }
+
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo {
+        endpoint.info()
+    }
+
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<fast_socket_rs::UdpTxBuffer<Self>>>],
+    ) -> Result<usize, SendError> {
+        send_generic_udp_endpoint(self, endpoint, batch)
     }
 
     /// Receives UDP datagrams into `out`.

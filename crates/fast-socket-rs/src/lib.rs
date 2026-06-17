@@ -45,6 +45,7 @@ pub use route::{
 };
 pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId, SocketId};
 pub use udp::{
-    EcnCodepoint, UdpCapabilities, UdpReceive, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTransmit,
-    UdpTxBuffer, UdpTxBufferMut,
+    EcnCodepoint, GenericUdpEndpoint, UdpCapabilities, UdpEndpointInfo, UdpEndpointSpec,
+    UdpEndpointTransmit, UdpReceive, UdpRecvMeta, UdpRxBuffer, UdpSocket, UdpTransmit, UdpTxBuffer,
+    UdpTxBufferMut, prepare_generic_udp_endpoint, send_generic_udp_endpoint,
 };

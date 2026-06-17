@@ -3,8 +3,10 @@ mod support;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
 use fast_socket_rs::{
-    BusyPollDriver, Error, PollDriver, PollMode, RecvBatch, SendError, SocketId, TxSlot,
-    UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, UdpTxBufferMut,
+    BusyPollDriver, Error, GenericUdpEndpoint, PollDriver, PollMode, RecvBatch, SendError,
+    SocketId, TxSlot, UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive,
+    UdpRecvMeta, UdpSocket, UdpTransmit, UdpTxBufferMut, prepare_generic_udp_endpoint,
+    send_generic_udp_endpoint,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};
@@ -30,6 +32,7 @@ impl UdpSocket for MockUdpSocket {
     type TxBufferMut = PacketBufMut;
     type Driver = BusyPollDriver;
     type RecvMeta = UdpRecvMeta;
+    type Endpoint = GenericUdpEndpoint;
 
     fn socket_id(&self) -> SocketId {
         SocketId::new(7)
@@ -74,6 +77,26 @@ impl UdpSocket for MockUdpSocket {
         Ok(batch.len())
     }
 
+    fn prepare_udp_endpoint(&mut self, spec: UdpEndpointSpec) -> Result<Self::Endpoint, Error> {
+        prepare_generic_udp_endpoint(self, spec)
+    }
+
+    fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec {
+        endpoint.spec()
+    }
+
+    fn udp_endpoint_info(&self, endpoint: &Self::Endpoint) -> UdpEndpointInfo {
+        endpoint.info()
+    }
+
+    fn send_to_udp_endpoint(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<PacketBuf>>],
+    ) -> Result<usize, SendError> {
+        send_generic_udp_endpoint(self, endpoint, batch)
+    }
+
     fn recv(
         &mut self,
         out: &mut RecvBatch<UdpReceive<PacketBufMut, Self::RecvMeta>>,
@@ -115,4 +138,57 @@ fn udp_socket_trait_surface_accepts_mock_socket() {
     let mut rx = RecvBatch::with_capacity(4);
     assert_eq!(socket.recv(&mut rx).unwrap(), 1);
     assert_eq!(rx.len(), 1);
+}
+
+#[test]
+fn udp_endpoint_send_uses_prepared_metadata() {
+    let mut socket = MockUdpSocket::new();
+    let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999).into();
+    let spec = UdpEndpointSpec {
+        destination,
+        payload_len: Some(4),
+        ..UdpEndpointSpec::new(destination)
+    };
+    let mut endpoint = socket.prepare_udp_endpoint(spec.clone()).unwrap();
+
+    assert_eq!(socket.udp_endpoint_spec(&endpoint), &spec);
+    assert_eq!(
+        socket.udp_endpoint_info(&endpoint),
+        UdpEndpointInfo {
+            mtu: 128,
+            payload_len: Some(4),
+            gso_segment_size: None,
+        }
+    );
+
+    let packet = PacketBuf::copy_from_slice(b"ping");
+    let mut tx = [TxSlot::Ready(UdpEndpointTransmit::new(packet))];
+    assert_eq!(
+        socket.send_to_udp_endpoint(&mut endpoint, &mut tx).unwrap(),
+        1
+    );
+    assert!(tx[0].is_taken());
+}
+
+#[test]
+fn udp_endpoint_rejects_wrong_fixed_payload_len_without_consuming_slot() {
+    let mut socket = MockUdpSocket::new();
+    let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999).into();
+    let mut endpoint = socket
+        .prepare_udp_endpoint(UdpEndpointSpec {
+            destination,
+            payload_len: Some(4),
+            ..UdpEndpointSpec::new(destination)
+        })
+        .unwrap();
+
+    let packet = PacketBuf::copy_from_slice(b"too long");
+    let mut tx = [TxSlot::Ready(UdpEndpointTransmit::new(packet))];
+    let error = socket
+        .send_to_udp_endpoint(&mut endpoint, &mut tx)
+        .unwrap_err();
+
+    assert_eq!(error.accepted, 0);
+    assert!(matches!(error.kind, Error::InvalidPacket));
+    assert!(tx[0].is_ready());
 }
