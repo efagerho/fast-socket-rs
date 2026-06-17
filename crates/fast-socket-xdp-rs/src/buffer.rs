@@ -230,35 +230,37 @@ pub(crate) struct XdpPreparedTxBatch {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct XdpEndpointHeaderPatch {
-    total_len_offset: usize,
-    checksum_offset: usize,
-    transport_len_offset: usize,
+    total_len_offset: u16,
+    checksum_offset: u16,
+    transport_len_offset: u16,
     total_len_base: u16,
     transport_len_base: u16,
 }
 
 impl XdpEndpointHeaderPatch {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         total_len_offset: usize,
         checksum_offset: usize,
         transport_len_offset: usize,
         total_len_base: u16,
         transport_len_base: u16,
-    ) -> Self {
-        Self {
-            total_len_offset,
-            checksum_offset,
-            transport_len_offset,
+    ) -> Option<Self> {
+        Some(Self {
+            total_len_offset: u16::try_from(total_len_offset).ok()?,
+            checksum_offset: u16::try_from(checksum_offset).ok()?,
+            transport_len_offset: u16::try_from(transport_len_offset).ok()?,
             total_len_base,
             transport_len_base,
-        }
+        })
     }
 
     fn required_header_len(self) -> Option<usize> {
-        self.total_len_offset
-            .max(self.checksum_offset)
-            .max(self.transport_len_offset)
-            .checked_add(2)
+        usize::from(
+            self.total_len_offset
+                .max(self.checksum_offset)
+                .max(self.transport_len_offset),
+        )
+        .checked_add(2)
     }
 
     #[inline(always)]
@@ -267,15 +269,18 @@ impl XdpEndpointHeaderPatch {
         let transport_len = self.transport_len_base + payload_len as u16;
         // SAFETY: caller validated that all offsets plus two bytes fit inside
         // the copied header.
-        let old_total_len = unsafe { read_be_u16(header.add(self.total_len_offset)) };
+        let total_len_ptr = unsafe { header.add(usize::from(self.total_len_offset)) };
+        let checksum_ptr = unsafe { header.add(usize::from(self.checksum_offset)) };
+        let transport_len_ptr = unsafe { header.add(usize::from(self.transport_len_offset)) };
+        let old_total_len = unsafe { read_be_u16(total_len_ptr) };
         // SAFETY: see above.
-        let old_checksum = unsafe { read_be_u16(header.add(self.checksum_offset)) };
+        let old_checksum = unsafe { read_be_u16(checksum_ptr) };
         let checksum = ipv4_checksum_replace_word(old_checksum, old_total_len, total_len);
         // SAFETY: see above.
         unsafe {
-            write_be_u16(header.add(self.total_len_offset), total_len);
-            write_be_u16(header.add(self.checksum_offset), checksum);
-            write_be_u16(header.add(self.transport_len_offset), transport_len);
+            write_be_u16(total_len_ptr, total_len);
+            write_be_u16(checksum_ptr, checksum);
+            write_be_u16(transport_len_ptr, transport_len);
         }
     }
 }
@@ -407,6 +412,7 @@ impl FrameReclaim {
         count
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pop_many_try_with<E>(
         &self,
         max: usize,
@@ -450,6 +456,7 @@ impl FrameReclaim {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn push_local(&self, addr: u64) {
         // SAFETY: used by owner-thread completion reclaim paths.
         unsafe { self.local_free_mut() }.push(addr);
@@ -814,45 +821,69 @@ impl XdpTxPool {
         out.reserve(max);
 
         let start_len = out.len();
+        // SAFETY: `reserve(max)` above guarantees room for up to `max`
+        // descriptors after `start_len`; initialized entries are committed with
+        // `set_len` only after the packet loop succeeds.
+        let desc_out = unsafe { out.as_mut_ptr().add(start_len) };
         let mut written = 0usize;
         let mut tx_bytes = 0u64;
 
-        let result = live.reclaim.pop_many_try_with(max, |frame_addr| {
+        // SAFETY: endpoint batch preparation runs on the pool owner thread.
+        let free = unsafe { live.reclaim.local_free_mut() };
+        if free.len() < max {
+            drain_remote(&live.reclaim.remote, free);
+        }
+        let count = max.min(free.len());
+        for _ in 0..count {
+            let frame_addr = free.pop().expect("count is bounded by free.len()");
             // SAFETY: frame addresses come from this pool's live reclaim list,
             // and bounds above prove the header and payload-capacity slices fit.
-            let payload_len = unsafe {
+            let payload_len = match unsafe {
                 let frame = umem_base.add(frame_addr as usize);
-                let header_dst = frame.add(header_start);
-                ptr::copy_nonoverlapping(header.as_ptr(), header_dst, header_len);
                 let payload = slice::from_raw_parts_mut(frame.add(payload_start), payload_capacity);
                 let payload_len = fill_payload(written, payload);
                 if let Some(expected) = expected_payload_len
                     && payload_len != expected
                 {
-                    return Err(Error::InvalidPacket);
+                    Err(Error::InvalidPacket)
+                } else if payload_len > payload_len_limit {
+                    Err(Error::OversizeForMtu)
+                } else {
+                    let header_dst = frame.add(header_start);
+                    ptr::copy_nonoverlapping(header.as_ptr(), header_dst, header_len);
+                    header_patch.patch(header_dst, payload_len);
+                    Ok(payload_len)
                 }
-                if payload_len > payload_len_limit {
-                    return Err(Error::OversizeForMtu);
+            } {
+                Ok(payload_len) => payload_len,
+                Err(error) => {
+                    reclaim_failed_endpoint_batch(
+                        free,
+                        desc_out,
+                        written,
+                        header_start,
+                        frame_addr,
+                    );
+                    return Err(error);
                 }
-                header_patch.patch(header_dst, payload_len);
-                payload_len
             };
 
             let desc_len = header_len_u32 + payload_len as u32;
             tx_bytes += (l3_header_len + payload_len) as u64;
-            out.push(XdpDesc {
-                addr: frame_addr + header_start as u64,
-                len: desc_len,
-                options: 0,
-            });
-            written += 1;
-            Ok(())
-        });
-        if let Err(error) = result {
-            for desc in out.drain(start_len..) {
-                live.reclaim.push_local(desc.addr - header_start as u64);
+            // SAFETY: `written < count <= max`, and `out.reserve(max)` made
+            // these tail slots available.
+            unsafe {
+                desc_out.add(written).write(XdpDesc {
+                    addr: frame_addr + header_start as u64,
+                    len: desc_len,
+                    options: 0,
+                });
             }
-            return Err(error);
+            written += 1;
+        }
+        // SAFETY: exactly `written` tail elements were initialized above.
+        unsafe {
+            out.set_len(start_len + written);
         }
 
         Ok(XdpPreparedTxBatch {
@@ -868,6 +899,24 @@ impl XdpTxPool {
             let frame_addr = desc_addr - (desc_addr % frame_size);
             live.reclaim.push_local(frame_addr);
         }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reclaim_failed_endpoint_batch(
+    free: &mut Vec<u64>,
+    desc_out: *mut XdpDesc,
+    written: usize,
+    header_start: usize,
+    frame_addr: u64,
+) {
+    free.push(frame_addr);
+    for index in 0..written {
+        // SAFETY: exactly `written` descriptor slots before this point have
+        // been initialized.
+        let desc = unsafe { *desc_out.add(index) };
+        free.push(desc.addr - header_start as u64);
     }
 }
 
@@ -1653,7 +1702,8 @@ mod tests {
         header[16..18].copy_from_slice(&28u16.to_be_bytes());
         header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
         header[38..40].copy_from_slice(&8u16.to_be_bytes());
-        let header_patch = XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8);
+        let header_patch =
+            XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8).expect("test patch offsets fit");
         let payload_capacity = 8;
         let payload_lens = [3usize, 5];
         let mut descs = Vec::new();
@@ -1707,7 +1757,8 @@ mod tests {
         header[16..18].copy_from_slice(&28u16.to_be_bytes());
         header[24..26].copy_from_slice(&0x5a5au16.to_be_bytes());
         header[38..40].copy_from_slice(&8u16.to_be_bytes());
-        let header_patch = XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8);
+        let header_patch =
+            XdpEndpointHeaderPatch::new(16, 24, 38, 28, 8).expect("test patch offsets fit");
         let mut descs = Vec::new();
 
         let error = pool

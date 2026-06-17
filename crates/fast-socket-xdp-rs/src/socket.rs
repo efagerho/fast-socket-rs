@@ -2352,7 +2352,11 @@ where
             l2_len + IPV4_MIN_HEADER_LEN + 4,
             (IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) as u16,
             UDP_HEADER_LEN as u16,
-        );
+        )
+        .ok_or(SendError {
+            accepted: 0,
+            kind: Error::InvalidPacket,
+        })?;
 
         if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
             return Err(SendError { accepted: 0, kind });
