@@ -1,5 +1,4 @@
-#[path = "../common.rs"]
-mod common;
+use fast_socket_examples as common;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -59,14 +58,48 @@ fn main() -> Result<(), BoxError> {
     let local = SocketAddrV4::new(source_ip, source_port);
     run_static_route_blast(
         &args.device,
-        local,
-        args.target,
-        args.threads,
-        payload_len,
-        batch_size,
-        drain_every_batches,
-        args.duration_ms.map(Duration::from_millis),
+        BlastConfig {
+            local,
+            target: args.target,
+            threads: args.threads,
+            payload_len,
+            batch_size,
+            drain_every_batches,
+            duration: args.duration_ms.map(Duration::from_millis),
+        },
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlastConfig {
+    local: SocketAddrV4,
+    target: SocketAddrV4,
+    threads: usize,
+    payload_len: usize,
+    batch_size: usize,
+    drain_every_batches: usize,
+    duration: Option<Duration>,
+}
+
+impl BlastConfig {
+    fn worker(self) -> WorkerConfig {
+        WorkerConfig {
+            target: self.target.into(),
+            payload_len: self.payload_len,
+            batch_size: self.batch_size,
+            drain_every_batches: self.drain_every_batches,
+            duration: self.duration,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerConfig {
+    target: SocketAddr,
+    payload_len: usize,
+    batch_size: usize,
+    drain_every_batches: usize,
+    duration: Option<Duration>,
 }
 
 fn normalize_drain_every_batches(value: usize) -> Result<usize, BoxError> {
@@ -114,16 +147,16 @@ impl XdpUdpRouter for StaticTargetRouter {
 
 type StaticAggregate = XdpUdpAggregate<fast_socket_rs::BusyPollDriver, StaticTargetRouter>;
 
-fn run_static_route_blast(
-    device: &str,
-    local: SocketAddrV4,
-    target: SocketAddrV4,
-    threads: usize,
-    payload_len: usize,
-    batch_size: usize,
-    drain_every_batches: usize,
-    duration: Option<Duration>,
-) -> Result<(), BoxError> {
+fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxError> {
+    let BlastConfig {
+        local,
+        payload_len,
+        batch_size,
+        drain_every_batches,
+        duration,
+        target,
+        threads,
+    } = config;
     let routes = RouteSnapshot::from_netlink()?;
     let factory = build_xdp_factory(device, local, threads, routes.clone())?;
     let plans = factory.into_worker_plans();
@@ -156,23 +189,15 @@ fn run_static_route_blast(
             target: *target.ip(),
             resolved: XdpResolvedEgress::from_egress(egress),
         };
+        let worker_config = config.worker();
         let worker_stop = Arc::clone(&stop);
         let worker_total = Arc::clone(&total);
         handles.push(thread::spawn(move || -> Result<(), String> {
             let mut aggregate = plan
                 .open_udp_busy_poll_with_router(local, || router.clone())
                 .map_err(|error| error.to_string())?;
-            run_worker(
-                &mut aggregate,
-                target.into(),
-                payload_len,
-                batch_size,
-                drain_every_batches,
-                duration,
-                worker_stop,
-                worker_total,
-            )
-            .map_err(|error| error.to_string())
+            run_worker(&mut aggregate, worker_config, worker_stop, worker_total)
+                .map_err(|error| error.to_string())
         }));
     }
 
@@ -204,14 +229,17 @@ fn run_static_route_blast(
 
 fn run_worker(
     aggregate: &mut StaticAggregate,
-    target: SocketAddr,
-    payload_len: usize,
-    batch_size: usize,
-    drain_every_batches: usize,
-    duration: Option<Duration>,
+    config: WorkerConfig,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
 ) -> Result<(), BoxError> {
+    let WorkerConfig {
+        target,
+        payload_len,
+        batch_size,
+        drain_every_batches,
+        duration,
+    } = config;
     let started = Instant::now();
     let mut payload_bytes = payload(payload_len);
     let mut sequence = 0u64;

@@ -59,7 +59,7 @@ cargo run -p fast-socket-examples --bin udp-tokio-echo -- \
 calls `echo_step`; the XDP runner calls the same step once per socket in the
 busy-poll aggregate.
 
-```rust
+```rust,ignore
 while !shutdown_requested() {
     let count = echo_step(&mut socket, &mut state)?;
     progress.add(count as u64);
@@ -72,7 +72,7 @@ while !shutdown_requested() {
 
 `echo_step` drains the receive batch into transmit slots:
 
-```rust
+```rust,ignore
 fn echo_step<S>(socket: &mut S, state: &mut EchoState<S>) -> Result<usize, BoxError>
 where
     S: FastUdpSocket<RecvMeta = UdpRecvMeta>,
@@ -90,7 +90,8 @@ where
         state.tx.push(TxSlot::Ready(tx));
     }
 
-    let sent = common::send_all(socket, &mut state.tx)?;
+    let sent = socket.send_all(&mut state.tx)?;
+    socket.notify_tx()?;
     socket.drain_tx_completions()?;
     Ok(sent)
 }
@@ -99,15 +100,16 @@ where
 `EchoState` owns a reusable receive batch and a reusable TX slot vector. Echo
 does not call `allocate_tx_batch`. Each received packet is drained, frozen into
 a transmit buffer, addressed back to `item.meta.source`, and submitted through
-`common::send_all`. The helper handles partial acceptance by draining TX
-completions and retrying until every ready slot has been accepted.
+`socket.send_all`. The trait helper handles partial acceptance by draining TX
+completions and retrying until every ready slot has been accepted. The example
+then calls `notify_tx` for backends that need an explicit transmit wakeup.
 
 ## Tokio Actor Implementation
 
 `udp-tokio-echo` opens OS or wait-driven XDP actors and runs one `echo_actor`
 task per actor. The actor loop is the packet-processing loop:
 
-```rust
+```rust,ignore
 let mut tx_packets: Vec<ActorTxPacket<S>> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
 while !stop.load(Ordering::Relaxed) && !common::shutdown_requested() {
     let mut batch = match rx.recv_batch().await {

@@ -49,12 +49,13 @@ impl AttachMode {
 }
 
 /// XDP program and filter configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum XdpProgramConfig {
     /// Use the per-port membership array program.
     ///
     /// Call [`XdpProgram::bind_port`] and [`XdpProgram::unbind_port`] to update
     /// the redirected UDP destination ports after the program is attached.
+    #[default]
     BoundPorts,
     /// Use the inclusive UDP destination-port range program.
     ///
@@ -110,12 +111,6 @@ impl XdpProgramConfig {
             }
         }
         Ok(self)
-    }
-}
-
-impl Default for XdpProgramConfig {
-    fn default() -> Self {
-        Self::BoundPorts
     }
 }
 

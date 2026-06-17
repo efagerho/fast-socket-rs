@@ -59,7 +59,7 @@ cargo run -p fast-socket-examples --bin udp-tokio-pong -- \
 `main` builds the fixed response payload, then selects the OS loop or the XDP
 busy-poll loop. The runner repeatedly calls `pong_step` for each active socket:
 
-```rust
+```rust,ignore
 while !shutdown_requested() {
     let count = pong_step(&mut socket, &mut state)?;
     progress.add(count as u64);
@@ -73,7 +73,7 @@ while !shutdown_requested() {
 `pong_step` receives a batch, allocates TX buffers, fills them, and sends the
 generated replies:
 
-```rust
+```rust,ignore
 fn pong_step<S>(socket: &mut S, state: &mut PongState<S>) -> Result<usize, BoxError>
 where
     S: FastUdpSocket<RecvMeta = UdpRecvMeta>,
@@ -98,7 +98,8 @@ where
         state.tx.push(TxSlot::Ready(tx));
     }
 
-    let sent = common::send_all(socket, &mut state.tx)?;
+    let sent = socket.send_all(&mut state.tx)?;
+    socket.notify_tx()?;
     socket.drain_tx_completions()?;
     Ok(sent)
 }
@@ -108,8 +109,9 @@ where
 slot vector, and the shared response bytes. `socket.recv` determines how many
 responses are needed. `socket.allocate_tx_batch` asks for up to that many TX
 buffers. If fewer buffers are available than packets were received, the step
-sends only the responses it could allocate. `common::send_all` submits the
-ready slots and retries partial sends.
+sends only the responses it could allocate. `socket.send_all` submits the ready
+slots and retries partial sends, then the example calls `notify_tx` for backends
+that need an explicit transmit wakeup.
 
 ## Tokio Actor Implementation
 
@@ -117,7 +119,7 @@ ready slots and retries partial sends.
 task per actor. The actor loop records reply destinations, allocates actor TX
 buffers, fills them, and submits generated packets:
 
-```rust
+```rust,ignore
 let mut destinations: Vec<(SocketAddr, Option<u16>)> = Vec::with_capacity(batch_size);
 let mut tx_buffers: Vec<ActorTxBuffer<S>> = Vec::with_capacity(batch_size);
 let mut tx_packets: Vec<ActorTxPacket<S>> = Vec::with_capacity(batch_size);

@@ -517,7 +517,7 @@ where
             return Ok(0);
         }
         let mut moved = Vec::with_capacity(count);
-        moved.extend(buffers.drain(..));
+        moved.append(buffers);
         match self
             .commands
             .send(ActorCommand::SendBuffers {
@@ -553,7 +553,7 @@ where
             return Ok(0);
         }
         let mut moved = Vec::with_capacity(count);
-        moved.extend(packets.drain(..));
+        moved.append(packets);
         match self
             .commands
             .send(ActorCommand::SendPackets { packets: moved })

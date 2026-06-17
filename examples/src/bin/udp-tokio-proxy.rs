@@ -1,5 +1,4 @@
-#[path = "../common.rs"]
-mod common;
+use fast_socket_examples as common;
 
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;

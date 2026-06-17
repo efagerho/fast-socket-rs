@@ -43,7 +43,7 @@ The example uses `StaticTargetRouter` as a one-entry route table. It stores the
 only destination the generator will send to and the fully resolved XDP egress
 state for that destination:
 
-```rust
+```rust,ignore
 #[derive(Clone, Debug)]
 struct StaticTargetRouter {
     target: Ipv4Addr,
@@ -56,7 +56,7 @@ use a queue-local router backed by the current route snapshot. This example
 replaces that router with one that only answers for the configured target and
 interface:
 
-```rust
+```rust,ignore
 impl XdpUdpRouter for StaticTargetRouter {
     fn resolve_udp_egress(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<XdpEgress> {
         if dst != self.target || context.ifindex != self.resolved.egress().ifindex {
@@ -101,7 +101,7 @@ the cold path. For each worker plan it resolves the target once for that
 worker's interface and first queue, converts that result into `XdpResolvedEgress`,
 and stores it in `StaticTargetRouter`:
 
-```rust
+```rust,ignore
 let queue = plan
     .queue_ids()
     .first()
@@ -125,7 +125,7 @@ let router = StaticTargetRouter {
 
 The router is then installed when the worker opens its aggregate:
 
-```rust
+```rust,ignore
 let mut aggregate = plan
     .open_udp_busy_poll_with_router(local, || router.clone())
     .map_err(|error| error.to_string())?;

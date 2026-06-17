@@ -1,5 +1,4 @@
-#[path = "../common.rs"]
-mod common;
+use fast_socket_examples as common;
 
 use std::net::{SocketAddr, SocketAddrV4};
 
@@ -111,7 +110,8 @@ where
         state.tx.push(TxSlot::Ready(tx));
     }
 
-    let sent = common::send_all(socket, &mut state.tx)?;
+    let sent = socket.send_all(&mut state.tx)?;
+    socket.notify_tx()?;
     socket.drain_tx_completions()?;
     Ok(sent)
 }

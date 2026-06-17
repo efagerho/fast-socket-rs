@@ -56,7 +56,7 @@ cargo run -p fast-socket-examples --bin udp-tokio-discard -- \
 `common::run_xdp_busy_poll_loop`. The OS runner opens one socket and repeatedly
 calls the example step function:
 
-```rust
+```rust,ignore
 while !shutdown_requested() {
     let count = discard_step(&mut socket, &mut state)?;
     progress.add(count as u64);
@@ -71,7 +71,7 @@ The XDP runner uses the same `discard_step` callback, but calls it once per
 socket in the busy-poll aggregate before deciding whether the worker made
 progress:
 
-```rust
+```rust,ignore
 while !worker_stop.load(Ordering::Relaxed) && !shutdown_requested() {
     let mut progressed = 0usize;
     for (socket, state) in aggregate.members_mut().iter_mut().zip(states.iter_mut()) {
@@ -87,7 +87,7 @@ while !worker_stop.load(Ordering::Relaxed) && !shutdown_requested() {
 
 The discard packet step is only a receive path:
 
-```rust
+```rust,ignore
 fn discard_step<S>(socket: &mut S, state: &mut DiscardState<S>) -> Result<usize, BoxError>
 where
     S: FastUdpSocket<RecvMeta = UdpRecvMeta>,
@@ -111,7 +111,7 @@ buffers. No TX buffers are allocated, and no packets are sent.
 passes them to `common::run_actor_tasks`. The packet-processing loop is the
 actor task:
 
-```rust
+```rust,ignore
 while !stop.load(Ordering::Relaxed) && !common::shutdown_requested() {
     let batch = match rx.recv_batch().await {
         Ok(batch) => batch,

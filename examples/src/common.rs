@@ -1,6 +1,3 @@
-// Included by each example binary via `#[path = "../common.rs"] mod common;`.
-#![allow(dead_code, unused_imports)]
-
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
@@ -13,18 +10,15 @@ use fast_socket_async_rs::{
     ActorConfig, AsyncUdpActor, AsyncUdpHandle, AsyncUdpRx, spawn_udp_actor_local,
 };
 use fast_socket_os_rs::{OsUdpSocket, OsUdpSocketBuilder};
-use fast_socket_rs::{
-    BufferLayout, TxSlot, UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer,
-    WaitDrivenDriverKind,
-};
+use fast_socket_rs::{BufferLayout, UdpSocket as FastUdpSocket, WaitDrivenDriverKind};
 use fast_socket_xdp_rs::{
     BusyPollXdpUdpSocket, InterfaceSelector, PortFilter, RouteSnapshot, WaitDrivenXdpUdpSocket,
     XdpFactory, XdpFactoryBuilder,
 };
 
 pub use fast_socket_benchmarks::{
-    BoxError, dynamic_source_port, install_shutdown_signal_handlers, payload,
-    pin_current_thread_to_cpu, shutdown_requested, write_sequence,
+    BoxError, dynamic_source_port, install_shutdown_signal_handlers, payload, shutdown_requested,
+    write_sequence,
 };
 
 pub const DEFAULT_BATCH_SIZE: usize = 64;
@@ -177,28 +171,6 @@ pub fn open_xdp_wait_driven_actors(
         return Err("XDP factory did not produce any wait-driven sockets".into());
     }
     Ok(actors)
-}
-
-pub fn send_all<S>(
-    socket: &mut S,
-    batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<S>>>],
-) -> Result<usize, BoxError>
-where
-    S: FastUdpSocket,
-{
-    let mut accepted = 0;
-    while accepted < batch.len() {
-        match socket.send(&mut batch[accepted..]) {
-            Ok(0) => {
-                socket.drain_tx_completions()?;
-                std::hint::spin_loop();
-            }
-            Ok(n) => accepted += n,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    socket.notify_tx()?;
-    Ok(accepted)
 }
 
 pub fn run_os_socket_loop<State, Step>(

@@ -8,13 +8,12 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use fast_socket_benchmarks::{
-    BoxError, Progress, RunLimit, install_shutdown_signal_handlers, pin_current_thread_to_cpu,
-    shutdown_requested,
+    BoxError, Progress, RunLimit, install_shutdown_signal_handlers, shutdown_requested,
 };
 use fast_socket_os_rs::{OsPacketBuf, OsPacketBufMut, OsUdpSocket, OsUdpSocketBuilder};
 use fast_socket_rs::{
     BufferLayout, IfIndex, PacketBufferMut, QueueAffinity, QueueId, RecvBatch, TxSlot, UdpReceive,
-    UdpRecvMeta, UdpSocket, UdpTransmit,
+    UdpRecvMeta, UdpSocket, UdpTransmit, pin_current_thread_to_cpu,
 };
 use fast_socket_xdp_rs::{cpu_for_xdp_queue, if_index_to_name, xdp_queue_slots_for_interface};
 
@@ -228,7 +227,7 @@ fn pong(socket: &mut OsUdpSocket, limit: RunLimit) -> Result<(), BoxError> {
                 item.meta.source,
             )));
         }
-        packets += send_all(socket, &mut tx_batch)? as u64;
+        packets += socket.send_all(&mut tx_batch)? as u64;
         progress.tick(packets);
     }
     progress.finish(packets);
@@ -273,24 +272,9 @@ fn pong_shared(
                 item.meta.source,
             )));
         }
-        total.fetch_add(send_all(socket, &mut tx_batch)? as u64, Relaxed);
+        total.fetch_add(socket.send_all(&mut tx_batch)? as u64, Relaxed);
     }
     Ok(())
-}
-
-fn send_all(
-    socket: &mut OsUdpSocket,
-    batch: &mut [TxSlot<UdpTransmit<OsPacketBuf>>],
-) -> Result<usize, BoxError> {
-    let mut accepted = 0;
-    while accepted < batch.len() {
-        match socket.send(&mut batch[accepted..]) {
-            Ok(0) => std::hint::spin_loop(),
-            Ok(n) => accepted += n,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(accepted)
 }
 
 fn join_workers(handles: Vec<thread::JoinHandle<()>>) -> Result<(), BoxError> {

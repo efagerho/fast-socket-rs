@@ -179,31 +179,6 @@ extern "C" fn handle_shutdown_signal(signal: libc::c_int) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn pin_current_thread_to_cpu(cpu: u32) -> Result<(), BoxError> {
-    let cpu = usize::try_from(cpu)?;
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        let result = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
-        );
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error().into())
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn pin_current_thread_to_cpu(cpu: u32) -> Result<(), BoxError> {
-    Err(format!("thread pinning is not implemented on this target (requested CPU {cpu})").into())
-}
-
-#[cfg(target_os = "linux")]
 pub type XdpProgramMap =
     std::collections::BTreeMap<fast_socket_rs::IfIndex, fast_socket_xdp_rs::XdpProgramHandle>;
 

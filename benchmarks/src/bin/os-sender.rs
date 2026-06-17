@@ -197,25 +197,10 @@ fn blast_worker(
             packet.extend_from_slice(&bytes)?;
             batch.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), dest)));
         }
-        count += send_all(socket, &mut batch)? as u64;
+        count += socket.send_all(&mut batch)? as u64;
         if let Some(progress) = progress.as_deref_mut() {
             progress.tick(count);
         }
     }
     Ok(count)
-}
-
-fn send_all(
-    socket: &mut OsUdpSocket,
-    batch: &mut [TxSlot<UdpTransmit<OsPacketBuf>>],
-) -> Result<usize, BoxError> {
-    let mut accepted = 0;
-    while accepted < batch.len() {
-        match socket.send(&mut batch[accepted..]) {
-            Ok(0) => std::hint::spin_loop(),
-            Ok(n) => accepted += n,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(accepted)
 }

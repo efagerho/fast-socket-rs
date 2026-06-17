@@ -63,7 +63,7 @@ cargo run -p fast-socket-examples --bin udp-tokio-proxy -- \
 upstream address into each `ProxyState`. The runner repeatedly calls
 `proxy_step` with the socket and its state:
 
-```rust
+```rust,ignore
 while !shutdown_requested() {
     let count = proxy_step(&mut socket, &mut state)?;
     progress.add(count as u64);
@@ -77,7 +77,7 @@ while !shutdown_requested() {
 `proxy_step` receives a batch, decides where each packet should go, and submits
 the forwarded packets:
 
-```rust
+```rust,ignore
 fn proxy_step<S>(socket: &mut S, state: &mut ProxyState<S>) -> Result<usize, BoxError>
 where
     S: FastUdpSocket<RecvMeta = UdpRecvMeta>,
@@ -105,7 +105,8 @@ where
         state.tx.push(TxSlot::Ready(tx));
     }
 
-    let sent = common::send_all(socket, &mut state.tx)?;
+    let sent = socket.send_all(&mut state.tx)?;
+    socket.notify_tx()?;
     socket.drain_tx_completions()?;
     Ok(sent)
 }
@@ -118,7 +119,7 @@ upstream. An upstream packet is skipped if no client has been observed yet.
 
 The direct proxy does not allocate TX buffers. It freezes each received buffer
 into a transmit buffer, changes the destination and optional source-port
-metadata, and submits the ready slots through `common::send_all`.
+metadata, and submits the ready slots through `socket.send_all`.
 
 ## Tokio Actor Implementation
 
@@ -126,7 +127,7 @@ metadata, and submits the ready slots through `common::send_all`.
 task per actor. The actor loop receives packets, chooses destinations, and
 submits forwarded packets:
 
-```rust
+```rust,ignore
 let mut last_client = None;
 let mut tx_packets: Vec<ActorTxPacket<S>> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
 
