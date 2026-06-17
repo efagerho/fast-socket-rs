@@ -33,7 +33,7 @@ use std::thread::{self, ThreadId};
 
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
-    BufferAccessError, BufferLayout, BufferPool, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
+    BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     ReserveError, Segment,
 };
 
@@ -313,10 +313,10 @@ impl fmt::Debug for OsBufferPool {
     }
 }
 
-impl BufferPool for OsBufferPool {
-    type Buffer = OsPacketBufMut;
-
-    fn layout(&self) -> &BufferLayout {
+impl OsBufferPool {
+    /// Returns the layout used for newly allocated buffers.
+    #[must_use]
+    pub fn layout(&self) -> &BufferLayout {
         &self.ctx.layout
     }
 
@@ -326,7 +326,7 @@ impl BufferPool for OsBufferPool {
     /// pointers: **this pool and its owning socket must outlive the buffer**,
     /// even if it is moved to another thread. Debug builds panic on violation;
     /// release builds do not check.
-    fn allocate(&mut self) -> Option<Self::Buffer> {
+    pub fn allocate(&mut self) -> Option<OsPacketBufMut> {
         let mut storage = match self.reclaim.pop() {
             Some(storage) => storage,
             None => {

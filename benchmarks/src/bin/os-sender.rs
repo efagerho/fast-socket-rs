@@ -8,7 +8,7 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use fast_socket_benchmarks::{BoxError, Progress, RunLimit, payload, write_sequence};
 use fast_socket_os_rs::{OsPacketBuf, OsUdpSocket, OsUdpSocketBuilder};
-use fast_socket_rs::{BufferLayout, BufferPool, PacketBufferMut, TxSlot, UdpSocket, UdpTransmit};
+use fast_socket_rs::{BufferLayout, PacketBufferMut, TxSlot, UdpSocket, UdpTransmit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
@@ -178,14 +178,22 @@ fn blast_worker(
     let mut count = 0;
     let mut bytes = payload(payload_len);
     let mut batch: Vec<TxSlot<UdpTransmit<OsPacketBuf>>> = Vec::with_capacity(64);
+    let mut tx_buffers = Vec::with_capacity(64);
     while limit.keep_running(count, started) {
         batch.clear();
-        while batch.len() < 64 && limit.keep_running(count + batch.len() as u64, started) {
+        let mut requested = 0usize;
+        while requested < 64 && limit.keep_running(count + requested as u64, started) {
+            requested += 1;
+        }
+
+        tx_buffers.clear();
+        if socket.allocate_tx_batch(&mut tx_buffers, requested)? == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+
+        for mut packet in tx_buffers.drain(..) {
             write_sequence(&mut bytes, count + batch.len() as u64);
-            let mut packet = socket
-                .tx_pool_mut()
-                .allocate()
-                .ok_or("tx allocation failed")?;
             packet.extend_from_slice(&bytes)?;
             batch.push(TxSlot::Ready(UdpTransmit::new(packet.freeze(), dest)));
         }

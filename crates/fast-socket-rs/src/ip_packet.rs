@@ -4,8 +4,8 @@ use core::num::NonZeroU16;
 
 use crate::route::{NeighborId, RouteId};
 use crate::{
-    BufferPool, Error, IpFamily, Mixed, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch,
-    SendError, SocketId, TxSlot,
+    Error, IpFamily, Mixed, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError,
+    SocketId, TxSlot,
 };
 
 /// IP version carried by an IP packet.
@@ -178,12 +178,14 @@ where
     }
 }
 
-/// Immutable transmit buffer type derived from an IP packet socket's transmit pool.
-pub type IpPacketTxBuffer<S> =
-    <<<S as IpPacketSocket>::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen;
+/// Immutable transmit buffer type derived from an IP packet socket's transmit buffer type.
+pub type IpPacketTxBuffer<S> = <<S as IpPacketSocket>::TxBufferMut as PacketBufferMut>::Frozen;
 
-/// Mutable receive buffer type derived from an IP packet socket's receive pool.
-pub type IpPacketRxBuffer<S> = <<S as IpPacketSocket>::RxPool as BufferPool>::Buffer;
+/// Mutable transmit buffer type allocated by an IP packet socket.
+pub type IpPacketTxBufferMut<S> = <S as IpPacketSocket>::TxBufferMut;
+
+/// Mutable receive buffer type delivered by an IP packet socket.
+pub type IpPacketRxBuffer<S> = <S as IpPacketSocket>::RxBuffer;
 
 /// Transmit item type derived from an IP packet socket's pools and egress family.
 pub type IpPacketTxItem<S> = IpPacketTransmit<
@@ -198,16 +200,14 @@ pub type IpPacketRxItem<S> = IpPacketReceive<IpPacketRxBuffer<S>, <S as IpPacket
 /// IP-packet queue abstraction.
 pub trait IpPacketSocket
 where
-    <Self::RxPool as BufferPool>::Buffer: Send,
-    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxPool as BufferPool>::Buffer: Send,
-    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
 {
-    /// Buffer pool used by the socket receive path.
-    type RxPool: BufferPool;
+    /// Mutable buffer type delivered by the socket receive path.
+    type RxBuffer: PacketBufferMut + Send;
 
-    /// Buffer pool used by the socket transmit path.
-    type TxPool: BufferPool;
+    /// Mutable buffer type allocated by the socket transmit path.
+    type TxBufferMut: PacketBufferMut + Send;
 
     /// Compile-time address-family policy.
     type Family: IpFamily;
@@ -235,26 +235,53 @@ where
         QueueAffinity::Any
     }
 
-    /// Returns the socket-owned receive buffer pool.
-    fn rx_pool(&self) -> &Self::RxPool;
-
-    /// Returns the socket-owned receive buffer pool mutably.
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool;
-
-    /// Returns the socket-owned transmit buffer pool.
-    fn tx_pool(&self) -> &Self::TxPool;
-
-    /// Returns the socket-owned transmit buffer pool mutably.
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool;
-
     /// Returns the polling driver.
     fn driver(&self) -> &Self::Driver;
 
     /// Returns the polling driver mutably.
     fn driver_mut(&mut self) -> &mut Self::Driver;
 
+    /// Allocates up to `max` socket-owned transmit buffers into `out`.
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<IpPacketTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error>
+    where
+        Self: Sized;
+
     /// Sends a batch of complete IP datagrams, consuming accepted slots in order.
     fn send(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>]) -> Result<usize, SendError>;
+
+    /// Sends `batch` to completion, draining TX completions on partial
+    /// acceptance so the next `send` has transmit capacity.
+    fn send_all(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>]) -> Result<usize, SendError>
+    where
+        Self: Sized,
+    {
+        let mut total = 0usize;
+        while total < batch.len() {
+            match self.send(&mut batch[total..]) {
+                Ok(0) => {
+                    if let Err(error) = self.drain_tx_completions() {
+                        return Err(SendError {
+                            accepted: total,
+                            kind: error,
+                        });
+                    }
+                    core::hint::spin_loop();
+                }
+                Ok(n) => total += n,
+                Err(SendError { accepted, kind }) => {
+                    return Err(SendError {
+                        accepted: total + accepted,
+                        kind,
+                    });
+                }
+            }
+        }
+        Ok(total)
+    }
 
     /// Receives a batch of complete IP datagrams into `out`.
     fn recv(&mut self, out: &mut RecvBatch<IpPacketRxItem<Self>>) -> Result<usize, Error>;

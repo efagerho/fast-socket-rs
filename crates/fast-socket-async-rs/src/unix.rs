@@ -913,8 +913,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use fast_socket_rs::{
-        BufferAccessError, BufferLayout, BufferPool, PacketBuffer, ReserveError, Segment, Segments,
-        SocketId, UdpRecvMeta, WaitOutcome, WakeHandle,
+        BufferAccessError, BufferLayout, PacketBuffer, ReserveError, Segment, Segments, SocketId,
+        UdpRecvMeta, WaitOutcome, WakeHandle,
     };
 
     use super::*;
@@ -1047,14 +1047,8 @@ mod tests {
         }
     }
 
-    impl BufferPool for TestPool {
-        type Buffer = TestBuf;
-
-        fn layout(&self) -> &BufferLayout {
-            &self.layout
-        }
-
-        fn allocate(&mut self) -> Option<Self::Buffer> {
+    impl TestPool {
+        fn allocate(&mut self) -> Option<TestBuf> {
             if self.remaining == 0 {
                 return None;
             }
@@ -1090,7 +1084,6 @@ mod tests {
     impl WaitDrivenDriverKind for TestWaitDriver {}
 
     struct TestSocket {
-        rx_pool: TestPool,
         tx_pool: TestPool,
         driver: TestWaitDriver,
         rx: VecDeque<UdpReceive<TestBuf, UdpRecvMeta>>,
@@ -1100,7 +1093,6 @@ mod tests {
     impl TestSocket {
         fn new(rx: VecDeque<UdpReceive<TestBuf, UdpRecvMeta>>, tx_buffers: usize) -> Self {
             Self {
-                rx_pool: TestPool::new(0),
                 tx_pool: TestPool::new(tx_buffers),
                 driver: TestWaitDriver::new(),
                 rx,
@@ -1114,8 +1106,8 @@ mod tests {
     }
 
     impl UdpSocket for TestSocket {
-        type RxPool = TestPool;
-        type TxPool = TestPool;
+        type RxBuffer = TestBuf;
+        type TxBufferMut = TestBuf;
         type Driver = TestWaitDriver;
         type RecvMeta = UdpRecvMeta;
 
@@ -1127,28 +1119,27 @@ mod tests {
             1500
         }
 
-        fn rx_pool(&self) -> &Self::RxPool {
-            &self.rx_pool
-        }
-
-        fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-            &mut self.rx_pool
-        }
-
-        fn tx_pool(&self) -> &Self::TxPool {
-            &self.tx_pool
-        }
-
-        fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-            &mut self.tx_pool
-        }
-
         fn driver(&self) -> &Self::Driver {
             &self.driver
         }
 
         fn driver_mut(&mut self) -> &mut Self::Driver {
             &mut self.driver
+        }
+
+        fn allocate_tx_batch(
+            &mut self,
+            out: &mut Vec<UdpTxBufferMut<Self>>,
+            max: usize,
+        ) -> Result<usize, Error> {
+            let start_len = out.len();
+            while out.len() - start_len < max {
+                let Some(buffer) = self.tx_pool.allocate() else {
+                    break;
+                };
+                out.push(buffer);
+            }
+            Ok(out.len() - start_len)
         }
 
         fn send(&mut self, batch: &mut [TxSlot<UdpTransmit<TestBuf>>]) -> Result<usize, SendError> {

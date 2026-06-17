@@ -3,8 +3,8 @@ mod support;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, Error, PollDriver, PollMode, RecvBatch, SendError, SocketId,
-    TxSlot, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit,
+    BusyPollDriver, Error, PollDriver, PollMode, RecvBatch, SendError, SocketId, TxSlot,
+    UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, UdpTxBufferMut,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};
@@ -26,8 +26,8 @@ impl MockUdpSocket {
 }
 
 impl UdpSocket for MockUdpSocket {
-    type RxPool = HeapBufferPool;
-    type TxPool = HeapBufferPool;
+    type RxBuffer = PacketBufMut;
+    type TxBufferMut = PacketBufMut;
     type Driver = BusyPollDriver;
     type RecvMeta = UdpRecvMeta;
 
@@ -39,20 +39,19 @@ impl UdpSocket for MockUdpSocket {
         128
     }
 
-    fn rx_pool(&self) -> &Self::RxPool {
-        &self.rx_pool
-    }
-
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        &mut self.rx_pool
-    }
-
-    fn tx_pool(&self) -> &Self::TxPool {
-        &self.tx_pool
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        &mut self.tx_pool
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<UdpTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        let start_len = out.len();
+        while out.len() - start_len < max {
+            let Some(buffer) = self.tx_pool.allocate() else {
+                break;
+            };
+            out.push(buffer);
+        }
+        Ok(out.len() - start_len)
     }
 
     fn driver(&self) -> &Self::Driver {

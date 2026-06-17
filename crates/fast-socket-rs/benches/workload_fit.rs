@@ -19,7 +19,6 @@ const IPV4_HEADER_LEN: usize = 20;
 
 #[derive(Debug)]
 struct BenchIpPacketSocket {
-    rx_pool: HeapBufferPool,
     tx_pool: HeapBufferPool,
     driver: BusyPollDriver,
     recv: VecDeque<IpPacketReceive<PacketBufMut, IpPacketRecvMeta>>,
@@ -30,7 +29,6 @@ struct BenchIpPacketSocket {
 impl BenchIpPacketSocket {
     fn new() -> Self {
         Self {
-            rx_pool: HeapBufferPool::new(BufferLayout::with_headroom_and_tailroom(2048, 64, 64)),
             tx_pool: HeapBufferPool::new(BufferLayout::with_headroom_and_tailroom(2048, 64, 64)),
             driver: BusyPollDriver::new(),
             recv: VecDeque::new(),
@@ -52,8 +50,8 @@ impl BenchIpPacketSocket {
 }
 
 impl IpPacketSocket for BenchIpPacketSocket {
-    type RxPool = HeapBufferPool;
-    type TxPool = HeapBufferPool;
+    type RxBuffer = PacketBufMut;
+    type TxBufferMut = PacketBufMut;
     type Family = V4Only;
     type Egress = ();
     type Driver = BusyPollDriver;
@@ -67,28 +65,27 @@ impl IpPacketSocket for BenchIpPacketSocket {
         1500
     }
 
-    fn rx_pool(&self) -> &Self::RxPool {
-        &self.rx_pool
-    }
-
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        &mut self.rx_pool
-    }
-
-    fn tx_pool(&self) -> &Self::TxPool {
-        &self.tx_pool
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        &mut self.tx_pool
-    }
-
     fn driver(&self) -> &Self::Driver {
         &self.driver
     }
 
     fn driver_mut(&mut self) -> &mut Self::Driver {
         &mut self.driver
+    }
+
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<fast_socket_rs::IpPacketTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        let start_len = out.len();
+        while out.len() - start_len < max {
+            let Some(buffer) = self.tx_pool.allocate() else {
+                break;
+            };
+            out.push(buffer);
+        }
+        Ok(out.len() - start_len)
     }
 
     fn send(

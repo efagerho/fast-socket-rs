@@ -22,6 +22,8 @@ use fast_socket_xdp_rs::{
     XdpUdpAggregate, XdpUdpRouter,
 };
 
+const DEFAULT_DRAIN_EVERY_BATCHES: usize = 2;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -38,6 +40,8 @@ struct Args {
     payload_len: usize,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
     batch_size: usize,
+    #[arg(long, default_value_t = DEFAULT_DRAIN_EVERY_BATCHES)]
+    drain_every_batches: usize,
     #[arg(long)]
     duration_ms: Option<u64>,
 }
@@ -46,6 +50,7 @@ fn main() -> Result<(), BoxError> {
     install_shutdown_signal_handlers()?;
     let args = Args::parse();
     let batch_size = normalize_batch_size(args.batch_size)?;
+    let drain_every_batches = normalize_drain_every_batches(args.drain_every_batches)?;
     let payload_len = normalize_payload_len(args.payload_len)?;
     let source_ip = args
         .source_ip
@@ -59,8 +64,16 @@ fn main() -> Result<(), BoxError> {
         args.threads,
         payload_len,
         batch_size,
+        drain_every_batches,
         args.duration_ms.map(Duration::from_millis),
     )
+}
+
+fn normalize_drain_every_batches(value: usize) -> Result<usize, BoxError> {
+    if value == 0 {
+        return Err("--drain-every-batches must be at least 1".into());
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug)]
@@ -108,13 +121,14 @@ fn run_static_route_blast(
     threads: usize,
     payload_len: usize,
     batch_size: usize,
+    drain_every_batches: usize,
     duration: Option<Duration>,
 ) -> Result<(), BoxError> {
     let routes = RouteSnapshot::from_netlink()?;
     let factory = build_xdp_factory(device, local, threads, routes.clone())?;
     let plans = factory.into_worker_plans();
     eprintln!(
-        "udp-xdp-static-route-blast: {} XDP worker(s), {payload_len}-byte payloads, batch size {batch_size}, {local} -> {target}",
+        "udp-xdp-static-route-blast: {} XDP worker(s), {payload_len}-byte payloads, batch size {batch_size}, drain every {drain_every_batches} batch(es), {local} -> {target}",
         plans.len()
     );
 
@@ -153,6 +167,7 @@ fn run_static_route_blast(
                 target.into(),
                 payload_len,
                 batch_size,
+                drain_every_batches,
                 duration,
                 worker_stop,
                 worker_total,
@@ -192,6 +207,7 @@ fn run_worker(
     target: SocketAddr,
     payload_len: usize,
     batch_size: usize,
+    drain_every_batches: usize,
     duration: Option<Duration>,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
@@ -201,6 +217,7 @@ fn run_worker(
     let mut sequence = 0u64;
     let mut tx_buffers = Vec::with_capacity(batch_size);
     let mut batch = Vec::with_capacity(batch_size);
+    let mut batches_since_drain = 0usize;
 
     while !stop.load(Ordering::Relaxed)
         && !shutdown_requested()
@@ -208,7 +225,7 @@ fn run_worker(
     {
         let mut progressed = 0usize;
         for socket in aggregate.members_mut() {
-            progressed += send_batch(
+            let accepted = send_batch(
                 socket,
                 target,
                 &mut payload_bytes,
@@ -217,6 +234,14 @@ fn run_worker(
                 &mut tx_buffers,
                 &mut batch,
             )?;
+            progressed += accepted;
+            if accepted > 0 {
+                batches_since_drain += 1;
+                if batches_since_drain >= drain_every_batches {
+                    socket.drain_tx_completions()?;
+                    batches_since_drain = 0;
+                }
+            }
         }
         if progressed == 0 {
             aggregate.drain_tx_completions()?;
@@ -224,6 +249,10 @@ fn run_worker(
         } else {
             total.fetch_add(progressed as u64, Ordering::Relaxed);
         }
+    }
+
+    if batches_since_drain > 0 {
+        aggregate.drain_tx_completions()?;
     }
 
     Ok(())
@@ -255,6 +284,5 @@ fn send_batch(
     }
 
     let accepted = socket.send(batch.as_mut_slice())?;
-    socket.drain_tx_completions()?;
     Ok(accepted)
 }

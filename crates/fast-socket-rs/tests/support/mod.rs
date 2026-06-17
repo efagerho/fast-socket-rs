@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use fast_socket_rs::{
-    BufferAccessError, BufferLayout, BufferPool, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
+    BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     ReserveError, Segments,
 };
 
@@ -264,14 +264,13 @@ impl HeapBufferPool {
     }
 }
 
-impl BufferPool for HeapBufferPool {
-    type Buffer = PacketBufMut;
-
-    fn layout(&self) -> &BufferLayout {
+impl HeapBufferPool {
+    #[must_use]
+    pub fn layout(&self) -> &BufferLayout {
         &self.layout
     }
 
-    fn allocate(&mut self) -> Option<Self::Buffer> {
+    pub fn allocate(&mut self) -> Option<PacketBufMut> {
         Some(PacketBufMut::new(self.layout))
     }
 }

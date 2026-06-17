@@ -1,9 +1,9 @@
 mod support;
 
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, ChecksumStatus, CoreEgress, Error, IpPacketReceive,
-    IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, NeighborId, PollDriver,
-    PollMode, RecvBatch, SendError, SocketId, TxOffload, TxSlot, V4Only,
+    BusyPollDriver, ChecksumStatus, CoreEgress, Error, IpPacketReceive, IpPacketRecvMeta,
+    IpPacketSocket, IpPacketTransmit, IpVersion, NeighborId, PollDriver, PollMode, RecvBatch,
+    SendError, SocketId, TxOffload, TxSlot, V4Only,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};
@@ -25,8 +25,8 @@ impl MockIpPacketSocket {
 }
 
 impl IpPacketSocket for MockIpPacketSocket {
-    type RxPool = HeapBufferPool;
-    type TxPool = HeapBufferPool;
+    type RxBuffer = PacketBufMut;
+    type TxBufferMut = PacketBufMut;
     type Family = V4Only;
     type Egress = CoreEgress;
     type Driver = BusyPollDriver;
@@ -40,28 +40,27 @@ impl IpPacketSocket for MockIpPacketSocket {
         1500
     }
 
-    fn rx_pool(&self) -> &Self::RxPool {
-        &self.rx_pool
-    }
-
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        &mut self.rx_pool
-    }
-
-    fn tx_pool(&self) -> &Self::TxPool {
-        &self.tx_pool
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        &mut self.tx_pool
-    }
-
     fn driver(&self) -> &Self::Driver {
         &self.driver
     }
 
     fn driver_mut(&mut self) -> &mut Self::Driver {
         &mut self.driver
+    }
+
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<fast_socket_rs::IpPacketTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        let start_len = out.len();
+        while out.len() - start_len < max {
+            let Some(buffer) = self.tx_pool.allocate() else {
+                break;
+            };
+            out.push(buffer);
+        }
+        Ok(out.len() - start_len)
     }
 
     fn send(

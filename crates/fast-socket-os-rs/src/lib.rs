@@ -24,9 +24,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use fast_socket_rs::{
-    BufferLayout, BufferPool, DeviceError, DeviceErrorKind, Error, IfIndex, PacketBuffer,
-    PollDriver, PollMode, QueueAffinity, QueueId, RecvBatch, SendError, SocketId, TxSlot,
-    UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, WaitOutcome, WakeHandle,
+    BufferLayout, DeviceError, DeviceErrorKind, Error, IfIndex, PacketBuffer, PollDriver, PollMode,
+    QueueAffinity, QueueId, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
+    UdpRecvMeta, UdpSocket, UdpTransmit, UdpTxBufferMut, WaitOutcome, WakeHandle,
 };
 
 pub use buffer::{OsBufferPool, OsPacketBuf, OsPacketBufMut};
@@ -497,11 +497,23 @@ impl OsUdpSocket {
     pub const fn queue_affinity(&self) -> QueueAffinity {
         self.queue_affinity
     }
+
+    /// Returns the configured receive buffer layout.
+    #[must_use]
+    pub fn rx_buffer_layout(&self) -> &BufferLayout {
+        self.rx_pool.layout()
+    }
+
+    /// Returns the configured transmit buffer layout.
+    #[must_use]
+    pub fn tx_buffer_layout(&self) -> &BufferLayout {
+        self.tx_pool.layout()
+    }
 }
 
 impl UdpSocket for OsUdpSocket {
-    type RxPool = OsBufferPool;
-    type TxPool = OsBufferPool;
+    type RxBuffer = OsPacketBufMut;
+    type TxBufferMut = OsPacketBufMut;
     type Driver = OsWaitDrivenDriver;
     type RecvMeta = UdpRecvMeta;
 
@@ -521,20 +533,30 @@ impl UdpSocket for OsUdpSocket {
         UdpCapabilities::default()
     }
 
-    fn rx_pool(&self) -> &Self::RxPool {
-        &self.rx_pool
-    }
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<UdpTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        let start_len = out.len();
+        let mut drained_after_empty = false;
+        while out.len() - start_len < max {
+            if let Some(buffer) = self.tx_pool.allocate() {
+                out.push(buffer);
+                drained_after_empty = false;
+                continue;
+            }
 
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        &mut self.rx_pool
-    }
+            if drained_after_empty {
+                break;
+            }
 
-    fn tx_pool(&self) -> &Self::TxPool {
-        &self.tx_pool
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        &mut self.tx_pool
+            if self.drain_tx_completions()? == 0 {
+                break;
+            }
+            drained_after_empty = true;
+        }
+        Ok(out.len() - start_len)
     }
 
     fn driver(&self) -> &Self::Driver {
@@ -1529,12 +1551,14 @@ mod tests {
             .bind()
             .unwrap();
 
-        assert_eq!(socket.rx_pool().layout().payload_capacity(), 128);
-        assert_eq!(socket.rx_pool().layout().headroom(), 4);
-        assert_eq!(socket.tx_pool().layout().payload_capacity(), 512);
-        assert_eq!(socket.tx_pool().layout().headroom(), 64);
+        assert_eq!(socket.rx_buffer_layout().payload_capacity(), 128);
+        assert_eq!(socket.rx_buffer_layout().headroom(), 4);
+        assert_eq!(socket.tx_buffer_layout().payload_capacity(), 512);
+        assert_eq!(socket.tx_buffer_layout().headroom(), 64);
 
-        let mut tx_buffer = socket.tx_pool_mut().allocate().unwrap();
+        let mut scratch = Vec::new();
+        assert_eq!(socket.allocate_tx_batch(&mut scratch, 1).unwrap(), 1);
+        let mut tx_buffer = scratch.pop().unwrap();
         tx_buffer.extend_from_slice(b"tx").unwrap();
         assert_eq!(tx_buffer.headroom(), 64);
     }
@@ -1608,7 +1632,9 @@ mod tests {
     }
 
     fn tx_packet(socket: &mut OsUdpSocket, bytes: &[u8]) -> OsPacketBuf {
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut scratch = Vec::new();
+        assert_eq!(socket.allocate_tx_batch(&mut scratch, 1).unwrap(), 1);
+        let mut packet = scratch.pop().unwrap();
         packet.extend_from_slice(bytes).unwrap();
         packet.freeze()
     }

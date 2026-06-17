@@ -11,12 +11,11 @@ use std::time::Duration;
 #[cfg(test)]
 use fast_socket_rs::OwnedPacketBuffer;
 use fast_socket_rs::{
-    BufferPool, BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind,
-    EgressResolver, Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
-    IpPacketTransmit, IpVersion, NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode,
-    QueueAffinity, QueueId, RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot,
-    UdpCapabilities, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome,
-    WakeHandle,
+    BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, EgressResolver,
+    Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion,
+    NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode, QueueAffinity, QueueId,
+    RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpReceive,
+    UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -2186,8 +2185,8 @@ where
     D: PollDriver,
     R: XdpUdpRouter,
 {
-    type RxPool = XdpRxPool;
-    type TxPool = XdpTxPool;
+    type RxBuffer = XdpPacketBufMut;
+    type TxBufferMut = XdpPacketBufMut;
     type Driver = D;
     type RecvMeta = UdpRecvMeta;
 
@@ -2206,22 +2205,6 @@ where
 
     fn capabilities(&self) -> UdpCapabilities {
         UdpCapabilities::default()
-    }
-
-    fn rx_pool(&self) -> &Self::RxPool {
-        self.ip.rx_pool()
-    }
-
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        self.ip.rx_pool_mut()
-    }
-
-    fn tx_pool(&self) -> &Self::TxPool {
-        self.ip.tx_pool()
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        self.ip.tx_pool_mut()
     }
 
     fn allocate_tx_batch(
@@ -2282,8 +2265,8 @@ impl<D> IpPacketSocket for XdpIpPacketSocket<D>
 where
     D: PollDriver,
 {
-    type RxPool = XdpRxPool;
-    type TxPool = XdpTxPool;
+    type RxBuffer = XdpPacketBufMut;
+    type TxBufferMut = XdpPacketBufMut;
     type Family = V4Only;
     type Egress = XdpEgress;
     type Driver = D;
@@ -2301,28 +2284,24 @@ where
         self.config.mtu
     }
 
-    fn rx_pool(&self) -> &Self::RxPool {
-        &self.rx_pool
-    }
-
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool {
-        &mut self.rx_pool
-    }
-
-    fn tx_pool(&self) -> &Self::TxPool {
-        &self.tx_pool
-    }
-
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool {
-        &mut self.tx_pool
-    }
-
     fn driver(&self) -> &Self::Driver {
         &self.driver
     }
 
     fn driver_mut(&mut self) -> &mut Self::Driver {
         &mut self.driver
+    }
+
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<fast_socket_rs::IpPacketTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error> {
+        #[cfg(test)]
+        if self.live.is_none() {
+            return self.allocate_tx_batch_test(out, max);
+        }
+        self.allocate_tx_batch_inner(out, max)
     }
 
     fn send(
@@ -3159,7 +3138,7 @@ mod tests {
     use std::rc::Rc;
 
     use fast_socket_rs::{
-        BufferLayout, BufferPool, Error, HugePageSize, LinkAddr, PacketBufferMut, UdpSocket,
+        BufferLayout, Error, HugePageSize, IpPacketSocket, LinkAddr, PacketBufferMut, UdpSocket,
         UdpTransmit,
     };
 
@@ -3179,6 +3158,25 @@ mod tests {
 
     fn mac(value: u8) -> LinkAddr {
         LinkAddr::new([value; 6])
+    }
+
+    fn allocate_ip_tx<D>(socket: &mut XdpIpPacketSocket<D>) -> XdpPacketBufMut
+    where
+        D: PollDriver,
+    {
+        let mut buffers = Vec::new();
+        assert_eq!(socket.allocate_tx_batch(&mut buffers, 1).unwrap(), 1);
+        buffers.pop().unwrap()
+    }
+
+    fn allocate_udp_tx<D, R>(socket: &mut XdpUdpSocket<D, R>) -> XdpPacketBufMut
+    where
+        D: PollDriver,
+        R: XdpUdpRouter,
+    {
+        let mut buffers = Vec::new();
+        assert_eq!(socket.allocate_tx_batch(&mut buffers, 1).unwrap(), 1);
+        buffers.pop().unwrap()
     }
 
     fn route_snapshot_for_gateway(
@@ -3362,7 +3360,7 @@ mod tests {
         let mut socket =
             XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
         let ip = ipv4_packet();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_ip_tx(&mut socket);
         packet.extend_from_slice(&ip).unwrap();
         let mut batch = [TxSlot::Ready(IpPacketTransmit::new(
             packet.freeze(),
@@ -3414,7 +3412,7 @@ mod tests {
     fn xdp_ip_packet_socket_rejects_trailing_tx_bytes() {
         let mut socket =
             XdpIpPacketSocketBuilder::new(IfIndex::new(1), QueueId::new(0)).open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_ip_tx(&mut socket);
         packet.extend_from_slice(&ipv4_packet()).unwrap();
         packet.extend_from_slice(b"extra").unwrap();
         let mut batch = [TxSlot::Ready(IpPacketTransmit::new(
@@ -3443,7 +3441,7 @@ mod tests {
                 egress().src_mac,
             ))
             .open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_udp_tx(&mut socket);
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
             packet.freeze(),
@@ -3488,7 +3486,7 @@ mod tests {
                 egress().src_mac,
             ))
             .open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_udp_tx(&mut socket);
         packet.extend_from_slice(b"hello").unwrap();
         let mut tx = UdpTransmit::new(packet.freeze(), remote.into());
         tx.source_port = Some(9015);
@@ -3518,7 +3516,7 @@ mod tests {
                 route_src_mac,
             ))
             .open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_udp_tx(&mut socket);
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
             packet.freeze(),
@@ -3541,7 +3539,7 @@ mod tests {
         let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
             .router(StaticUdpRouter { egress: egress() })
             .open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_udp_tx(&mut socket);
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
             packet.freeze(),
@@ -3561,7 +3559,7 @@ mod tests {
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
         let mut socket =
             XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local).open_busy_poll_test();
-        let mut packet = socket.tx_pool_mut().allocate().unwrap();
+        let mut packet = allocate_udp_tx(&mut socket);
         packet.extend_from_slice(b"hello").unwrap();
         let mut batch = [TxSlot::Ready(UdpTransmit::new(
             packet.freeze(),

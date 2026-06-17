@@ -13,9 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fast_socket_os_rs::{OsPacketBuf, OsUdpSocket, OsUdpSocketBuilder};
-use fast_socket_rs::{
-    BufferLayout, BufferPool, PacketBufferMut, RecvBatch, TxSlot, UdpSocket, UdpTransmit,
-};
+use fast_socket_rs::{BufferLayout, PacketBufferMut, RecvBatch, TxSlot, UdpSocket, UdpTransmit};
 
 const PACKETS: u64 = 4096;
 const BATCH: usize = 64;
@@ -104,11 +102,13 @@ fn build_batch(
     debug_assert!(len <= BATCH);
     slots.clear();
     slots.reserve(len);
-    for _ in 0..len {
-        let mut packet = socket
-            .tx_pool_mut()
-            .allocate()
-            .expect("tx pool grows as needed");
+    let mut buffers = Vec::with_capacity(len);
+    assert_eq!(
+        socket.allocate_tx_batch(&mut buffers, len).unwrap(),
+        len,
+        "tx pool grows as needed"
+    );
+    for mut packet in buffers {
         packet.extend_from_slice(payload).unwrap();
         slots.push(TxSlot::Ready(UdpTransmit::new(
             packet.freeze(),

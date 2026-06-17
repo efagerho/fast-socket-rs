@@ -463,18 +463,6 @@ pub trait OwnedPacketBuffer: PacketBuffer + Sized {
     fn into_mut(self) -> Self::Mutable;
 }
 
-/// Shared buffer pool abstraction.
-pub trait BufferPool {
-    /// Mutable buffer type allocated by this pool.
-    type Buffer: PacketBufferMut;
-
-    /// Returns the layout used for newly allocated buffers.
-    fn layout(&self) -> &BufferLayout;
-
-    /// Allocates one mutable packet buffer.
-    fn allocate(&mut self) -> Option<Self::Buffer>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

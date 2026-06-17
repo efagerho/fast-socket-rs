@@ -1,7 +1,7 @@
 mod support;
 
 use fast_socket_rs::{
-    BufferAccessError, BufferLayout, BufferPool, PacketBuffer, PacketBufferMut, ReserveError,
+    BufferAccessError, BufferLayout, PacketBuffer, PacketBufferMut, ReserveError,
 };
 
 use support::{HeapBufferPool, PacketBuf, PacketBufMut};

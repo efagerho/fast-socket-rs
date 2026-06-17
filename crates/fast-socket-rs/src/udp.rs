@@ -4,8 +4,7 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    BufferPool, Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId,
-    TxSlot,
+    Error, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError, SocketId, TxSlot,
 };
 
 /// Explicit Congestion Notification codepoint.
@@ -99,29 +98,26 @@ pub struct UdpCapabilities {
     pub max_gso_segments: Option<NonZeroU16>,
 }
 
-/// Immutable transmit buffer type derived from a UDP socket's transmit pool.
-pub type UdpTxBuffer<S> =
-    <<<S as UdpSocket>::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen;
+/// Immutable transmit buffer type derived from a UDP socket's transmit buffer type.
+pub type UdpTxBuffer<S> = <<S as UdpSocket>::TxBufferMut as PacketBufferMut>::Frozen;
 
-/// Mutable transmit buffer type derived from a UDP socket's transmit pool.
-pub type UdpTxBufferMut<S> = <<S as UdpSocket>::TxPool as BufferPool>::Buffer;
+/// Mutable transmit buffer type allocated by a UDP socket.
+pub type UdpTxBufferMut<S> = <S as UdpSocket>::TxBufferMut;
 
-/// Mutable receive buffer type derived from a UDP socket's receive pool.
-pub type UdpRxBuffer<S> = <<S as UdpSocket>::RxPool as BufferPool>::Buffer;
+/// Mutable receive buffer type delivered by a UDP socket.
+pub type UdpRxBuffer<S> = <S as UdpSocket>::RxBuffer;
 
 /// High-level UDP socket interface.
 pub trait UdpSocket
 where
-    <Self::RxPool as BufferPool>::Buffer: Send,
-    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxPool as BufferPool>::Buffer: Send,
-    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
 {
-    /// Buffer pool used by the socket receive path.
-    type RxPool: BufferPool;
+    /// Mutable buffer type delivered by the socket receive path.
+    type RxBuffer: PacketBufferMut + Send;
 
-    /// Buffer pool used by the socket transmit path.
-    type TxPool: BufferPool;
+    /// Mutable buffer type allocated by the socket transmit path.
+    type TxBufferMut: PacketBufferMut + Send;
 
     /// Polling driver selected by this socket implementation.
     type Driver: PollDriver;
@@ -148,50 +144,14 @@ where
         UdpCapabilities::default()
     }
 
-    /// Returns the socket-owned receive buffer pool.
-    fn rx_pool(&self) -> &Self::RxPool;
-
-    /// Returns the socket-owned receive buffer pool mutably.
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool;
-
-    /// Returns the socket-owned transmit buffer pool.
-    fn tx_pool(&self) -> &Self::TxPool;
-
-    /// Returns the socket-owned transmit buffer pool mutably.
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool;
-
     /// Allocates up to `max` socket-owned transmit buffers into `out`.
-    ///
-    /// The default implementation allocates from the transmit pool and, when
-    /// the pool is empty, drains transmit completions once before retrying.
     fn allocate_tx_batch(
         &mut self,
         out: &mut Vec<UdpTxBufferMut<Self>>,
         max: usize,
     ) -> Result<usize, Error>
     where
-        Self: Sized,
-    {
-        let start_len = out.len();
-        let mut drained_after_empty = false;
-        while out.len() - start_len < max {
-            if let Some(buffer) = self.tx_pool_mut().allocate() {
-                out.push(buffer);
-                drained_after_empty = false;
-                continue;
-            }
-
-            if drained_after_empty {
-                break;
-            }
-
-            if self.drain_tx_completions()? == 0 {
-                break;
-            }
-            drained_after_empty = true;
-        }
-        Ok(out.len() - start_len)
-    }
+        Self: Sized;
 
     /// Returns the polling driver.
     fn driver(&self) -> &Self::Driver;

@@ -42,7 +42,7 @@ use std::thread::{self, ThreadId};
 
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
-    BufferAccessError, BufferLayout, BufferPool, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
+    BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     ReserveError, Segment,
 };
 
@@ -649,10 +649,10 @@ impl XdpTxPool {
     }
 }
 
-impl BufferPool for XdpRxPool {
-    type Buffer = XdpPacketBufMut;
-
-    fn layout(&self) -> &BufferLayout {
+impl XdpRxPool {
+    /// Returns the layout used for newly allocated buffers.
+    #[must_use]
+    pub fn layout(&self) -> &BufferLayout {
         &self.ctx.layout
     }
 
@@ -663,7 +663,7 @@ impl BufferPool for XdpRxPool {
     /// its owning socket must outlive the buffer**, even if it is moved to
     /// another thread. Debug builds panic on violation; release builds do not
     /// check.
-    fn allocate(&mut self) -> Option<Self::Buffer> {
+    pub fn allocate(&mut self) -> Option<XdpPacketBufMut> {
         let frame = self.heap.pop()?;
         let data_offset = self.ctx.layout.data_offset();
         Some(XdpPacketBufMut::from_storage(
@@ -676,10 +676,10 @@ impl BufferPool for XdpRxPool {
     }
 }
 
-impl BufferPool for XdpTxPool {
-    type Buffer = XdpPacketBufMut;
-
-    fn layout(&self) -> &BufferLayout {
+impl XdpTxPool {
+    /// Returns the layout used for newly allocated buffers.
+    #[must_use]
+    pub fn layout(&self) -> &BufferLayout {
         &self.ctx.layout
     }
 
@@ -690,7 +690,7 @@ impl BufferPool for XdpTxPool {
     /// its owning socket must outlive the buffer**, even if it is moved to
     /// another thread. Debug builds panic on violation; release builds do not
     /// check.
-    fn allocate(&mut self) -> Option<Self::Buffer> {
+    pub fn allocate(&mut self) -> Option<XdpPacketBufMut> {
         if let Some(live) = &self.live {
             let frame_addr = live.reclaim.pop()?;
             // See allocate_many: the socket/pool must outlive all buffers.
@@ -1307,7 +1307,7 @@ fn read_contiguous(buffer: &[u8], offset: usize, dst: &mut [u8]) -> Result<(), B
 mod tests {
     use std::num::NonZeroUsize;
 
-    use fast_socket_rs::{BufferPool, HugePageSize, PacketBufferMut};
+    use fast_socket_rs::{HugePageSize, PacketBufferMut};
 
     use super::*;
 

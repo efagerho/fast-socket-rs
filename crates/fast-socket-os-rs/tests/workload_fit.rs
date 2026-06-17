@@ -2,9 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use fast_socket_os_rs::OsUdpSocketBuilder;
-use fast_socket_rs::{
-    BufferLayout, BufferPool, PacketBufferMut, RecvBatch, TxSlot, UdpSocket, UdpTransmit,
-};
+use fast_socket_rs::{BufferLayout, PacketBufferMut, RecvBatch, TxSlot, UdpSocket, UdpTransmit};
 
 #[test]
 fn direct_udp_request_response_workload_fit() {
@@ -60,7 +58,9 @@ fn tx_packet(
     socket: &mut fast_socket_os_rs::OsUdpSocket,
     bytes: &[u8],
 ) -> fast_socket_os_rs::OsPacketBuf {
-    let mut packet = socket.tx_pool_mut().allocate().unwrap();
+    let mut scratch = Vec::new();
+    assert_eq!(socket.allocate_tx_batch(&mut scratch, 1).unwrap(), 1);
+    let mut packet = scratch.pop().unwrap();
     packet.extend_from_slice(bytes).unwrap();
     packet.freeze()
 }
