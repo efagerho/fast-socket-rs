@@ -62,7 +62,9 @@ Start with:
 
 - `docs/src/core-design.md` for the ownership and batching model;
 - `docs/src/core-traits.md` for the current public trait surface;
-- `docs/src/writing-a-server.md` for direct socket loops versus the Tokio actor.
+- `docs/src/sockets-and-workers.md` for socket construction, worker loops,
+  pinning, and override points;
+- `docs/src/examples/index.md` for the runnable example binaries.
 
 ## License
 

@@ -84,23 +84,13 @@ pub trait OwnedPacketBuffer: PacketBuffer + Sized {
 }
 ```
 
-### `BufferPool`
+### Socket Buffer Allocation
 
-`BufferPool` allocates mutable packet buffers with a shared `BufferLayout`. It
-returns `None` when no buffer is immediately available.
-
-It exists to keep packet allocation and reuse out of the hot-path socket API.
-Backends can provide fixed-size, pre-registered, or recycled memory while users
-interact with a single allocation interface.
-
-```rust,ignore
-pub trait BufferPool {
-    type Buffer: PacketBufferMut;
-
-    fn layout(&self) -> &BufferLayout;
-    fn allocate(&mut self) -> Option<Self::Buffer>;
-}
-```
+Socket implementations own backend-specific receive and transmit pools, but the
+core socket traits do not expose those pool types. Applications receive mutable
+RX buffers through `recv` and allocate mutable TX buffers through
+`allocate_tx_batch`, leaving completion draining and batch allocation fast paths
+inside the backend.
 
 ### `RawDevice`
 
@@ -217,10 +207,10 @@ pub trait EgressResolver<F: IpFamily, E: IpPacketEgress> {
 
 ### `UdpSocket`
 
-`UdpSocket` is the high-level socket trait for UDP payloads. It owns receive and
-transmit pools, exposes capabilities and a polling driver, receives
-`UdpReceive` batches, sends `UdpTransmit` slots, allocates transmit buffers, and
-drains transmit completions.
+`UdpSocket` is the high-level socket trait for UDP payloads. It exposes
+capabilities and a polling driver, receives `UdpReceive` batches, sends
+`UdpTransmit` slots, allocates transmit buffers, and drains transmit
+completions.
 
 It exists to give applications one UDP packet API across operating-system
 sockets, kernel-bypass backends, and test implementations while preserving the
@@ -229,13 +219,11 @@ core ownership model.
 ```rust,ignore
 pub trait UdpSocket
 where
-    <Self::RxPool as BufferPool>::Buffer: Send,
-    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxPool as BufferPool>::Buffer: Send,
-    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
 {
-    type RxPool: BufferPool;
-    type TxPool: BufferPool;
+    type RxBuffer: PacketBufferMut + Send;
+    type TxBufferMut: PacketBufferMut + Send;
     type Driver: PollDriver;
     type RecvMeta;
 
@@ -243,10 +231,6 @@ where
     fn mtu(&self) -> usize;
     fn worker_affinity(&self) -> QueueAffinity;
     fn capabilities(&self) -> UdpCapabilities;
-    fn rx_pool(&self) -> &Self::RxPool;
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool;
-    fn tx_pool(&self) -> &Self::TxPool;
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool;
     fn allocate_tx_batch(
         &mut self,
         out: &mut Vec<UdpTxBufferMut<Self>>,
@@ -277,9 +261,9 @@ where
 
 ### `IpPacketSocket`
 
-`IpPacketSocket` is the socket trait for complete IP datagrams. It owns receive
-and transmit pools, exposes a polling driver, receives `IpPacketReceive` batches,
-sends `IpPacketTransmit` slots, and drains transmit completions.
+`IpPacketSocket` is the socket trait for complete IP datagrams. It exposes a
+polling driver, receives `IpPacketReceive` batches, sends `IpPacketTransmit`
+slots, allocates transmit buffers, and drains transmit completions.
 
 It exists for applications and backends that want to work below UDP while still
 using the same packet ownership, batch, and polling model.
@@ -287,13 +271,11 @@ using the same packet ownership, batch, and polling model.
 ```rust,ignore
 pub trait IpPacketSocket
 where
-    <Self::RxPool as BufferPool>::Buffer: Send,
-    <<Self::RxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxPool as BufferPool>::Buffer: Send,
-    <<Self::TxPool as BufferPool>::Buffer as PacketBufferMut>::Frozen: Send,
+    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
+    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
 {
-    type RxPool: BufferPool;
-    type TxPool: BufferPool;
+    type RxBuffer: PacketBufferMut + Send;
+    type TxBufferMut: PacketBufferMut + Send;
     type Family: IpFamily;
     type Egress: IpPacketEgress;
     type Driver: PollDriver;
@@ -302,14 +284,21 @@ where
     fn socket_id(&self) -> SocketId;
     fn mtu(&self) -> usize;
     fn worker_affinity(&self) -> QueueAffinity;
-    fn rx_pool(&self) -> &Self::RxPool;
-    fn rx_pool_mut(&mut self) -> &mut Self::RxPool;
-    fn tx_pool(&self) -> &Self::TxPool;
-    fn tx_pool_mut(&mut self) -> &mut Self::TxPool;
     fn driver(&self) -> &Self::Driver;
     fn driver_mut(&mut self) -> &mut Self::Driver;
+    fn allocate_tx_batch(
+        &mut self,
+        out: &mut Vec<IpPacketTxBufferMut<Self>>,
+        max: usize,
+    ) -> Result<usize, Error>
+    where
+        Self: Sized;
     fn send(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>])
         -> Result<usize, SendError>;
+    fn send_all(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>])
+        -> Result<usize, SendError>
+    where
+        Self: Sized;
     fn recv(&mut self, out: &mut RecvBatch<IpPacketRxItem<Self>>)
         -> Result<usize, Error>;
     fn drain_tx_completions(&mut self) -> Result<usize, Error>;

@@ -2,7 +2,7 @@
 
 `fast-socket-rs` is a small set of packet ownership and socket-driving
 abstractions. Backend crates implement those abstractions for operating-system
-UDP sockets and AF_XDP queues.
+UDP sockets and AF_XDP queues. A DPDK backend is also planned.
 
 The common design goal is simple: keep the packet path explicit. Applications
 should be able to see where packet memory comes from, who owns it, when a socket
