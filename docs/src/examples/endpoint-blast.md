@@ -6,15 +6,13 @@ generated payload buffers through that endpoint as fast as the XDP workers
 accept them.
 
 This example basically demonstrates the most efficient way to generate packets
-using the library. Initial tests generated about 28M PPS on a single CPU core.
+using the library. Initial tests generated about 60M PPS on a single CPU core.
 When using an `Endpoint`, we can precompute the L2+IP+UDP header only needing to
 adjust checksums during header generation. The header generation then translates
 mainly into a memcpy.
 
 Note that AF_XDP sockets don't currently expose checksum offloads from the NIC,
 so the `Endpoint` implementation has to calculate the checksums on the CPU.
-
-It does not take `--backend`; it always uses busy-poll XDP sockets.
 
 ```sh
 cargo run -p fast-socket-examples --bin endpoint-blast -- \
@@ -65,24 +63,37 @@ for socket in aggregate.members_mut() {
 
 ## Transmit Loop
 
-The inner loop still allocates normal TX buffers and writes the sequence payload
-into each buffer. The difference is the batch item: `UdpEndpointTransmit` only
-carries the packet buffer because the endpoint already owns the destination,
-source selection, MTU, and cached header state.
+The inner loop uses the XDP endpoint batch builder. The builder writes the
+cached endpoint header and caller-provided payloads directly into UMEM-backed TX
+frames, so the example does not allocate `UdpEndpointTransmit` slots for each
+packet.
 
 ```rust,ignore
-while let Some(mut buffer) = tx_buffers.pop() {
-    write_sequence(payload_bytes, *sequence);
-    buffer.extend_from_slice(payload_bytes)?;
-    batch.push(TxSlot::Ready(UdpEndpointTransmit::new(buffer.freeze())));
-    *sequence = sequence.wrapping_add(1);
-}
+// SAFETY: the callback writes exactly `payload_bytes.len()` bytes into the
+// payload prefix before returning that same length.
+let accepted = unsafe {
+    socket
+        .udp_endpoint_batch(endpoint, batch_size)
+        .send(|_, payload| {
+            let payload_len = payload_bytes.len();
+            let payload = &mut payload[..payload_len];
+            payload.copy_from_slice(payload_bytes);
+            write_sequence(payload, *sequence);
+            *sequence = (*sequence).wrapping_add(1);
+            payload_len
+        })?
+};
 ```
 
-The completed batch is submitted through the prepared endpoint:
+The callback runs once for each TX frame that the socket can reserve, up to the
+requested batch size. Each slice is the endpoint's maximum UDP payload size, and
+the returned length selects how many bytes become part of that packet. The slice
+is not cleared before the callback runs.
 
 ```rust,ignore
-let accepted = socket.send_to_udp_endpoint(endpoint, batch.as_mut_slice())?;
+if accepted == 0 {
+    socket.drain_tx_completions()?;
+}
 ```
 
 The XDP backend refreshes the cached endpoint header if the route table changes,

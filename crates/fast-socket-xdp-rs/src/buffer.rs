@@ -42,10 +42,11 @@ use std::thread::{self, ThreadId};
 
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
-    BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
+    BufferAccessError, BufferLayout, Error, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
     ReserveError, Segment,
 };
 
+use crate::ring::XdpDesc;
 use crate::umem::Umem;
 
 use self::owner_epoch::{BufferEpoch, OwnerEpoch};
@@ -219,6 +220,12 @@ pub(crate) struct FrameReclaim {
     free: UnsafeCell<Vec<u64>>,
     remote: MpscQueue<u64>,
     epoch: OwnerEpoch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct XdpPreparedTxBatch {
+    pub(crate) prepared: usize,
+    pub(crate) tx_bytes: u64,
 }
 
 // SAFETY: the `free` vectors are accessed only by the owner thread. Buffers
@@ -637,6 +644,102 @@ impl XdpTxPool {
             out.push(buffer);
         }
         out.len() - start_len
+    }
+
+    pub(crate) fn prepare_endpoint_batch<F>(
+        &mut self,
+        out: &mut Vec<XdpDesc>,
+        header: &[u8],
+        l2_len: usize,
+        payload_capacity: usize,
+        max: usize,
+        mut prepare_frame: F,
+    ) -> Result<XdpPreparedTxBatch, Error>
+    where
+        F: FnMut(usize, &mut [u8], &mut [u8]) -> Result<usize, Error>,
+    {
+        if max == 0 {
+            return Ok(XdpPreparedTxBatch {
+                prepared: 0,
+                tx_bytes: 0,
+            });
+        }
+
+        let live = self.live.as_ref().ok_or(Error::InvalidPacket)?;
+        let payload_start = self.ctx.layout.data_offset();
+        let header_start = payload_start
+            .checked_sub(header.len())
+            .ok_or(Error::InvalidPacket)?;
+        let max_frame_len = header
+            .len()
+            .checked_add(payload_capacity)
+            .ok_or(Error::InvalidPacket)?;
+        let frame_size = live.umem.frame_size() as usize;
+        if header_start
+            .checked_add(max_frame_len)
+            .ok_or(Error::InvalidPacket)?
+            > frame_size
+            || header.len() < l2_len
+        {
+            return Err(Error::InvalidPacket);
+        }
+        let _max_desc_len = u32::try_from(max_frame_len).map_err(|_| Error::InvalidPacket)?;
+        let l3_header_len = header
+            .len()
+            .checked_sub(l2_len)
+            .ok_or(Error::InvalidPacket)?;
+        let umem_base = live.umem.as_ptr() as *mut u8;
+        out.reserve(max);
+
+        let start_len = out.len();
+        let mut written = 0usize;
+        let mut tx_bytes = 0u64;
+        while written < max {
+            let Some(frame_addr) = live.reclaim.pop() else {
+                break;
+            };
+
+            // SAFETY: frame addresses come from this pool's live reclaim list,
+            // and bounds above prove the header and payload-capacity slices fit.
+            let payload_len = unsafe {
+                let frame = umem_base.add(frame_addr as usize);
+                ptr::copy_nonoverlapping(header.as_ptr(), frame.add(header_start), header.len());
+                let header = slice::from_raw_parts_mut(frame.add(header_start), header.len());
+                let payload = slice::from_raw_parts_mut(frame.add(payload_start), payload_capacity);
+                prepare_frame(written, header, payload)
+            };
+            let payload_len = match payload_len {
+                Ok(payload_len) if payload_len <= payload_capacity => payload_len,
+                Ok(_) => {
+                    live.reclaim.push_local(frame_addr);
+                    for desc in out.drain(start_len..) {
+                        live.reclaim.push_local(desc.addr - header_start as u64);
+                    }
+                    return Err(Error::OversizeForMtu);
+                }
+                Err(error) => {
+                    live.reclaim.push_local(frame_addr);
+                    for desc in out.drain(start_len..) {
+                        live.reclaim.push_local(desc.addr - header_start as u64);
+                    }
+                    return Err(error);
+                }
+            };
+            let desc_len = u32::try_from(header.len() + payload_len)
+                .expect("payload length was bounded by max_desc_len");
+            tx_bytes = tx_bytes.saturating_add((l3_header_len + payload_len) as u64);
+            out.push(XdpDesc {
+                addr: frame_addr + header_start as u64,
+                len: desc_len,
+                options: 0,
+            });
+            written += 1;
+        }
+
+        Ok(XdpPreparedTxBatch {
+            prepared: written,
+            tx_bytes,
+        })
     }
 
     #[cfg(test)]
@@ -1420,6 +1523,47 @@ mod tests {
         reclaim.drain_into(&mut reclaimed);
         reclaimed.sort_unstable();
         assert_eq!(reclaimed, frames);
+    }
+
+    #[test]
+    fn live_tx_pool_prepares_endpoint_batch_directly() {
+        let umem = Rc::new(Umem::new(2048, 4, HugePageSize::Default).unwrap());
+        let reclaim = FrameReclaim::new(vec![umem.frame_offset(0), umem.frame_offset(1)]);
+        let mut pool = XdpTxPool::live(layout(), Rc::clone(&umem), Rc::clone(&reclaim));
+        let header = [0xab; 42];
+        let payload_capacity = 8;
+        let payload_lens = [3usize, 5];
+        let mut descs = Vec::new();
+
+        let batch = pool
+            .prepare_endpoint_batch(
+                &mut descs,
+                &header,
+                14,
+                payload_capacity,
+                2,
+                |index, _header, payload| {
+                    let payload_len = payload_lens[index];
+                    payload[..payload_len].fill(index as u8 + 1);
+                    Ok(payload_len)
+                },
+            )
+            .expect("live pool can prepare direct endpoint batch");
+
+        assert_eq!(batch.prepared, 2);
+        assert_eq!(batch.tx_bytes, 64);
+        assert_eq!(descs.len(), 2);
+        for (index, desc) in descs.iter().enumerate() {
+            let payload_len = payload_lens[index];
+            assert_eq!(desc.len as usize, header.len() + payload_len);
+            assert_eq!(umem.slice_at(desc.addr, header.len()), &header);
+            assert_eq!(
+                umem.slice_at(desc.addr + header.len() as u64, payload_len),
+                vec![index as u8 + 1; payload_len]
+            );
+        }
+
+        assert!(pool.allocate().is_none());
     }
 
     #[test]

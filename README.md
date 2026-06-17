@@ -50,7 +50,7 @@ cargo run -p fast-socket-examples --bin udp-tokio-echo -- --help
 cargo run -p fast-socket-examples --bin udp-tokio-pong -- --help
 cargo run -p fast-socket-examples --bin udp-tokio-discard -- --help
 cargo run -p fast-socket-examples --bin udp-tokio-proxy -- --help
-cargo run -p fast-socket-examples --bin udp-xdp-static-route-blast -- --help
+cargo run -p fast-socket-examples --bin endpoint-blast -- --help
 ```
 
 The AF_XDP examples require Linux, an appropriate NIC/interface setup, and the

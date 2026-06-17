@@ -12,10 +12,7 @@ use common::{
     install_shutdown_signal_handlers, interface_ipv4_addr, normalize_batch_size,
     normalize_payload_len, payload, shutdown_requested, write_sequence,
 };
-use fast_socket_rs::{
-    PacketBufferMut, TxSlot, UdpEndpointSpec, UdpEndpointTransmit, UdpSocket as FastUdpSocket,
-    UdpTxBuffer, UdpTxBufferMut,
-};
+use fast_socket_rs::{UdpEndpointSpec, UdpSocket as FastUdpSocket};
 use fast_socket_xdp_rs::{
     BusyPollXdpUdpSocket, RouteSnapshot, XdpQueueLocalRouter, XdpUdpAggregate,
 };
@@ -203,10 +200,8 @@ fn run_worker(
         duration,
     } = config;
     let started = Instant::now();
-    let mut payload_bytes = payload(payload_len);
+    let payload_bytes = payload(payload_len);
     let mut sequence = 0u64;
-    let mut tx_buffers = Vec::with_capacity(batch_size);
-    let mut batch = Vec::with_capacity(batch_size);
     let mut batches_since_drain = 0usize;
     let mut batches_until_housekeeping = WORKER_HOUSEKEEPING_BATCHES;
     let mut pending_total = 0u64;
@@ -225,15 +220,7 @@ fn run_worker(
     'running: loop {
         let mut progressed = 0usize;
         for (socket, endpoint) in aggregate.members_mut().iter_mut().zip(endpoints.iter_mut()) {
-            let accepted = send_batch(
-                socket,
-                endpoint,
-                &mut payload_bytes,
-                &mut sequence,
-                batch_size,
-                &mut tx_buffers,
-                &mut batch,
-            )?;
+            let accepted = send_batch(socket, endpoint, &payload_bytes, &mut sequence, batch_size)?;
             progressed += accepted;
             if accepted > 0 {
                 pending_total += accepted as u64;
@@ -275,28 +262,27 @@ fn run_worker(
 fn send_batch(
     socket: &mut BusyPollXdpUdpSocket,
     endpoint: &mut Endpoint,
-    payload_bytes: &mut [u8],
+    payload_bytes: &[u8],
     sequence: &mut u64,
     batch_size: usize,
-    tx_buffers: &mut Vec<UdpTxBufferMut<BusyPollXdpUdpSocket>>,
-    batch: &mut Vec<TxSlot<UdpEndpointTransmit<UdpTxBuffer<BusyPollXdpUdpSocket>>>>,
 ) -> Result<usize, BoxError> {
-    tx_buffers.clear();
-    batch.clear();
-    socket.allocate_tx_batch(tx_buffers, batch_size)?;
+    // SAFETY: the callback writes exactly `payload_bytes.len()` bytes into the
+    // payload prefix before returning that same length.
+    let accepted = unsafe {
+        socket
+            .udp_endpoint_batch(endpoint, batch_size)
+            .send(|_, payload| {
+                let payload_len = payload_bytes.len();
+                let payload = &mut payload[..payload_len];
+                payload.copy_from_slice(payload_bytes);
+                write_sequence(payload, *sequence);
+                *sequence = (*sequence).wrapping_add(1);
+                payload_len
+            })?
+    };
 
-    while let Some(mut buffer) = tx_buffers.pop() {
-        write_sequence(payload_bytes, *sequence);
-        buffer.extend_from_slice(payload_bytes)?;
-        batch.push(TxSlot::Ready(UdpEndpointTransmit::new(buffer.freeze())));
-        *sequence = sequence.wrapping_add(1);
-    }
-
-    if batch.is_empty() {
+    if accepted == 0 {
         socket.drain_tx_completions()?;
-        return Ok(0);
     }
-
-    let accepted = socket.send_to_udp_endpoint(endpoint, batch.as_mut_slice())?;
     Ok(accepted)
 }

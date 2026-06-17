@@ -144,6 +144,49 @@ impl XdpUdpEndpoint {
     }
 }
 
+/// Builder for a direct AF_XDP UDP endpoint transmit batch.
+///
+/// This is an XDP-specific fast path for endpoint packet generation. It
+/// writes the endpoint's cached L2+IPv4+UDP header and caller-provided payloads
+/// directly into UMEM-backed TX frames, skipping the generic
+/// `UdpEndpointTransmit` slot materialization path.
+pub struct XdpUdpEndpointBatchBuilder<'a, D, R> {
+    socket: &'a mut XdpUdpSocket<D, R>,
+    endpoint: &'a mut XdpUdpEndpoint,
+    max: usize,
+}
+
+impl<D, R> XdpUdpEndpointBatchBuilder<'_, D, R>
+where
+    D: PollDriver,
+    R: XdpUdpRouter,
+{
+    /// Builds and sends this batch.
+    ///
+    /// `fill_payload` is called once for each TX frame that can be reserved,
+    /// up to `max`. The provided slice is the endpoint's maximum UDP payload
+    /// size. The callback returns the number of payload bytes written for that
+    /// packet. The callback may be called fewer than `max` times when TX
+    /// descriptors or UMEM frames are unavailable.
+    ///
+    /// # Safety
+    ///
+    /// The callback must initialize every byte in `payload[..returned_len]`
+    /// before returning `returned_len`. Returning a length for bytes that were
+    /// not written may transmit stale frame contents. The payload slice is not
+    /// cleared before the callback runs.
+    pub unsafe fn send<F>(self, fill_payload: F) -> Result<usize, SendError>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        // SAFETY: forwarded from this method's caller.
+        unsafe {
+            self.socket
+                .send_udp_endpoint_direct_batch(self.endpoint, self.max, fill_payload)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct XdpUdpEndpointCache {
     route_generation: u64,
@@ -367,8 +410,8 @@ enum CompletionReclaim {
         first_tx_frame_addr: u64,
     },
     SharedMemberSlices {
-        frame_size: u64,
-        frames_per_member: u32,
+        frame_shift: u32,
+        member_frame_mask: u32,
         rx_frames_per_member: u32,
         active_frames: u32,
     },
@@ -381,6 +424,51 @@ enum CompletionPool {
 }
 
 impl CompletionReclaim {
+    fn shared_member_slices(
+        frame_size: u32,
+        frames_per_member: u32,
+        rx_frames_per_member: u32,
+        active_frames: u32,
+    ) -> std::io::Result<Self> {
+        if !frame_size.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("XDP frame size must be a power of two (got {frame_size})"),
+            ));
+        }
+        if frames_per_member == 0 || !frames_per_member.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "XDP frames per member must be a non-zero power of two (got {frames_per_member})"
+                ),
+            ));
+        }
+        if rx_frames_per_member == 0 || !rx_frames_per_member.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "XDP rx frames per member must be a non-zero power of two (got {rx_frames_per_member})"
+                ),
+            ));
+        }
+        if rx_frames_per_member > frames_per_member {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "XDP rx frames per member {rx_frames_per_member} exceeds frames per member {frames_per_member}"
+                ),
+            ));
+        }
+
+        Ok(Self::SharedMemberSlices {
+            frame_shift: frame_size.trailing_zeros(),
+            member_frame_mask: frames_per_member - 1,
+            rx_frames_per_member,
+            active_frames,
+        })
+    }
+
     fn classify(self, frame_addr: u64) -> Option<CompletionPool> {
         match self {
             Self::LocalSplit {
@@ -393,16 +481,16 @@ impl CompletionReclaim {
                 }
             }
             Self::SharedMemberSlices {
-                frame_size,
-                frames_per_member,
+                frame_shift,
+                member_frame_mask,
                 rx_frames_per_member,
                 active_frames,
             } => {
-                let frame_index = u32::try_from(frame_addr / frame_size).ok()?;
+                let frame_index = u32::try_from(frame_addr >> frame_shift).ok()?;
                 if frame_index >= active_frames {
                     return None;
                 }
-                let member_frame = frame_index % frames_per_member;
+                let member_frame = frame_index & member_frame_mask;
                 if member_frame < rx_frames_per_member {
                     Some(CompletionPool::Rx)
                 } else {
@@ -718,12 +806,8 @@ impl LiveXdpState {
         // rings/frames), identical across members.
         let (drain_threshold, drain_interval) =
             tx_drain_hysteresis(config.rings.completion, per_member);
-        let completion_reclaim = CompletionReclaim::SharedMemberSlices {
-            frame_size: u64::from(frame_size),
-            frames_per_member: per_member,
-            rx_frames_per_member: per_rx,
-            active_frames: total_frames,
-        };
+        let completion_reclaim =
+            CompletionReclaim::shared_member_slices(frame_size, per_member, per_rx, total_frames)?;
         let shared_remote_reclaim_capacity = total_frames as usize;
 
         let mut opened = Vec::with_capacity(member_count);
@@ -1846,6 +1930,23 @@ where
     D: PollDriver,
     R: XdpUdpRouter,
 {
+    /// Creates a direct AF_XDP endpoint batch builder.
+    ///
+    /// The returned builder writes endpoint headers and payloads directly into
+    /// TX UMEM frames. This is useful for packet generators that want to avoid
+    /// constructing [`UdpEndpointTransmit`] slots.
+    pub fn udp_endpoint_batch<'a>(
+        &'a mut self,
+        endpoint: &'a mut XdpUdpEndpoint,
+        max: usize,
+    ) -> XdpUdpEndpointBatchBuilder<'a, D, R> {
+        XdpUdpEndpointBatchBuilder {
+            socket: self,
+            endpoint,
+            max,
+        }
+    }
+
     #[cfg(test)]
     fn send_udp_test(
         &mut self,
@@ -2139,6 +2240,180 @@ where
         }
 
         Ok(())
+    }
+
+    unsafe fn send_udp_endpoint_direct_batch<F>(
+        &mut self,
+        endpoint: &mut XdpUdpEndpoint,
+        max: usize,
+        mut fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        if max == 0 {
+            return Ok(0);
+        }
+
+        #[cfg(test)]
+        if self.ip.live.is_none() {
+            return self.send_udp_endpoint_batch_test(endpoint, max, fill_payload);
+        }
+
+        if let Err(kind) = self.refresh_udp_endpoint_cache(endpoint) {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let info = endpoint.info;
+        let cache = endpoint
+            .cached
+            .as_ref()
+            .expect("endpoint cache was refreshed before send");
+        let l2_len = cache.l2_len;
+
+        if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let mut tx_available = self
+            .ip
+            .live
+            .as_mut()
+            .expect("send_udp_endpoint_direct_batch called only for live socket")
+            .raw
+            .tx_available() as usize;
+        if tx_available == 0 {
+            self.ip.stats.ring_full = self.ip.stats.ring_full.saturating_add(1);
+            if let Err(kind) = self.ip.drain_tx_completions_inner() {
+                return Err(SendError { accepted: 0, kind });
+            }
+            tx_available = self
+                .ip
+                .live
+                .as_mut()
+                .expect("send_udp_endpoint_direct_batch called only for live socket")
+                .raw
+                .tx_available() as usize;
+            if tx_available == 0 {
+                return Ok(0);
+            }
+        }
+
+        let limit = max.min(tx_available);
+        let prepared_batch;
+        let mut wake_error = None;
+
+        {
+            let live = self
+                .ip
+                .live
+                .as_mut()
+                .expect("send_udp_endpoint_direct_batch called only for live socket");
+            live.tx_descs.clear();
+
+            prepared_batch = self
+                .ip
+                .tx_pool
+                .prepare_endpoint_batch(
+                    &mut live.tx_descs,
+                    &cache.header,
+                    l2_len,
+                    info.mtu,
+                    limit,
+                    |index, header, payload| {
+                        let payload_len = fill_payload(index, payload);
+                        validate_xdp_udp_endpoint_payload(info, payload_len)?;
+                        patch_xdp_udp_endpoint_header_lengths(header, l2_len, payload_len)?;
+                        Ok(payload_len)
+                    },
+                )
+                .map_err(|kind| SendError { accepted: 0, kind })?;
+
+            if prepared_batch.prepared == 0 {
+                return Ok(0);
+            }
+
+            let accepted = live
+                .raw
+                .enqueue_tx_batch(&live.tx_descs[..prepared_batch.prepared]);
+            assert_eq!(
+                accepted, prepared_batch.prepared,
+                "AF_XDP TX ring accepted fewer descriptors than reserved",
+            );
+            live.raw.commit_tx();
+            live.tx_in_flight = live.tx_in_flight.saturating_add(accepted);
+            live.tx_since_completion_drain =
+                live.tx_since_completion_drain.saturating_add(accepted);
+
+            let needs_wake = live.tx_wake_pending || live.raw.tx_needs_wakeup();
+            if needs_wake {
+                match live.raw.wake_tx() {
+                    Ok(()) => live.tx_wake_pending = false,
+                    Err(error) => {
+                        live.tx_wake_pending = true;
+                        wake_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        self.ip.stats.tx_packets = self
+            .ip
+            .stats
+            .tx_packets
+            .saturating_add(prepared_batch.prepared as u64);
+        self.ip.stats.tx_bytes = self
+            .ip
+            .stats
+            .tx_bytes
+            .saturating_add(prepared_batch.tx_bytes);
+
+        if let Some(error) = wake_error {
+            return Err(SendError {
+                accepted: prepared_batch.prepared,
+                kind: device_error(error),
+            });
+        }
+
+        Ok(prepared_batch.prepared)
+    }
+
+    #[cfg(test)]
+    fn send_udp_endpoint_batch_test<F>(
+        &mut self,
+        endpoint: &mut XdpUdpEndpoint,
+        max: usize,
+        mut fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        if let Err(kind) = self.refresh_udp_endpoint_cache(endpoint) {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let mut tx_buffers = Vec::with_capacity(max);
+        if let Err(kind) = self.allocate_tx_batch(&mut tx_buffers, max) {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let mut payload = vec![0u8; endpoint.info.mtu];
+        let mut batch = Vec::with_capacity(tx_buffers.len());
+        for (index, mut buffer) in tx_buffers.into_iter().enumerate() {
+            let payload_len = fill_payload(index, &mut payload);
+            if let Err(kind) = validate_xdp_udp_endpoint_payload(endpoint.info, payload_len) {
+                return Err(SendError { accepted: 0, kind });
+            }
+            if buffer.extend_from_slice(&payload[..payload_len]).is_err() {
+                return Err(SendError {
+                    accepted: 0,
+                    kind: Error::InvalidPacket,
+                });
+            }
+            batch.push(TxSlot::Ready(UdpEndpointTransmit::new(buffer.freeze())));
+        }
+
+        self.send_udp_endpoint_test(endpoint, batch.as_mut_slice())
     }
 
     #[cfg(test)]
@@ -2938,19 +3213,48 @@ fn update_xdp_udp_endpoint_header(
         return Ok(());
     }
 
+    patch_xdp_udp_endpoint_header_lengths(&mut cache.header, cache.l2_len, payload_len)
+}
+
+fn patch_xdp_udp_endpoint_header_lengths(
+    header: &mut [u8],
+    l2_len: usize,
+    payload_len: usize,
+) -> Result<(), Error> {
     let udp_len = payload_len + UDP_HEADER_LEN;
     let total_len = udp_len + IPV4_MIN_HEADER_LEN;
     if total_len > u16::MAX as usize {
         return Err(Error::OversizeForMtu);
     }
 
-    let ip_start = cache.l2_len;
-    cache.header[ip_start + 2..ip_start + 4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    cache.header[ip_start + 10..ip_start + 12].copy_from_slice(&0u16.to_be_bytes());
-    cache.header[ip_start + 24..ip_start + 26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    let checksum = ipv4_header_checksum(&cache.header[ip_start..ip_start + IPV4_MIN_HEADER_LEN]);
-    cache.header[ip_start + 10..ip_start + 12].copy_from_slice(&checksum.to_be_bytes());
+    let ip_start = l2_len;
+    let old_total_len = read_be_u16(header, ip_start + 2);
+    let old_checksum = read_be_u16(header, ip_start + 10);
+    let total_len = total_len as u16;
+    let checksum = ipv4_checksum_replace_word(old_checksum, old_total_len, total_len);
+    write_be_u16(header, ip_start + 2, total_len);
+    write_be_u16(header, ip_start + 10, checksum);
+    write_be_u16(header, ip_start + 24, udp_len as u16);
     Ok(())
+}
+
+#[inline]
+fn read_be_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline]
+fn write_be_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    let [hi, lo] = value.to_be_bytes();
+    bytes[offset] = hi;
+    bytes[offset + 1] = lo;
+}
+
+#[inline]
+fn ipv4_checksum_replace_word(checksum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
+    sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
 }
 
 fn validate_xdp_udp_endpoint_payload(
@@ -3770,12 +4074,8 @@ mod tests {
         let rx_reclaim = FrameReclaim::new(Vec::new());
         let tx_reclaim = FrameReclaim::new(Vec::new());
         let mut tx_pool = XdpTxPool::live(live_layout(), Rc::clone(&umem), Rc::clone(&tx_reclaim));
-        let completion_reclaim = CompletionReclaim::SharedMemberSlices {
-            frame_size: u64::from(umem.frame_size()),
-            frames_per_member: 4,
-            rx_frames_per_member: 2,
-            active_frames: 8,
-        };
+        let completion_reclaim =
+            CompletionReclaim::shared_member_slices(umem.frame_size(), 4, 2, 8).unwrap();
 
         reclaim_completed_xdp_frame(
             umem.frame_offset(1),
@@ -3809,6 +4109,28 @@ mod tests {
         let mut tx_frames = Vec::new();
         tx_reclaim.drain_into(&mut tx_frames);
         assert_eq!(tx_frames, vec![umem.frame_offset(3), umem.frame_offset(6)]);
+    }
+
+    #[test]
+    fn shared_completion_reclaim_requires_power_of_two_sizes() {
+        assert_eq!(
+            CompletionReclaim::shared_member_slices(2048, 6, 3, 12)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            CompletionReclaim::shared_member_slices(3000, 4, 2, 8)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            CompletionReclaim::shared_member_slices(2048, 4, 3, 8)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -3981,6 +4303,57 @@ mod tests {
     }
 
     #[test]
+    fn xdp_udp_endpoint_batch_builder_sends_variable_payloads() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                Ipv4Addr::new(192, 0, 2, 1),
+                egress().dst_mac,
+                egress().src_mac,
+            ))
+            .open_busy_poll_test();
+        let spec = UdpEndpointSpec::new(remote.into());
+        let mut endpoint = socket.prepare_udp_endpoint(spec).unwrap();
+        let payloads: [&[u8]; 2] = [b"hi", b"world"];
+
+        // SAFETY: the callback writes each payload prefix before returning that
+        // payload's length.
+        let sent = unsafe {
+            socket
+                .udp_endpoint_batch(&mut endpoint, payloads.len())
+                .send(|index, payload| {
+                    let expected = payloads[index];
+                    payload[..expected.len()].copy_from_slice(expected);
+                    expected.len()
+                })
+                .unwrap()
+        };
+
+        assert_eq!(sent, 2);
+        assert_eq!(socket.ip.pending_tx_frame_count(), 2);
+        for (index, expected) in payloads.iter().enumerate() {
+            let frame = socket.ip.pending_tx_frame(index).unwrap();
+            assert_eq!(&frame[..6], &[1, 2, 3, 4, 5, 6]);
+            assert_eq!(&frame[6..12], &[6, 5, 4, 3, 2, 1]);
+            assert_eq!(&frame[12..14], &ETHERTYPE_IPV4.to_be_bytes());
+            let ip = &frame[ETHERNET_HEADER_LEN..];
+            assert_eq!(
+                usize::from(u16::from_be_bytes([ip[2], ip[3]])),
+                IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN + expected.len()
+            );
+            assert_eq!(ipv4_header_checksum(&ip[..IPV4_MIN_HEADER_LEN]), 0);
+            assert_eq!(
+                usize::from(u16::from_be_bytes([ip[24], ip[25]])),
+                UDP_HEADER_LEN + expected.len()
+            );
+            assert_eq!(&ip[28..], *expected);
+        }
+    }
+
+    #[test]
     fn xdp_udp_endpoint_patches_variable_lengths_and_checksum() {
         let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
         let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
@@ -4038,6 +4411,48 @@ mod tests {
             13
         );
         assert_eq!(&second_ip[28..], b"hello");
+    }
+
+    #[test]
+    fn xdp_udp_endpoint_length_patch_matches_recomputed_checksum() {
+        let mut header = [0u8; IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN];
+        write_ipv4_udp_headers(
+            &mut header,
+            Ipv4UdpHeaderFields {
+                source_port: 9000,
+                destination_port: 9001,
+                source: Ipv4Addr::new(192, 0, 2, 10),
+                destination: Ipv4Addr::new(198, 51, 100, 20),
+                total_len: (IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN) as u16,
+                udp_len: UDP_HEADER_LEN as u16,
+                ttl: 64,
+                ecn: None,
+            },
+        );
+
+        for payload_len in [0usize, 1, 5, 1472, 64, 0, 1450] {
+            patch_xdp_udp_endpoint_header_lengths(&mut header, 0, payload_len).unwrap();
+
+            let udp_len = UDP_HEADER_LEN + payload_len;
+            let total_len = IPV4_MIN_HEADER_LEN + udp_len;
+            let mut expected = [0u8; IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN];
+            write_ipv4_udp_headers(
+                &mut expected,
+                Ipv4UdpHeaderFields {
+                    source_port: 9000,
+                    destination_port: 9001,
+                    source: Ipv4Addr::new(192, 0, 2, 10),
+                    destination: Ipv4Addr::new(198, 51, 100, 20),
+                    total_len: total_len as u16,
+                    udp_len: udp_len as u16,
+                    ttl: 64,
+                    ecn: None,
+                },
+            );
+
+            assert_eq!(header, expected);
+            assert_eq!(ipv4_header_checksum(&header[..IPV4_MIN_HEADER_LEN]), 0);
+        }
     }
 
     #[test]
