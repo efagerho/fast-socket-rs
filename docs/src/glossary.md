@@ -258,6 +258,22 @@ where
     ) -> Result<usize, SendError>
     where
         Self: Sized;
+    fn udp_endpoint_batch<'a>(
+        &'a mut self,
+        endpoint: &'a mut Self::Endpoint,
+        max: usize,
+    ) -> UdpEndpointBatchBuilder<'a, Self>
+    where
+        Self: Sized;
+    fn send_udp_endpoint_batch<F>(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        max: usize,
+        fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized,
+        F: FnMut(usize, &mut [u8]) -> usize;
     fn send_all(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
@@ -278,7 +294,8 @@ where
 `UdpEndpointSpec` describes a prepared UDP transmit shape: destination address
 plus optional source IP, source port, ECN, GSO segment size, and fixed payload
 length. A `UdpSocket` turns it into its associated `Endpoint` type and later
-sends `UdpEndpointTransmit` slots through that handle.
+sends `UdpEndpointTransmit` slots or generated payload batches through that
+handle.
 
 ### `IpPacketSocket`
 

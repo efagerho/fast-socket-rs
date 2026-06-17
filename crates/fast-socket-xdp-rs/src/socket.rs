@@ -152,42 +152,8 @@ impl XdpUdpEndpoint {
 /// writes the endpoint's cached L2+IPv4+UDP header and caller-provided payloads
 /// directly into UMEM-backed TX frames, skipping the generic
 /// `UdpEndpointTransmit` slot materialization path.
-pub struct XdpUdpEndpointBatchBuilder<'a, D, R> {
-    socket: &'a mut XdpUdpSocket<D, R>,
-    endpoint: &'a mut XdpUdpEndpoint,
-    max: usize,
-}
-
-impl<D, R> XdpUdpEndpointBatchBuilder<'_, D, R>
-where
-    D: PollDriver,
-    R: XdpUdpRouter,
-{
-    /// Builds and sends this batch.
-    ///
-    /// `fill_payload` is called once for each TX frame that can be reserved,
-    /// up to `max`. The provided slice is the endpoint's maximum UDP payload
-    /// size. The callback returns the number of payload bytes written for that
-    /// packet. The callback may be called fewer than `max` times when TX
-    /// descriptors or UMEM frames are unavailable.
-    ///
-    /// # Safety
-    ///
-    /// The callback must initialize every byte in `payload[..returned_len]`
-    /// before returning `returned_len`. Returning a length for bytes that were
-    /// not written may transmit stale frame contents. The payload slice is not
-    /// cleared before the callback runs.
-    pub unsafe fn send<F>(self, fill_payload: F) -> Result<usize, SendError>
-    where
-        F: FnMut(usize, &mut [u8]) -> usize,
-    {
-        // SAFETY: forwarded from this method's caller.
-        unsafe {
-            self.socket
-                .send_udp_endpoint_direct_batch(self.endpoint, self.max, fill_payload)
-        }
-    }
-}
+pub type XdpUdpEndpointBatchBuilder<'a, D, R> =
+    fast_socket_rs::UdpEndpointBatchBuilder<'a, XdpUdpSocket<D, R>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct XdpUdpEndpointCache {
@@ -2029,16 +1995,13 @@ where
     /// The returned builder writes endpoint headers and payloads directly into
     /// TX UMEM frames. This is useful for packet generators that want to avoid
     /// constructing [`UdpEndpointTransmit`] slots.
+    #[inline(always)]
     pub fn udp_endpoint_batch<'a>(
         &'a mut self,
         endpoint: &'a mut XdpUdpEndpoint,
         max: usize,
     ) -> XdpUdpEndpointBatchBuilder<'a, D, R> {
-        XdpUdpEndpointBatchBuilder {
-            socket: self,
-            endpoint,
-            max,
-        }
+        UdpSocket::udp_endpoint_batch(self, endpoint, max)
     }
 
     #[cfg(test)]
@@ -2336,7 +2299,7 @@ where
         Ok(())
     }
 
-    unsafe fn send_udp_endpoint_direct_batch<F>(
+    fn send_udp_endpoint_direct_batch<F>(
         &mut self,
         endpoint: &mut XdpUdpEndpoint,
         max: usize,
@@ -2943,6 +2906,19 @@ where
             return self.send_udp_endpoint_test(endpoint, batch);
         }
         self.send_udp_endpoint_inner(endpoint, batch)
+    }
+
+    #[inline(always)]
+    fn send_udp_endpoint_batch<F>(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        max: usize,
+        fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        self.send_udp_endpoint_direct_batch(endpoint, max, fill_payload)
     }
 
     /// Receives UDP datagrams into `out`.
@@ -4433,18 +4409,14 @@ mod tests {
         let mut endpoint = socket.prepare_udp_endpoint(spec).unwrap();
         let payloads: [&[u8]; 2] = [b"hi", b"world"];
 
-        // SAFETY: the callback writes each payload prefix before returning that
-        // payload's length.
-        let sent = unsafe {
-            socket
-                .udp_endpoint_batch(&mut endpoint, payloads.len())
-                .send(|index, payload| {
-                    let expected = payloads[index];
-                    payload[..expected.len()].copy_from_slice(expected);
-                    expected.len()
-                })
-                .unwrap()
-        };
+        let sent = socket
+            .udp_endpoint_batch(&mut endpoint, payloads.len())
+            .send(|index, payload| {
+                let expected = payloads[index];
+                payload[..expected.len()].copy_from_slice(expected);
+                expected.len()
+            })
+            .unwrap();
 
         assert_eq!(sent, 2);
         assert_eq!(socket.ip.pending_tx_frame_count(), 2);

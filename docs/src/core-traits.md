@@ -210,6 +210,22 @@ where
     ) -> Result<usize, SendError>
     where
         Self: Sized;
+    fn udp_endpoint_batch<'a>(
+        &'a mut self,
+        endpoint: &'a mut Self::Endpoint,
+        max: usize,
+    ) -> UdpEndpointBatchBuilder<'a, Self>
+    where
+        Self: Sized;
+    fn send_udp_endpoint_batch<F>(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        max: usize,
+        fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized,
+        F: FnMut(usize, &mut [u8]) -> usize;
     fn send_all(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
@@ -249,10 +265,12 @@ selection out of the per-packet transmit item. `UdpEndpointSpec` names the
 remote peer plus optional source IP, source port, ECN, GSO segment size, and
 fixed payload length. `prepare_udp_endpoint` returns a socket-specific
 `Endpoint`, and `send_to_udp_endpoint` submits `UdpEndpointTransmit` slots that
-only carry payload buffers. Backends that do not have a specialized endpoint
-fast path can use `GenericUdpEndpoint`, `prepare_generic_udp_endpoint`, and
-`send_generic_udp_endpoint` to delegate through the normal `UdpSocket::send`
-path while preserving prefix ownership semantics.
+only carry payload buffers. `udp_endpoint_batch` exposes a payload-generation
+builder for callers that want to fill endpoint payloads directly. Backends that
+do not have a specialized endpoint fast path can use `GenericUdpEndpoint`,
+`prepare_generic_udp_endpoint`, `send_generic_udp_endpoint`, and
+`send_generic_udp_endpoint_batch` to delegate through the normal socket paths
+while preserving prefix ownership semantics.
 
 The XDP UDP backend uses a specialized endpoint handle. It caches one
 contiguous L2+IPv4+UDP header template, copies that header into packet headroom

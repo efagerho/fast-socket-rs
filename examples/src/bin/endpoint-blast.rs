@@ -266,20 +266,16 @@ fn send_batch(
     sequence: &mut u64,
     batch_size: usize,
 ) -> Result<usize, BoxError> {
-    // SAFETY: the callback writes exactly `payload_bytes.len()` bytes into the
-    // payload prefix before returning that same length.
-    let accepted = unsafe {
-        socket
-            .udp_endpoint_batch(endpoint, batch_size)
-            .send(|_, payload| {
-                let payload_len = payload_bytes.len();
-                let payload = &mut payload[..payload_len];
-                payload.copy_from_slice(payload_bytes);
-                write_sequence(payload, *sequence);
-                *sequence = (*sequence).wrapping_add(1);
-                payload_len
-            })?
-    };
+    let accepted = socket
+        .udp_endpoint_batch(endpoint, batch_size)
+        .send(|_, payload| {
+            let payload_len = payload_bytes.len();
+            let payload = &mut payload[..payload_len];
+            payload.copy_from_slice(payload_bytes);
+            write_sequence(payload, *sequence);
+            *sequence = (*sequence).wrapping_add(1);
+            payload_len
+        })?;
 
     if accepted == 0 {
         socket.drain_tx_completions()?;

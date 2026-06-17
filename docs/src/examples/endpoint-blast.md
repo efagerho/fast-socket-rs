@@ -67,34 +67,30 @@ for socket in aggregate.members_mut() {
 
 ## Transmit Loop
 
-The inner loop uses the direct XDP endpoint batch builder. The builder writes
-the cached endpoint header and caller-provided payloads directly into
-UMEM-backed TX frames, so the example does not allocate `UdpEndpointTransmit`
-slots for each packet.
+The inner loop uses the `UdpSocket` endpoint batch builder. On XDP sockets the
+builder writes the cached endpoint header and caller-provided payloads directly
+into UMEM-backed TX frames, so the example does not allocate
+`UdpEndpointTransmit` slots for each packet.
 
 ```rust,ignore
-// SAFETY: the callback writes exactly `payload_bytes.len()` bytes into the
-// payload prefix before returning that same length.
-let accepted = unsafe {
-    socket
-        .udp_endpoint_batch(endpoint, batch_size)
-        .send(|_, payload| {
-            let payload_len = payload_bytes.len();
-            let payload = &mut payload[..payload_len];
-            payload.copy_from_slice(payload_bytes);
-            write_sequence(payload, *sequence);
-            *sequence = (*sequence).wrapping_add(1);
-            payload_len
-        })?
-};
+let accepted = socket
+    .udp_endpoint_batch(endpoint, batch_size)
+    .send(|_, payload| {
+        let payload_len = payload_bytes.len();
+        let payload = &mut payload[..payload_len];
+        payload.copy_from_slice(payload_bytes);
+        write_sequence(payload, *sequence);
+        *sequence = (*sequence).wrapping_add(1);
+        payload_len
+    })?;
 ```
 
 The callback runs once for each TX frame that the socket can reserve, up to the
 requested batch size. Each slice is the endpoint's maximum UDP payload size, and
-the returned length selects how many bytes become part of that packet. The slice
-is not cleared before the callback runs, which is why `send` is unsafe: the
-callback must initialize every byte in `payload[..returned_len]`. The example
-copies a reusable payload template and writes the sequence prefix with the shared
+the returned length selects how many bytes become part of that packet. Backends
+are not required to clear the slice before the callback runs, so the callback
+must initialize every byte in `payload[..returned_len]`. The example copies a
+reusable payload template and writes the sequence prefix with the shared
 benchmark helper, which uses a direct big-endian word store for payloads of at
 least eight bytes.
 

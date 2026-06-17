@@ -15,6 +15,7 @@ struct MockUdpSocket {
     rx_pool: HeapBufferPool,
     tx_pool: HeapBufferPool,
     driver: BusyPollDriver,
+    sent: Vec<Vec<u8>>,
 }
 
 impl MockUdpSocket {
@@ -23,6 +24,7 @@ impl MockUdpSocket {
             rx_pool: HeapBufferPool::with_payload_capacity(128),
             tx_pool: HeapBufferPool::with_payload_capacity(128),
             driver: BusyPollDriver::new(),
+            sent: Vec::new(),
         }
     }
 }
@@ -67,12 +69,13 @@ impl UdpSocket for MockUdpSocket {
 
     fn send(&mut self, batch: &mut [TxSlot<UdpTransmit<PacketBuf>>]) -> Result<usize, SendError> {
         for (accepted, slot) in batch.iter_mut().enumerate() {
-            if slot.take().is_none() {
+            let Some(tx) = slot.take() else {
                 return Err(SendError {
                     accepted,
                     kind: Error::InvalidBatch,
                 });
-            }
+            };
+            self.sent.push(tx.packet.as_slice().to_vec());
         }
         Ok(batch.len())
     }
@@ -168,6 +171,28 @@ fn udp_endpoint_send_uses_prepared_metadata() {
         1
     );
     assert!(tx[0].is_taken());
+}
+
+#[test]
+fn udp_endpoint_batch_is_available_on_udp_socket_trait() {
+    let mut socket = MockUdpSocket::new();
+    let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999).into();
+    let mut endpoint = socket
+        .prepare_udp_endpoint(UdpEndpointSpec::new(destination))
+        .unwrap();
+    let payloads: [&[u8]; 3] = [b"first", b"second", b"third"];
+
+    let accepted = socket
+        .udp_endpoint_batch(&mut endpoint, payloads.len())
+        .send(|index, payload| {
+            let source = payloads[index];
+            payload[..source.len()].copy_from_slice(source);
+            source.len()
+        })
+        .unwrap();
+
+    assert_eq!(accepted, payloads.len());
+    assert_eq!(socket.sent, payloads.map(Vec::from));
 }
 
 #[test]

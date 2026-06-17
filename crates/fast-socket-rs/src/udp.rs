@@ -4,8 +4,8 @@ use core::num::NonZeroU16;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::{
-    Error, PacketBuffer, PacketBufferMut, PollDriver, QueueAffinity, RecvBatch, SendError,
-    SocketId, TxSlot,
+    DeviceError, DeviceErrorKind, Error, PacketBuffer, PacketBufferMut, PollDriver, QueueAffinity,
+    RecvBatch, SendError, SocketId, TxSlot,
 };
 
 /// Explicit Congestion Notification codepoint.
@@ -187,6 +187,44 @@ pub type UdpTxBufferMut<S> = <S as UdpSocket>::TxBufferMut;
 /// Mutable receive buffer type delivered by a UDP socket.
 pub type UdpRxBuffer<S> = <S as UdpSocket>::RxBuffer;
 
+/// Builder for generating and sending a UDP endpoint batch.
+///
+/// The builder delegates to the socket implementation. Backends with a direct
+/// packet-generation path can override [`UdpSocket::send_udp_endpoint_batch`];
+/// other backends use the generic fallback.
+pub struct UdpEndpointBatchBuilder<'a, S>
+where
+    S: UdpSocket,
+{
+    socket: &'a mut S,
+    endpoint: &'a mut S::Endpoint,
+    max: usize,
+}
+
+impl<S> UdpEndpointBatchBuilder<'_, S>
+where
+    S: UdpSocket,
+{
+    /// Builds and sends this batch.
+    ///
+    /// `fill_payload` is called once for each TX packet the socket can prepare,
+    /// up to `max`. The provided slice is the endpoint's maximum payload buffer
+    /// for this packet. The callback returns how many bytes from the slice should
+    /// become the UDP payload.
+    ///
+    /// The callback must write every byte in `payload[..returned_len]` before
+    /// returning. Backends are not required to clear the slice before invoking
+    /// the callback.
+    #[inline(always)]
+    pub fn send<F>(self, fill_payload: F) -> Result<usize, SendError>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        self.socket
+            .send_udp_endpoint_batch(self.endpoint, self.max, fill_payload)
+    }
+}
+
 /// Prepares a correctness-first generic UDP endpoint for `socket`.
 ///
 /// Backends can use this as their mandatory endpoint implementation while
@@ -267,6 +305,80 @@ where
             restore_unaccepted_endpoint_slots::<S>(batch, &mut converted, accepted);
             Err(SendError { accepted, kind })
         }
+    }
+}
+
+/// Builds a batch through a prepared endpoint using the generic buffer path.
+///
+/// This is the default implementation behind [`UdpSocket::udp_endpoint_batch`].
+/// It allocates ordinary TX buffers, lets the caller fill a temporary payload
+/// slice, copies the returned prefix into each TX buffer, and submits the
+/// resulting [`UdpEndpointTransmit`] slots through
+/// [`UdpSocket::send_to_udp_endpoint`].
+pub fn send_generic_udp_endpoint_batch<S, F>(
+    socket: &mut S,
+    endpoint: &mut S::Endpoint,
+    max: usize,
+    mut fill_payload: F,
+) -> Result<usize, SendError>
+where
+    S: UdpSocket,
+    F: FnMut(usize, &mut [u8]) -> usize,
+{
+    if max == 0 {
+        return Ok(0);
+    }
+
+    let info = socket.udp_endpoint_info(endpoint);
+    let payload_capacity = info.payload_len.unwrap_or(info.mtu);
+    let mut buffers = Vec::new();
+    socket
+        .allocate_tx_batch(&mut buffers, max)
+        .map_err(|kind| SendError { accepted: 0, kind })?;
+    if buffers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut payload = vec![0u8; payload_capacity];
+    let mut batch = Vec::with_capacity(buffers.len());
+    let mut deferred_error = None;
+    for mut buffer in buffers {
+        let index = batch.len();
+        let payload_len = fill_payload(index, &mut payload);
+        let packet_error = validate_udp_endpoint_packet(info, payload_len).err();
+        if payload_len > payload_capacity {
+            deferred_error = Some(packet_error.unwrap_or(Error::OversizeForMtu));
+            break;
+        }
+        if let Some(error) = packet_error {
+            deferred_error = Some(error);
+            break;
+        }
+        if buffer.extend_from_slice(&payload[..payload_len]).is_err() {
+            deferred_error = Some(Error::Device(DeviceError::new(DeviceErrorKind::Backend)));
+            break;
+        }
+        batch.push(TxSlot::Ready(UdpEndpointTransmit::new(buffer.freeze())));
+    }
+
+    if batch.is_empty() {
+        return match deferred_error {
+            Some(kind) => Err(SendError { accepted: 0, kind }),
+            None => Ok(0),
+        };
+    }
+
+    match socket.send_to_udp_endpoint(endpoint, batch.as_mut_slice()) {
+        Ok(accepted) => {
+            if accepted < batch.len() {
+                return Ok(accepted);
+            }
+            match deferred_error {
+                Some(kind) => Err(SendError { accepted, kind }),
+                None => Ok(accepted),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -421,6 +533,45 @@ where
     ) -> Result<usize, SendError>
     where
         Self: Sized;
+
+    /// Creates a UDP endpoint batch builder.
+    ///
+    /// The returned builder can generate endpoint payloads directly for backends
+    /// that support it, or use a generic allocation-and-send fallback.
+    #[inline(always)]
+    fn udp_endpoint_batch<'a>(
+        &'a mut self,
+        endpoint: &'a mut Self::Endpoint,
+        max: usize,
+    ) -> UdpEndpointBatchBuilder<'a, Self>
+    where
+        Self: Sized,
+    {
+        UdpEndpointBatchBuilder {
+            socket: self,
+            endpoint,
+            max,
+        }
+    }
+
+    /// Builds and sends payloads through a prepared endpoint.
+    ///
+    /// Backends may override this hook to avoid materializing
+    /// [`UdpEndpointTransmit`] slots. The default implementation uses
+    /// [`send_generic_udp_endpoint_batch`].
+    #[inline(always)]
+    fn send_udp_endpoint_batch<F>(
+        &mut self,
+        endpoint: &mut Self::Endpoint,
+        max: usize,
+        fill_payload: F,
+    ) -> Result<usize, SendError>
+    where
+        Self: Sized,
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        send_generic_udp_endpoint_batch(self, endpoint, max, fill_payload)
+    }
 
     /// Sends `batch` to completion, draining TX completions on partial
     /// acceptance so the next `send` has transmit capacity.
