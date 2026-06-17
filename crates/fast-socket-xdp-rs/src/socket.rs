@@ -419,12 +419,6 @@ enum CompletionReclaim {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompletionPool {
-    Rx,
-    Tx,
-}
-
 impl CompletionReclaim {
     fn shared_member_slices(
         frame_size: u32,
@@ -470,36 +464,73 @@ impl CompletionReclaim {
             active_frames,
         })
     }
+}
 
-    fn classify(self, frame_addr: u64) -> Option<CompletionPool> {
-        match self {
-            Self::LocalSplit {
-                first_tx_frame_addr,
-            } => {
-                if frame_addr < first_tx_frame_addr {
-                    Some(CompletionPool::Rx)
-                } else {
-                    Some(CompletionPool::Tx)
-                }
-            }
-            Self::SharedMemberSlices {
-                frame_shift,
-                member_frame_mask,
-                rx_frames_per_member,
-                active_frames,
-            } => {
-                let frame_index = u32::try_from(frame_addr >> frame_shift).ok()?;
-                if frame_index >= active_frames {
-                    return None;
-                }
-                let member_frame = frame_index & member_frame_mask;
-                if member_frame < rx_frames_per_member {
-                    Some(CompletionPool::Rx)
-                } else {
-                    Some(CompletionPool::Tx)
-                }
-            }
+#[inline(always)]
+fn reclaim_local_split_completions(
+    completions: &[u64],
+    frame_mask: u64,
+    umem_len: u64,
+    first_tx_frame_addr: u64,
+    rx_free: &mut Vec<u64>,
+    tx_free: &mut Vec<u64>,
+) -> Result<(), Error> {
+    for &addr in completions {
+        let frame_addr = addr & !frame_mask;
+        if frame_addr >= umem_len {
+            return Err(ring_corrupt_error());
         }
+        if frame_addr < first_tx_frame_addr {
+            unsafe { push_reclaimed_frame_unchecked(rx_free, frame_addr) };
+        } else {
+            unsafe { push_reclaimed_frame_unchecked(tx_free, frame_addr) };
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn reclaim_shared_member_slice_completions(
+    completions: &[u64],
+    frame_mask: u64,
+    umem_len: u64,
+    frame_shift: u32,
+    member_frame_mask: u32,
+    rx_frames_per_member: u32,
+    active_frames: u32,
+    rx_free: &mut Vec<u64>,
+    tx_free: &mut Vec<u64>,
+) -> Result<(), Error> {
+    for &addr in completions {
+        let frame_addr = addr & !frame_mask;
+        if frame_addr >= umem_len {
+            return Err(ring_corrupt_error());
+        }
+        let Ok(frame_index) = u32::try_from(frame_addr >> frame_shift) else {
+            return Err(ring_corrupt_error());
+        };
+        if frame_index >= active_frames {
+            return Err(ring_corrupt_error());
+        }
+        let member_frame = frame_index & member_frame_mask;
+        if member_frame < rx_frames_per_member {
+            unsafe { push_reclaimed_frame_unchecked(rx_free, frame_addr) };
+        } else {
+            unsafe { push_reclaimed_frame_unchecked(tx_free, frame_addr) };
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+unsafe fn push_reclaimed_frame_unchecked(free: &mut Vec<u64>, frame_addr: u64) {
+    debug_assert!(free.len() < free.capacity());
+    let len = free.len();
+    // SAFETY: completion reclaim only returns frames previously removed from
+    // this owner-local free list, so capacity is already available.
+    unsafe {
+        free.as_mut_ptr().add(len).write(frame_addr);
+        free.set_len(len + 1);
     }
 }
 
@@ -1103,17 +1134,60 @@ impl<D> XdpIpPacketSocket<D> {
         let completed = live.raw.drain_completion_slices(
             self.config.rings.completion as usize,
             |first, second| -> Result<(), Error> {
-                for &addr in first.iter().chain(second.iter()) {
-                    let frame_addr = addr & !frame_mask;
-                    if frame_addr >= umem_len {
-                        return Err(ring_corrupt_error());
+                // SAFETY: completion draining runs on the socket owner thread.
+                // RX and TX reclaim lists are distinct pools constructed with
+                // the live socket state.
+                let rx_free = unsafe { rx_reclaim.local_free_mut() };
+                let tx_free = unsafe { tx_reclaim.local_free_mut() };
+                match completion_reclaim {
+                    CompletionReclaim::LocalSplit {
+                        first_tx_frame_addr,
+                    } => {
+                        reclaim_local_split_completions(
+                            first,
+                            frame_mask,
+                            umem_len,
+                            first_tx_frame_addr,
+                            rx_free,
+                            tx_free,
+                        )?;
+                        reclaim_local_split_completions(
+                            second,
+                            frame_mask,
+                            umem_len,
+                            first_tx_frame_addr,
+                            rx_free,
+                            tx_free,
+                        )?;
                     }
-                    match completion_reclaim
-                        .classify(frame_addr)
-                        .ok_or_else(ring_corrupt_error)?
-                    {
-                        CompletionPool::Rx => rx_reclaim.push_local(frame_addr),
-                        CompletionPool::Tx => tx_reclaim.push_local(frame_addr),
+                    CompletionReclaim::SharedMemberSlices {
+                        frame_shift,
+                        member_frame_mask,
+                        rx_frames_per_member,
+                        active_frames,
+                    } => {
+                        reclaim_shared_member_slice_completions(
+                            first,
+                            frame_mask,
+                            umem_len,
+                            frame_shift,
+                            member_frame_mask,
+                            rx_frames_per_member,
+                            active_frames,
+                            rx_free,
+                            tx_free,
+                        )?;
+                        reclaim_shared_member_slice_completions(
+                            second,
+                            frame_mask,
+                            umem_len,
+                            frame_shift,
+                            member_frame_mask,
+                            rx_frames_per_member,
+                            active_frames,
+                            rx_free,
+                            tx_free,
+                        )?;
                     }
                 }
                 Ok(())
@@ -3493,12 +3567,26 @@ fn reclaim_completed_xdp_frame(
     rx_reclaim: &FrameReclaim,
     tx_pool: &mut XdpTxPool,
 ) {
-    match completion_reclaim
-        .classify(frame_addr)
-        .expect("test frame must be in the active UMEM range")
-    {
-        CompletionPool::Rx => rx_reclaim.push_local(frame_addr),
-        CompletionPool::Tx => tx_pool.reclaim_completed_frame(frame_addr),
+    let is_rx = match completion_reclaim {
+        CompletionReclaim::LocalSplit {
+            first_tx_frame_addr,
+        } => frame_addr < first_tx_frame_addr,
+        CompletionReclaim::SharedMemberSlices {
+            frame_shift,
+            member_frame_mask,
+            rx_frames_per_member,
+            active_frames,
+        } => {
+            let frame_index =
+                u32::try_from(frame_addr >> frame_shift).expect("test frame index must fit u32");
+            assert!(frame_index < active_frames);
+            frame_index & member_frame_mask < rx_frames_per_member
+        }
+    };
+    if is_rx {
+        rx_reclaim.push_local(frame_addr);
+    } else {
+        tx_pool.reclaim_completed_frame(frame_addr);
     }
 }
 

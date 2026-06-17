@@ -442,9 +442,17 @@ impl FrameReclaim {
         }
     }
 
+    #[inline(always)]
+    pub(crate) unsafe fn local_free_mut(&self) -> &mut Vec<u64> {
+        // SAFETY: callers must be on the owner thread and must not create more
+        // than one mutable reference to the same local free list.
+        unsafe { &mut *self.free.get() }
+    }
+
+    #[inline(always)]
     pub(crate) fn push_local(&self, addr: u64) {
         // SAFETY: used by owner-thread completion reclaim paths.
-        unsafe { &mut *self.free.get() }.push(addr);
+        unsafe { self.local_free_mut() }.push(addr);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
