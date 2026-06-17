@@ -88,7 +88,7 @@ pub use route_monitor::{XdpRouteMonitor, XdpRouteMonitorHandle};
 pub use socket::{
     BusyPollXdpIpPacketSocket, BusyPollXdpUdpSocket, WaitDrivenXdpIpPacketSocket,
     WaitDrivenXdpUdpSocket, XdpIpPacketRecvMeta, XdpIpPacketSocket, XdpQueueLocalRouter,
-    XdpRouteContext, XdpUdpRouter, XdpUdpSocket,
+    XdpRouteContext, XdpUdpEndpoint, XdpUdpRouter, XdpUdpSocket,
 };
 /// Unstable low-level AF_XDP building blocks.
 ///

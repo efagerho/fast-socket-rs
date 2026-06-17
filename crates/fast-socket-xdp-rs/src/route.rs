@@ -555,6 +555,7 @@ impl EgressResolver<V4Only, XdpEgress> for RouteSnapshot {
 pub struct XdpLocalRoutes {
     snapshot: Box<RouteSnapshot>,
     pending: VecDeque<RouteSnapshot>,
+    generation: u64,
 }
 
 impl XdpLocalRoutes {
@@ -564,6 +565,7 @@ impl XdpLocalRoutes {
         Self {
             snapshot: Box::new(snapshot),
             pending: VecDeque::new(),
+            generation: 0,
         }
     }
 
@@ -579,12 +581,21 @@ impl XdpLocalRoutes {
         self.pending.push_back(snapshot);
     }
 
+    /// Returns the route generation adopted by this queue-local table.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Applies queued updates outside the packet path.
     pub fn apply_updates(&mut self) -> usize {
         let mut applied = 0;
         while let Some(snapshot) = self.pending.pop_front() {
             *self.snapshot = snapshot;
             applied += 1;
+        }
+        if applied != 0 {
+            self.generation = self.generation.wrapping_add(applied as u64);
         }
         applied
     }
@@ -871,8 +882,11 @@ mod tests {
             mtu: 1500,
             queue: QueueId::new(0),
         });
+        assert_eq!(local.generation(), 0);
         local.push_update(snapshot);
         assert_eq!(local.apply_updates(), 1);
+        assert_eq!(local.generation(), 1);
         assert_eq!(local.apply_updates(), 0);
+        assert_eq!(local.generation(), 1);
     }
 }

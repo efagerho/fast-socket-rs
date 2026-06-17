@@ -33,4 +33,4 @@ packets are submitted.
 | `udp-echo` | `udp-echo` | `udp-tokio-echo` | Echo received UDP payloads back to each sender. |
 | `udp-pong` | `udp-pong` | `udp-tokio-pong` | Reply to each packet with a generated fixed payload. |
 | `udp-proxy` | `udp-proxy` | `udp-tokio-proxy` | Forward packets between clients and one upstream endpoint. |
-| `udp-xdp-static-route-blast` | `udp-xdp-static-route-blast` | None | XDP-only UDP packet generator for one routed target. |
+| `endpoint-blast` | `endpoint-blast` | None | XDP-only UDP packet generator using prepared endpoints for one routed target. |

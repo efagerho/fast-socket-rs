@@ -14,7 +14,7 @@
   - [udp-echo](./examples/udp-echo.md)
   - [udp-pong](./examples/udp-pong.md)
   - [udp-proxy](./examples/udp-proxy.md)
-  - [udp-xdp-static-route-blast](./examples/udp-xdp-static-route-blast.md)
+  - [endpoint-blast](./examples/endpoint-blast.md)
 
 # Internals
 

@@ -254,6 +254,13 @@ fast path can use `GenericUdpEndpoint`, `prepare_generic_udp_endpoint`, and
 `send_generic_udp_endpoint` to delegate through the normal `UdpSocket::send`
 path while preserving prefix ownership semantics.
 
+The XDP UDP backend uses a specialized endpoint handle. It caches one
+contiguous L2+IPv4+UDP header template, copies that header into packet headroom
+in one operation, and patches only length-dependent fields plus the IPv4 header
+checksum for variable-length endpoints. Queue-local route updates advance a
+route generation; the next endpoint send clears any cached header from an older
+generation and rebuilds it before accepting packets.
+
 ## IP Packet Sockets
 
 `IpPacketSocket` follows the same buffer, batch, and polling model as

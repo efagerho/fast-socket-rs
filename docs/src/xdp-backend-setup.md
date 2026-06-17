@@ -12,7 +12,10 @@ The factory controls three deployment choices:
   `udp_port_range`, or `port_filter`.
 
 Every example below seeds queue-local routes from netlink. Long-running workers
-that need route updates should pair this with `XdpRouteMonitor`.
+that need route updates should pair this with `XdpRouteMonitor`. Prepared UDP
+endpoints cache the full L2+IPv4+UDP transmit header; route updates advance the
+router generation, and the next endpoint send clears and rebuilds stale cached
+headers before accepting packets.
 
 ## One Worker Per NIC Queue
 

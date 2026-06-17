@@ -13,15 +13,15 @@ use common::{
     normalize_payload_len, payload, shutdown_requested, write_sequence,
 };
 use fast_socket_rs::{
-    PacketBufferMut, QueueId, TxSlot, UdpSocket as FastUdpSocket, UdpTransmit, UdpTxBuffer,
-    UdpTxBufferMut,
+    PacketBufferMut, TxSlot, UdpEndpointSpec, UdpEndpointTransmit, UdpSocket as FastUdpSocket,
+    UdpTxBuffer, UdpTxBufferMut,
 };
 use fast_socket_xdp_rs::{
-    BusyPollXdpUdpSocket, ResolvedL2, RouteSnapshot, XdpEgress, XdpResolvedEgress, XdpRouteContext,
-    XdpUdpAggregate, XdpUdpRouter,
+    BusyPollXdpUdpSocket, RouteSnapshot, XdpQueueLocalRouter, XdpUdpAggregate,
 };
 
 const DEFAULT_DRAIN_EVERY_BATCHES: usize = 2;
+const WORKER_HOUSEKEEPING_BATCHES: usize = 1024;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -56,7 +56,7 @@ fn main() -> Result<(), BoxError> {
         .map_or_else(|| interface_ipv4_addr(&args.device), Ok)?;
     let source_port = args.source_port.unwrap_or_else(dynamic_source_port);
     let local = SocketAddrV4::new(source_ip, source_port);
-    run_static_route_blast(
+    run_endpoint_blast(
         &args.device,
         BlastConfig {
             local,
@@ -109,45 +109,26 @@ fn normalize_drain_every_batches(value: usize) -> Result<usize, BoxError> {
     Ok(value)
 }
 
-#[derive(Clone, Debug)]
-struct StaticTargetRouter {
-    target: Ipv4Addr,
-    resolved: XdpResolvedEgress,
+#[inline]
+fn worker_should_stop(stop: &AtomicBool, started: Instant, duration: Option<Duration>) -> bool {
+    stop.load(Ordering::Relaxed)
+        || shutdown_requested()
+        || duration.is_some_and(|duration| started.elapsed() >= duration)
 }
 
-impl XdpUdpRouter for StaticTargetRouter {
-    fn resolve_udp_egress(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<XdpEgress> {
-        if dst != self.target || context.ifindex != self.resolved.egress().ifindex {
-            return None;
-        }
-        let mut egress = self.resolved.egress();
-        egress.queue = context.queue;
-        Some(egress)
+#[inline]
+fn flush_pending_total(total: &AtomicU64, pending: &mut u64) {
+    if *pending == 0 {
+        return;
     }
-
-    fn resolve_udp_egress_resolved(
-        &self,
-        dst: Ipv4Addr,
-        context: XdpRouteContext,
-    ) -> Option<XdpResolvedEgress> {
-        self.resolve_udp_egress(dst, context)
-            .map(XdpResolvedEgress::from_egress)
-    }
-
-    fn resolve_udp_l2(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<ResolvedL2<'_>> {
-        if dst != self.target || context.ifindex != self.resolved.egress().ifindex {
-            return None;
-        }
-        Some(ResolvedL2::Borrowed {
-            l2_header: self.resolved.l2_header(),
-            ip_mtu: context.mtu.min(self.resolved.egress().mtu as usize),
-        })
-    }
+    total.fetch_add(*pending, Ordering::Relaxed);
+    *pending = 0;
 }
 
-type StaticAggregate = XdpUdpAggregate<fast_socket_rs::BusyPollDriver, StaticTargetRouter>;
+type EndpointAggregate = XdpUdpAggregate<fast_socket_rs::BusyPollDriver, XdpQueueLocalRouter>;
+type Endpoint = <BusyPollXdpUdpSocket as FastUdpSocket>::Endpoint;
 
-fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxError> {
+fn run_endpoint_blast(device: &str, config: BlastConfig) -> Result<(), BoxError> {
     let BlastConfig {
         local,
         payload_len,
@@ -158,10 +139,10 @@ fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxEr
         threads,
     } = config;
     let routes = RouteSnapshot::from_netlink()?;
-    let factory = build_xdp_factory(device, local, threads, routes.clone())?;
+    let factory = build_xdp_factory(device, local, threads, routes)?;
     let plans = factory.into_worker_plans();
     eprintln!(
-        "udp-xdp-static-route-blast: {} XDP worker(s), {payload_len}-byte payloads, batch size {batch_size}, drain every {drain_every_batches} batch(es), {local} -> {target}",
+        "endpoint-blast: {} XDP worker(s), {payload_len}-byte payloads, batch size {batch_size}, drain every {drain_every_batches} batch(es), {local} -> {target}",
         plans.len()
     );
 
@@ -170,31 +151,12 @@ fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxEr
     let mut handles = Vec::with_capacity(plans.len());
 
     for plan in plans {
-        let queue = plan
-            .queue_ids()
-            .first()
-            .copied()
-            .unwrap_or_else(|| QueueId::new(0));
-        let egress = routes
-            .egress_v4_for_interface(*target.ip(), plan.ifindex(), queue)
-            .ok_or_else(|| {
-                format!(
-                    "no queue-local netlink route/neighbor entry for {} on ifindex {} queue {}",
-                    target.ip(),
-                    plan.ifindex().get(),
-                    queue.get()
-                )
-            })?;
-        let router = StaticTargetRouter {
-            target: *target.ip(),
-            resolved: XdpResolvedEgress::from_egress(egress),
-        };
         let worker_config = config.worker();
         let worker_stop = Arc::clone(&stop);
         let worker_total = Arc::clone(&total);
         handles.push(thread::spawn(move || -> Result<(), String> {
             let mut aggregate = plan
-                .open_udp_busy_poll_with_router(local, || router.clone())
+                .open_udp_busy_poll(local)
                 .map_err(|error| error.to_string())?;
             run_worker(&mut aggregate, worker_config, worker_stop, worker_total)
                 .map_err(|error| error.to_string())
@@ -202,7 +164,7 @@ fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxEr
     }
 
     let started = Instant::now();
-    let mut progress = common::Progress::new("udp-xdp-static-route-blast");
+    let mut progress = common::Progress::new("endpoint-blast");
     while !shutdown_requested() && !stop.load(Ordering::Relaxed) {
         if duration.is_some_and(|duration| started.elapsed() >= duration) {
             break;
@@ -219,7 +181,7 @@ fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxEr
         match handle.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error.into()),
-            Err(_) => return Err("udp-xdp-static-route-blast worker thread panicked".into()),
+            Err(_) => return Err("endpoint-blast worker thread panicked".into()),
         }
     }
     progress.set(total.load(Ordering::Relaxed));
@@ -228,7 +190,7 @@ fn run_static_route_blast(device: &str, config: BlastConfig) -> Result<(), BoxEr
 }
 
 fn run_worker(
-    aggregate: &mut StaticAggregate,
+    aggregate: &mut EndpointAggregate,
     config: WorkerConfig,
     stop: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
@@ -246,16 +208,26 @@ fn run_worker(
     let mut tx_buffers = Vec::with_capacity(batch_size);
     let mut batch = Vec::with_capacity(batch_size);
     let mut batches_since_drain = 0usize;
+    let mut batches_until_housekeeping = WORKER_HOUSEKEEPING_BATCHES;
+    let mut pending_total = 0u64;
+    let mut endpoints = Vec::with_capacity(aggregate.len());
 
-    while !stop.load(Ordering::Relaxed)
-        && !shutdown_requested()
-        && duration.is_none_or(|duration| started.elapsed() < duration)
-    {
+    for socket in aggregate.members_mut() {
+        let mut spec = UdpEndpointSpec::new(target);
+        spec.payload_len = Some(payload_len);
+        endpoints.push(socket.prepare_udp_endpoint(spec)?);
+    }
+
+    if worker_should_stop(&stop, started, duration) {
+        return Ok(());
+    }
+
+    'running: loop {
         let mut progressed = 0usize;
-        for socket in aggregate.members_mut() {
+        for (socket, endpoint) in aggregate.members_mut().iter_mut().zip(endpoints.iter_mut()) {
             let accepted = send_batch(
                 socket,
-                target,
+                endpoint,
                 &mut payload_bytes,
                 &mut sequence,
                 batch_size,
@@ -264,20 +236,34 @@ fn run_worker(
             )?;
             progressed += accepted;
             if accepted > 0 {
+                pending_total += accepted as u64;
                 batches_since_drain += 1;
                 if batches_since_drain >= drain_every_batches {
                     socket.drain_tx_completions()?;
                     batches_since_drain = 0;
                 }
             }
+
+            batches_until_housekeeping -= 1;
+            if batches_until_housekeeping == 0 {
+                flush_pending_total(&total, &mut pending_total);
+                batches_until_housekeeping = WORKER_HOUSEKEEPING_BATCHES;
+                if worker_should_stop(&stop, started, duration) {
+                    break 'running;
+                }
+            }
         }
         if progressed == 0 {
             aggregate.drain_tx_completions()?;
+            flush_pending_total(&total, &mut pending_total);
+            if worker_should_stop(&stop, started, duration) {
+                break;
+            }
             thread::yield_now();
-        } else {
-            total.fetch_add(progressed as u64, Ordering::Relaxed);
         }
     }
+
+    flush_pending_total(&total, &mut pending_total);
 
     if batches_since_drain > 0 {
         aggregate.drain_tx_completions()?;
@@ -287,13 +273,13 @@ fn run_worker(
 }
 
 fn send_batch(
-    socket: &mut BusyPollXdpUdpSocket<StaticTargetRouter>,
-    target: SocketAddr,
+    socket: &mut BusyPollXdpUdpSocket,
+    endpoint: &mut Endpoint,
     payload_bytes: &mut [u8],
     sequence: &mut u64,
     batch_size: usize,
-    tx_buffers: &mut Vec<UdpTxBufferMut<BusyPollXdpUdpSocket<StaticTargetRouter>>>,
-    batch: &mut Vec<TxSlot<UdpTransmit<UdpTxBuffer<BusyPollXdpUdpSocket<StaticTargetRouter>>>>>,
+    tx_buffers: &mut Vec<UdpTxBufferMut<BusyPollXdpUdpSocket>>,
+    batch: &mut Vec<TxSlot<UdpEndpointTransmit<UdpTxBuffer<BusyPollXdpUdpSocket>>>>,
 ) -> Result<usize, BoxError> {
     tx_buffers.clear();
     batch.clear();
@@ -302,7 +288,7 @@ fn send_batch(
     while let Some(mut buffer) = tx_buffers.pop() {
         write_sequence(payload_bytes, *sequence);
         buffer.extend_from_slice(payload_bytes)?;
-        batch.push(TxSlot::Ready(UdpTransmit::new(buffer.freeze(), target)));
+        batch.push(TxSlot::Ready(UdpEndpointTransmit::new(buffer.freeze())));
         *sequence = sequence.wrapping_add(1);
     }
 
@@ -311,6 +297,6 @@ fn send_batch(
         return Ok(0);
     }
 
-    let accepted = socket.send(batch.as_mut_slice())?;
+    let accepted = socket.send_to_udp_endpoint(endpoint, batch.as_mut_slice())?;
     Ok(accepted)
 }

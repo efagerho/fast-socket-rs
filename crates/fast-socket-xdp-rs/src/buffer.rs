@@ -1064,7 +1064,7 @@ impl XdpPacketBuf {
         unsafe { slice::from_raw_parts(ptr.add(self.inner.start), len) }
     }
 
-    pub(crate) fn prepare_l2(&mut self, header: &[u8]) -> Option<XdpTxFrame> {
+    pub(crate) fn prepare_tx_frame_with_header(&mut self, header: &[u8]) -> Option<XdpTxFrame> {
         let packet_len = self.len();
         if self.inner.storage.is_none() || !self.inner.is_umem() || header.len() > self.inner.start
         {
@@ -1431,7 +1431,7 @@ mod tests {
         let mut packet = packet.freeze();
         let header = [0u8; 14];
         let frame = packet
-            .prepare_l2(&header)
+            .prepare_tx_frame_with_header(&header)
             .expect("live frame can be prepared");
         packet.into_submitted();
 

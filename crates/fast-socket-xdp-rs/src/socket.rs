@@ -12,12 +12,11 @@ use std::time::Duration;
 use fast_socket_rs::OwnedPacketBuffer;
 use fast_socket_rs::{
     BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, EgressResolver,
-    Error, GenericUdpEndpoint, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
-    IpPacketTransmit, IpVersion, NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode,
-    QueueAffinity, QueueId, RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot,
-    UdpCapabilities, UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive,
-    UdpRecvMeta, UdpSocket, UdpTransmit, V4Only, WaitOutcome, WakeHandle,
-    prepare_generic_udp_endpoint, send_generic_udp_endpoint,
+    Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion,
+    NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode, QueueAffinity, QueueId,
+    RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities,
+    UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive, UdpRecvMeta, UdpSocket,
+    UdpTransmit, V4Only, WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{FrameReclaim, XdpPacketBuf, XdpPacketBufMut, XdpRxPool, XdpTxPool};
@@ -123,6 +122,35 @@ pub struct XdpUdpSocket<D = BusyPollDriver, R = XdpQueueLocalRouter> {
     ttl: u8,
 }
 
+/// Prepared XDP UDP endpoint with a cached L2+IPv4+UDP header template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct XdpUdpEndpoint {
+    spec: UdpEndpointSpec,
+    info: UdpEndpointInfo,
+    cached: Option<XdpUdpEndpointCache>,
+}
+
+impl XdpUdpEndpoint {
+    /// Returns the original endpoint request.
+    #[must_use]
+    pub const fn spec(&self) -> &UdpEndpointSpec {
+        &self.spec
+    }
+
+    /// Returns endpoint limits and offload information.
+    #[must_use]
+    pub const fn info(&self) -> UdpEndpointInfo {
+        self.info
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct XdpUdpEndpointCache {
+    route_generation: u64,
+    header: Vec<u8>,
+    l2_len: usize,
+}
+
 /// Resolves UDP destinations into AF_XDP transmit egress handles.
 ///
 /// Implementors may own route and neighbor state, perform dynamic lookups, or
@@ -168,6 +196,15 @@ pub trait XdpUdpRouter {
             l2_len: resolved.l2_len(),
             ip_mtu: context.mtu.min(resolved.mtu() as usize),
         })
+    }
+
+    /// Returns the router's route generation for endpoint-cache invalidation.
+    ///
+    /// Stateless routers can keep the default `0`. Routers with mutable route
+    /// or neighbor state should increment this value when cached endpoint
+    /// headers may have gone stale.
+    fn route_generation(&self) -> u64 {
+        0
     }
 }
 
@@ -244,6 +281,10 @@ impl XdpUdpRouter for XdpQueueLocalRouter {
         self.routes
             .snapshot()
             .resolve_l2_for_interface(dst, context.ifindex, context.mtu)
+    }
+
+    fn route_generation(&self) -> u64 {
+        self.routes.generation()
     }
 }
 
@@ -1361,7 +1402,7 @@ impl<D> XdpIpPacketSocket<D> {
                 let l2_len = ethernet_header_len(tx.egress);
                 let mut header = [0u8; VLAN_HEADER_LEN];
                 write_ethernet_header(&mut header[..l2_len], tx.egress);
-                let Some(frame) = tx.packet.prepare_l2(&header[..l2_len]) else {
+                let Some(frame) = tx.packet.prepare_tx_frame_with_header(&header[..l2_len]) else {
                     deferred_error =
                         Some(Error::Device(DeviceError::new(DeviceErrorKind::Backend)));
                     break;
@@ -1951,7 +1992,8 @@ where
                     break;
                 }
 
-                let Some(frame) = tx.packet.prepare_l2(resolved.l2_header()) else {
+                let Some(frame) = tx.packet.prepare_tx_frame_with_header(resolved.l2_header())
+                else {
                     if let Err(kind) = restore_prepared_xdp_udp_transmit_in_place(tx) {
                         deferred_error = Some(kind);
                         break;
@@ -2037,6 +2079,266 @@ where
         // next `allocate_tx_batch_inner` (and again at the top of the next
         // `send_udp_inner`); draining here would re-run the same threshold check
         // a few cycles earlier without changing which iteration actually drains.
+
+        if accepted == prepared
+            && let Some(kind) = deferred_error
+        {
+            return Err(SendError { accepted, kind });
+        }
+
+        Ok(accepted)
+    }
+
+    fn prepare_xdp_udp_endpoint(&self, spec: UdpEndpointSpec) -> Result<XdpUdpEndpoint, Error> {
+        let route_context = self.route_context();
+        let generation = self.router.route_generation();
+        let (cached, info) = build_xdp_udp_endpoint_cache(
+            &self.router,
+            self.local_addr,
+            self.ttl,
+            route_context,
+            generation,
+            &spec,
+        )?;
+        Ok(XdpUdpEndpoint {
+            spec,
+            info,
+            cached: Some(cached),
+        })
+    }
+
+    fn route_context(&self) -> XdpRouteContext {
+        XdpRouteContext {
+            ifindex: self.ip.config.ifindex,
+            queue: self.ip.config.queue_id,
+            mtu: self.ip.config.mtu,
+        }
+    }
+
+    fn refresh_udp_endpoint_cache(&self, endpoint: &mut XdpUdpEndpoint) -> Result<(), Error> {
+        let generation = self.router.route_generation();
+        if endpoint
+            .cached
+            .as_ref()
+            .is_some_and(|cached| cached.route_generation != generation)
+        {
+            endpoint.cached = None;
+        }
+
+        if endpoint.cached.is_none() {
+            let (cached, info) = build_xdp_udp_endpoint_cache(
+                &self.router,
+                self.local_addr,
+                self.ttl,
+                self.route_context(),
+                generation,
+                &endpoint.spec,
+            )?;
+            endpoint.info = info;
+            endpoint.cached = Some(cached);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn send_udp_endpoint_test(
+        &mut self,
+        endpoint: &mut XdpUdpEndpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<XdpPacketBuf>>],
+    ) -> Result<usize, SendError> {
+        if let Err(kind) = self.refresh_udp_endpoint_cache(endpoint) {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let mut accepted = 0;
+        let cache = endpoint
+            .cached
+            .as_mut()
+            .expect("endpoint cache was refreshed before send");
+
+        for slot in batch.iter_mut() {
+            let Some(tx_ref) = slot.as_ref() else {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidBatch,
+                });
+            };
+            if let Err(kind) =
+                update_xdp_udp_endpoint_header(cache, endpoint.info, tx_ref.packet.len())
+            {
+                return Err(SendError { accepted, kind });
+            }
+
+            if self.ip.pending_tx_frames.len() >= MAX_PENDING_TX_FRAMES {
+                return Ok(accepted);
+            }
+
+            let Some(mut tx) = slot.take() else {
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidBatch,
+                });
+            };
+
+            if tx.packet.prepend(&cache.header).is_err() {
+                *slot = TxSlot::Ready(tx);
+                return Err(SendError {
+                    accepted,
+                    kind: Error::InvalidPacket,
+                });
+            }
+
+            let packet_len = tx.packet.len();
+            self.ip.stats.tx_packets = self.ip.stats.tx_packets.saturating_add(1);
+            self.ip.stats.tx_bytes = self
+                .ip
+                .stats
+                .tx_bytes
+                .saturating_add((packet_len - cache.l2_len) as u64);
+            self.ip.pending_tx_frames.push_back(tx.packet);
+            accepted += 1;
+        }
+
+        Ok(accepted)
+    }
+
+    fn send_udp_endpoint_inner(
+        &mut self,
+        endpoint: &mut XdpUdpEndpoint,
+        batch: &mut [TxSlot<UdpEndpointTransmit<XdpPacketBuf>>],
+    ) -> Result<usize, SendError> {
+        if let Err(kind) = self.refresh_udp_endpoint_cache(endpoint) {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        if let Err(kind) = self.ip.drain_completions_if_tx_pressure() {
+            return Err(SendError { accepted: 0, kind });
+        }
+
+        let mut tx_available = self
+            .ip
+            .live
+            .as_mut()
+            .expect("send_udp_endpoint_inner called only for live socket")
+            .raw
+            .tx_available() as usize;
+        if tx_available == 0 {
+            self.ip.stats.ring_full = self.ip.stats.ring_full.saturating_add(1);
+            if let Err(kind) = self.ip.drain_tx_completions_inner() {
+                return Err(SendError { accepted: 0, kind });
+            }
+            tx_available = self
+                .ip
+                .live
+                .as_mut()
+                .expect("send_udp_endpoint_inner called only for live socket")
+                .raw
+                .tx_available() as usize;
+            if tx_available == 0 {
+                return Ok(0);
+            }
+        }
+
+        let mut deferred_error = None;
+        let accepted;
+        let prepared;
+        let mut tx_bytes = 0u64;
+        let mut wake_error = None;
+
+        {
+            let cache = endpoint
+                .cached
+                .as_mut()
+                .expect("endpoint cache was refreshed before send");
+            let live = self
+                .ip
+                .live
+                .as_mut()
+                .expect("send_udp_endpoint_inner called only for live socket");
+            live.tx_descs.clear();
+
+            let limit = batch.len().min(tx_available);
+            for slot in batch.iter_mut().take(limit) {
+                let Some(tx) = slot.as_mut() else {
+                    deferred_error = Some(Error::InvalidBatch);
+                    break;
+                };
+                if let Err(kind) =
+                    update_xdp_udp_endpoint_header(cache, endpoint.info, tx.packet.len())
+                {
+                    deferred_error = Some(kind);
+                    break;
+                }
+
+                let Some(frame) = tx.packet.prepare_tx_frame_with_header(&cache.header) else {
+                    deferred_error =
+                        Some(Error::Device(DeviceError::new(DeviceErrorKind::Backend)));
+                    break;
+                };
+
+                tx_bytes = tx_bytes
+                    .saturating_add((tx.packet.len() + cache.header.len() - cache.l2_len) as u64);
+                live.tx_descs.push(XdpDesc {
+                    addr: frame.desc_addr,
+                    len: frame.len,
+                    options: 0,
+                });
+            }
+
+            prepared = live.tx_descs.len();
+            if prepared == 0 {
+                if let Some(kind) = deferred_error {
+                    return Err(SendError { accepted: 0, kind });
+                }
+                return Ok(0);
+            }
+
+            accepted = live.raw.enqueue_tx_batch(&live.tx_descs[..prepared]);
+            assert_eq!(
+                accepted, prepared,
+                "AF_XDP TX ring accepted fewer descriptors than reserved",
+            );
+            if accepted > 0 {
+                live.raw.commit_tx();
+                live.tx_in_flight = live.tx_in_flight.saturating_add(accepted);
+                live.tx_since_completion_drain =
+                    live.tx_since_completion_drain.saturating_add(accepted);
+            }
+
+            for slot in batch.iter_mut().take(accepted) {
+                match slot {
+                    TxSlot::Ready(tx) => tx.packet.mark_submitted(),
+                    TxSlot::Taken => {
+                        unreachable!("accepted UDP endpoint TX slot was already taken")
+                    }
+                }
+                *slot = TxSlot::Taken;
+            }
+
+            let needs_wake = live.tx_wake_pending || (accepted > 0 && live.raw.tx_needs_wakeup());
+            if needs_wake {
+                match live.raw.wake_tx() {
+                    Ok(()) => live.tx_wake_pending = false,
+                    Err(error) => {
+                        live.tx_wake_pending = true;
+                        wake_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        if accepted > 0 {
+            self.ip.stats.tx_packets = self.ip.stats.tx_packets.saturating_add(accepted as u64);
+            self.ip.stats.tx_bytes = self.ip.stats.tx_bytes.saturating_add(tx_bytes);
+        }
+
+        if let Some(error) = wake_error {
+            return Err(SendError {
+                accepted,
+                kind: device_error(error),
+            });
+        }
 
         if accepted == prepared
             && let Some(kind) = deferred_error
@@ -2191,7 +2493,7 @@ where
     type TxBufferMut = XdpPacketBufMut;
     type Driver = D;
     type RecvMeta = UdpRecvMeta;
-    type Endpoint = GenericUdpEndpoint;
+    type Endpoint = XdpUdpEndpoint;
 
     fn socket_id(&self) -> SocketId {
         IpPacketSocket::socket_id(&self.ip)
@@ -2242,7 +2544,7 @@ where
     }
 
     fn prepare_udp_endpoint(&mut self, spec: UdpEndpointSpec) -> Result<Self::Endpoint, Error> {
-        prepare_generic_udp_endpoint(self, spec)
+        self.prepare_xdp_udp_endpoint(spec)
     }
 
     fn udp_endpoint_spec<'a>(&self, endpoint: &'a Self::Endpoint) -> &'a UdpEndpointSpec {
@@ -2258,7 +2560,11 @@ where
         endpoint: &mut Self::Endpoint,
         batch: &mut [TxSlot<UdpEndpointTransmit<fast_socket_rs::UdpTxBuffer<Self>>>],
     ) -> Result<usize, SendError> {
-        send_generic_udp_endpoint(self, endpoint, batch)
+        #[cfg(test)]
+        if self.ip.live.is_none() {
+            return self.send_udp_endpoint_test(endpoint, batch);
+        }
+        self.send_udp_endpoint_inner(endpoint, batch)
     }
 
     /// Receives UDP datagrams into `out`.
@@ -2536,6 +2842,133 @@ struct Ipv4UdpHeaderFields {
     udp_len: u16,
     ttl: u8,
     ecn: Option<fast_socket_rs::EcnCodepoint>,
+}
+
+fn build_xdp_udp_endpoint_cache<R>(
+    router: &R,
+    local_addr: SocketAddrV4,
+    ttl: u8,
+    route_context: XdpRouteContext,
+    route_generation: u64,
+    spec: &UdpEndpointSpec,
+) -> Result<(XdpUdpEndpointCache, UdpEndpointInfo), Error>
+where
+    R: XdpUdpRouter,
+{
+    let SocketAddr::V4(destination) = spec.destination else {
+        return Err(Error::InvalidPacket);
+    };
+    let source_ip = match spec.source_ip {
+        Some(IpAddr::V4(addr)) => addr,
+        Some(IpAddr::V6(_)) => return Err(Error::InvalidPacket),
+        None => *local_addr.ip(),
+    };
+    if spec.gso_segment_size.is_some() {
+        return Err(Error::InvalidPacket);
+    }
+
+    let resolved = router
+        .resolve_udp_l2(*destination.ip(), route_context)
+        .ok_or(Error::NoEgressRoute)?;
+    let Some(max_payload_len) = resolved
+        .ip_mtu()
+        .checked_sub(IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN)
+    else {
+        return Err(Error::InvalidPacket);
+    };
+
+    let header_payload_len = spec.payload_len.unwrap_or(0);
+    validate_xdp_udp_endpoint_payload(
+        UdpEndpointInfo {
+            mtu: max_payload_len,
+            payload_len: spec.payload_len,
+            gso_segment_size: None,
+        },
+        header_payload_len,
+    )?;
+
+    let udp_len = header_payload_len + UDP_HEADER_LEN;
+    let total_len = udp_len + IPV4_MIN_HEADER_LEN;
+    if total_len > u16::MAX as usize {
+        return Err(Error::OversizeForMtu);
+    }
+
+    let l2_header = resolved.l2_header();
+    let mut header = Vec::with_capacity(l2_header.len() + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN);
+    header.extend_from_slice(l2_header);
+    let l2_len = header.len();
+    let mut ip_udp = [0u8; IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN];
+    write_ipv4_udp_headers(
+        &mut ip_udp,
+        Ipv4UdpHeaderFields {
+            source_port: spec.source_port.unwrap_or_else(|| local_addr.port()),
+            destination_port: destination.port(),
+            source: source_ip,
+            destination: *destination.ip(),
+            total_len: total_len as u16,
+            udp_len: udp_len as u16,
+            ttl,
+            ecn: spec.ecn,
+        },
+    );
+    header.extend_from_slice(&ip_udp);
+
+    let info = UdpEndpointInfo {
+        mtu: max_payload_len,
+        payload_len: spec.payload_len,
+        gso_segment_size: None,
+    };
+    Ok((
+        XdpUdpEndpointCache {
+            route_generation,
+            header,
+            l2_len,
+        },
+        info,
+    ))
+}
+
+fn update_xdp_udp_endpoint_header(
+    cache: &mut XdpUdpEndpointCache,
+    info: UdpEndpointInfo,
+    payload_len: usize,
+) -> Result<(), Error> {
+    validate_xdp_udp_endpoint_payload(info, payload_len)?;
+    if info.payload_len.is_some() {
+        return Ok(());
+    }
+
+    let udp_len = payload_len + UDP_HEADER_LEN;
+    let total_len = udp_len + IPV4_MIN_HEADER_LEN;
+    if total_len > u16::MAX as usize {
+        return Err(Error::OversizeForMtu);
+    }
+
+    let ip_start = cache.l2_len;
+    cache.header[ip_start + 2..ip_start + 4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    cache.header[ip_start + 10..ip_start + 12].copy_from_slice(&0u16.to_be_bytes());
+    cache.header[ip_start + 24..ip_start + 26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    let checksum = ipv4_header_checksum(&cache.header[ip_start..ip_start + IPV4_MIN_HEADER_LEN]);
+    cache.header[ip_start + 10..ip_start + 12].copy_from_slice(&checksum.to_be_bytes());
+    Ok(())
+}
+
+fn validate_xdp_udp_endpoint_payload(
+    info: UdpEndpointInfo,
+    payload_len: usize,
+) -> Result<(), Error> {
+    if let Some(expected) = info.payload_len
+        && payload_len != expected
+    {
+        return Err(Error::InvalidPacket);
+    }
+    if payload_len > info.mtu {
+        return Err(Error::OversizeForMtu);
+    }
+    if payload_len > u16::MAX as usize - IPV4_MIN_HEADER_LEN - UDP_HEADER_LEN {
+        return Err(Error::OversizeForMtu);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3161,8 +3594,8 @@ mod tests {
     use std::rc::Rc;
 
     use fast_socket_rs::{
-        BufferLayout, Error, HugePageSize, IpPacketSocket, LinkAddr, PacketBufferMut, UdpSocket,
-        UdpTransmit,
+        BufferLayout, Error, HugePageSize, IpPacketSocket, LinkAddr, PacketBufferMut,
+        UdpEndpointSpec, UdpEndpointTransmit, UdpSocket, UdpTransmit,
     };
 
     use super::*;
@@ -3494,6 +3927,185 @@ mod tests {
         assert_eq!(u16::from_be_bytes([ip[22], ip[23]]), remote.port());
         assert_eq!(usize::from(u16::from_be_bytes([ip[24], ip[25]])), 13);
         assert_eq!(&ip[28..], b"hello");
+    }
+
+    #[test]
+    fn xdp_udp_endpoint_sends_cached_ipv4_udp_ethernet_header() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                Ipv4Addr::new(192, 0, 2, 1),
+                egress().dst_mac,
+                egress().src_mac,
+            ))
+            .open_busy_poll_test();
+        let spec = UdpEndpointSpec {
+            destination: remote.into(),
+            payload_len: Some(5),
+            ..UdpEndpointSpec::new(remote.into())
+        };
+        let mut endpoint = socket.prepare_udp_endpoint(spec).unwrap();
+        let cached = endpoint
+            .cached
+            .as_ref()
+            .expect("prepared endpoint caches header");
+        assert_eq!(
+            cached.header.len(),
+            ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN
+        );
+
+        let mut packet = allocate_udp_tx(&mut socket);
+        packet.extend_from_slice(b"hello").unwrap();
+        let mut batch = [TxSlot::Ready(UdpEndpointTransmit::new(packet.freeze()))];
+
+        assert_eq!(
+            socket
+                .send_to_udp_endpoint(&mut endpoint, &mut batch)
+                .unwrap(),
+            1
+        );
+        assert!(batch[0].is_taken());
+
+        let frame = socket.ip.pending_tx_frame(0).unwrap();
+        assert_eq!(&frame[..6], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&frame[6..12], &[6, 5, 4, 3, 2, 1]);
+        assert_eq!(&frame[12..14], &ETHERTYPE_IPV4.to_be_bytes());
+        let ip = &frame[ETHERNET_HEADER_LEN..];
+        assert_eq!(usize::from(u16::from_be_bytes([ip[2], ip[3]])), 33);
+        assert_eq!(ipv4_header_checksum(&ip[..IPV4_MIN_HEADER_LEN]), 0);
+        assert_eq!(usize::from(u16::from_be_bytes([ip[24], ip[25]])), 13);
+        assert_eq!(&ip[28..], b"hello");
+    }
+
+    #[test]
+    fn xdp_udp_endpoint_patches_variable_lengths_and_checksum() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                Ipv4Addr::new(192, 0, 2, 1),
+                egress().dst_mac,
+                egress().src_mac,
+            ))
+            .open_busy_poll_test();
+        let mut endpoint = socket
+            .prepare_udp_endpoint(UdpEndpointSpec::new(remote.into()))
+            .unwrap();
+
+        let mut first = allocate_udp_tx(&mut socket);
+        first.extend_from_slice(b"a").unwrap();
+        let mut second = allocate_udp_tx(&mut socket);
+        second.extend_from_slice(b"hello").unwrap();
+        let mut batch = [
+            TxSlot::Ready(UdpEndpointTransmit::new(first.freeze())),
+            TxSlot::Ready(UdpEndpointTransmit::new(second.freeze())),
+        ];
+
+        assert_eq!(
+            socket
+                .send_to_udp_endpoint(&mut endpoint, &mut batch)
+                .unwrap(),
+            2
+        );
+
+        let first = socket.ip.pending_tx_frame(0).unwrap();
+        let first_ip = &first[ETHERNET_HEADER_LEN..];
+        assert_eq!(
+            usize::from(u16::from_be_bytes([first_ip[2], first_ip[3]])),
+            29
+        );
+        assert_eq!(ipv4_header_checksum(&first_ip[..IPV4_MIN_HEADER_LEN]), 0);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([first_ip[24], first_ip[25]])),
+            9
+        );
+        assert_eq!(&first_ip[28..], b"a");
+
+        let second = socket.ip.pending_tx_frame(1).unwrap();
+        let second_ip = &second[ETHERNET_HEADER_LEN..];
+        assert_eq!(
+            usize::from(u16::from_be_bytes([second_ip[2], second_ip[3]])),
+            33
+        );
+        assert_eq!(ipv4_header_checksum(&second_ip[..IPV4_MIN_HEADER_LEN]), 0);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([second_ip[24], second_ip[25]])),
+            13
+        );
+        assert_eq!(&second_ip[28..], b"hello");
+    }
+
+    #[test]
+    fn xdp_udp_endpoint_rebuilds_cached_header_after_route_update() {
+        let local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 9000);
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 20), 9001);
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let old_dst = mac(0x11);
+        let old_src = mac(0x22);
+        let new_dst = mac(0x33);
+        let new_src = mac(0x44);
+        let mut socket = XdpUdpSocket::builder(IfIndex::new(1), QueueId::new(0), local)
+            .route_snapshot(route_snapshot_for_gateway(
+                IfIndex::new(1),
+                QueueId::new(0),
+                gateway,
+                old_dst,
+                old_src,
+            ))
+            .open_busy_poll_test();
+        let mut endpoint = socket
+            .prepare_udp_endpoint(UdpEndpointSpec {
+                destination: remote.into(),
+                payload_len: Some(5),
+                ..UdpEndpointSpec::new(remote.into())
+            })
+            .unwrap();
+        assert_eq!(
+            endpoint
+                .cached
+                .as_ref()
+                .expect("cached header")
+                .route_generation,
+            0
+        );
+
+        socket.routes_mut().push_update(route_snapshot_for_gateway(
+            IfIndex::new(1),
+            QueueId::new(0),
+            gateway,
+            new_dst,
+            new_src,
+        ));
+        assert_eq!(socket.apply_route_updates(), 1);
+        assert_eq!(socket.routes().generation(), 1);
+
+        let mut packet = allocate_udp_tx(&mut socket);
+        packet.extend_from_slice(b"hello").unwrap();
+        let mut batch = [TxSlot::Ready(UdpEndpointTransmit::new(packet.freeze()))];
+
+        assert_eq!(
+            socket
+                .send_to_udp_endpoint(&mut endpoint, &mut batch)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            endpoint
+                .cached
+                .as_ref()
+                .expect("refreshed header")
+                .route_generation,
+            1
+        );
+
+        let frame = socket.ip.pending_tx_frame(0).unwrap();
+        assert_eq!(&frame[..6], &new_dst.octets());
+        assert_eq!(&frame[6..12], &new_src.octets());
     }
 
     #[test]

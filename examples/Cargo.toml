@@ -47,5 +47,5 @@ name = "udp-tokio-proxy"
 path = "src/bin/udp-tokio-proxy.rs"
 
 [[bin]]
-name = "udp-xdp-static-route-blast"
-path = "src/bin/udp-xdp-static-route-blast.rs"
+name = "endpoint-blast"
+path = "src/bin/endpoint-blast.rs"
