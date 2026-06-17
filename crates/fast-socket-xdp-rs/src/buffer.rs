@@ -302,6 +302,37 @@ unsafe fn write_be_u16(ptr: *mut u8, value: u16) {
 }
 
 #[inline(always)]
+unsafe fn copy_endpoint_header(src: *const u8, dst: *mut u8, len: usize) {
+    if len == 42 {
+        // SAFETY: caller guarantees 42 readable source bytes, 42 writable
+        // destination bytes, and no overlap. Unaligned word copies avoid a
+        // per-packet libc memcpy call for the common Ethernet+IPv4+UDP header.
+        unsafe {
+            copy_endpoint_header_word(src, dst, 0);
+            copy_endpoint_header_word(src, dst, 8);
+            copy_endpoint_header_word(src, dst, 16);
+            copy_endpoint_header_word(src, dst, 24);
+            copy_endpoint_header_word(src, dst, 32);
+            let tail = ptr::read_unaligned(src.add(40).cast::<u16>());
+            ptr::write_unaligned(dst.add(40).cast::<u16>(), tail);
+        }
+    } else {
+        // SAFETY: forwarded from this function's caller.
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_endpoint_header_word(src: *const u8, dst: *mut u8, offset: usize) {
+    // SAFETY: caller guarantees the 8-byte range at `offset` is readable and
+    // writable. Alignment is intentionally not required.
+    unsafe {
+        let word = ptr::read_unaligned(src.add(offset).cast::<u64>());
+        ptr::write_unaligned(dst.add(offset).cast::<u64>(), word);
+    }
+}
+
+#[inline(always)]
 fn ipv4_checksum_replace_word(checksum: u16, old: u16, new: u16) -> u16 {
     let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
     sum = (sum & 0xffff) + (sum >> 16);
@@ -861,7 +892,7 @@ impl XdpTxPool {
                     Err(Error::OversizeForMtu)
                 } else {
                     let header_dst = frame.add(header_start);
-                    ptr::copy_nonoverlapping(header.as_ptr(), header_dst, header_len);
+                    copy_endpoint_header(header.as_ptr(), header_dst, header_len);
                     header_patch.patch(header_dst, payload_len);
                     Ok(payload_len)
                 }

@@ -6,7 +6,7 @@ generated payload buffers through that endpoint as fast as the XDP workers
 accept them.
 
 This example basically demonstrates the most efficient way to generate packets
-using the library. Initial tests generated about 70M PPS on a single CPU core.
+using the library. Initial tests generated about 80M PPS on a single CPU core.
 When using an `Endpoint`, we can precompute the L2+IP+UDP header only needing to
 adjust checksums during header generation. The header generation then translates
 mainly into a memcpy.
