@@ -833,9 +833,20 @@ impl XdpTxPool {
         if free.len() < max {
             drain_remote(&live.reclaim.remote, free);
         }
-        let count = max.min(free.len());
-        for _ in 0..count {
-            let frame_addr = free.pop().expect("count is bounded by free.len()");
+        let free_len = free.len();
+        let count = max.min(free_len);
+        let retain_len = free_len - count;
+        // SAFETY: `free_len` is within the allocation; the loop decrements
+        // before reading, so it reads exactly `count` initialized tail entries
+        // in the same order as repeated `Vec::pop`.
+        let mut frame_cursor = unsafe { free.as_ptr().add(free_len) };
+        while written < count {
+            // SAFETY: `written < count <= free_len`; see `frame_cursor`
+            // construction above.
+            let frame_addr = unsafe {
+                frame_cursor = frame_cursor.sub(1);
+                *frame_cursor
+            };
             // SAFETY: frame addresses come from this pool's live reclaim list,
             // and bounds above prove the header and payload-capacity slices fit.
             let payload_len = match unsafe {
@@ -857,13 +868,6 @@ impl XdpTxPool {
             } {
                 Ok(payload_len) => payload_len,
                 Err(error) => {
-                    reclaim_failed_endpoint_batch(
-                        free,
-                        desc_out,
-                        written,
-                        header_start,
-                        frame_addr,
-                    );
                     return Err(error);
                 }
             };
@@ -880,6 +884,11 @@ impl XdpTxPool {
                 });
             }
             written += 1;
+        }
+        // SAFETY: the loop initialized descriptors for exactly the frames in
+        // `free[retain_len..free_len]`, so those frames are now owned by TX.
+        unsafe {
+            free.set_len(retain_len);
         }
         // SAFETY: exactly `written` tail elements were initialized above.
         unsafe {
@@ -899,24 +908,6 @@ impl XdpTxPool {
             let frame_addr = desc_addr - (desc_addr % frame_size);
             live.reclaim.push_local(frame_addr);
         }
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn reclaim_failed_endpoint_batch(
-    free: &mut Vec<u64>,
-    desc_out: *mut XdpDesc,
-    written: usize,
-    header_start: usize,
-    frame_addr: u64,
-) {
-    free.push(frame_addr);
-    for index in 0..written {
-        // SAFETY: exactly `written` descriptor slots before this point have
-        // been initialized.
-        let desc = unsafe { *desc_out.add(index) };
-        free.push(desc.addr - header_start as u64);
     }
 }
 
