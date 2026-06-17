@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -125,10 +126,53 @@ pub fn dynamic_source_port() -> u16 {
     FIRST_DYNAMIC_PORT + (std::process::id() % range) as u16
 }
 
+#[inline(always)]
 pub fn write_sequence(payload: &mut [u8], sequence: u64) {
+    if payload.len() >= std::mem::size_of::<u64>() {
+        // SAFETY: the length check above proves that eight writable bytes are
+        // available.
+        unsafe { write_sequence_at_least_8(payload, sequence) };
+    } else {
+        write_sequence_short(payload, sequence);
+    }
+}
+
+#[inline(always)]
+unsafe fn write_sequence_at_least_8(payload: &mut [u8], sequence: u64) {
+    debug_assert!(payload.len() >= std::mem::size_of::<u64>());
+    // SAFETY: guaranteed by the caller; unaligned stores are fine for packet payloads.
+    unsafe {
+        ptr::write_unaligned(payload.as_mut_ptr().cast::<u64>(), sequence.to_be());
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn write_sequence_short(payload: &mut [u8], sequence: u64) {
     let bytes = sequence.to_be_bytes();
-    let len = payload.len().min(bytes.len());
-    payload[..len].copy_from_slice(&bytes[..len]);
+    for (dst, src) in payload.iter_mut().zip(bytes) {
+        *dst = src;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_sequence;
+
+    #[test]
+    fn write_sequence_writes_big_endian_prefix() {
+        let sequence = 0x0102_0304_0506_0708u64;
+        let expected = sequence.to_be_bytes();
+
+        for len in 0..=10 {
+            let mut payload = [0xff; 10];
+            write_sequence(&mut payload[..len], sequence);
+            assert_eq!(&payload[..len.min(8)], &expected[..len.min(8)]);
+            if len > 8 {
+                assert_eq!(&payload[8..len], &[0xff; 2][..len - 8]);
+            }
+        }
+    }
 }
 
 static SHUTDOWN_SIGNALS: AtomicUsize = AtomicUsize::new(0);

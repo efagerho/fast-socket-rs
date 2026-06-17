@@ -5,11 +5,13 @@ prepares a socket-specific endpoint for the configured target, then sends
 generated payload buffers through that endpoint as fast as the XDP workers
 accept them.
 
-This example basically demonstrates the most efficient way to generate packets
-using the library. Initial tests generated about 80M PPS on a single CPU core.
-When using an `Endpoint`, we can precompute the L2+IP+UDP header only needing to
-adjust checksums during header generation. The header generation then translates
-mainly into a memcpy.
+This example demonstrates the fastest packet-generation path currently exposed
+by the library. Recent single-worker runs on this host generate about 81M PPS.
+When using an `Endpoint`, the XDP backend caches a contiguous L2+IPv4+UDP header
+template for the remote peer. The hot path copies that cached header into each TX
+frame, then patches the length-dependent IPv4 and UDP fields. The common
+Ethernet+IPv4+UDP header is copied with a small fixed-size word-copy path, with a
+generic memcpy fallback for other header sizes.
 
 Note that AF_XDP sockets don't currently expose checksum offloads from the NIC,
 so the `Endpoint` implementation has to calculate the checksums on the CPU.
@@ -49,7 +51,9 @@ let mut aggregate = plan.open_udp_busy_poll(local)?;
 
 Before entering the transmit loop, the worker prepares one endpoint per member
 socket. The fixed `payload_len` lets the XDP backend cache the complete
-L2+IPv4+UDP header shape for that packet size:
+L2+IPv4+UDP header shape for that packet size. Endpoints without a fixed payload
+length still use the same cached header template, but patch the IPv4 total
+length, IPv4 checksum, and UDP length for each returned payload length:
 
 ```rust,ignore
 let mut endpoints = Vec::with_capacity(aggregate.len());
@@ -63,10 +67,10 @@ for socket in aggregate.members_mut() {
 
 ## Transmit Loop
 
-The inner loop uses the XDP endpoint batch builder. The builder writes the
-cached endpoint header and caller-provided payloads directly into UMEM-backed TX
-frames, so the example does not allocate `UdpEndpointTransmit` slots for each
-packet.
+The inner loop uses the direct XDP endpoint batch builder. The builder writes
+the cached endpoint header and caller-provided payloads directly into
+UMEM-backed TX frames, so the example does not allocate `UdpEndpointTransmit`
+slots for each packet.
 
 ```rust,ignore
 // SAFETY: the callback writes exactly `payload_bytes.len()` bytes into the
@@ -88,13 +92,21 @@ let accepted = unsafe {
 The callback runs once for each TX frame that the socket can reserve, up to the
 requested batch size. Each slice is the endpoint's maximum UDP payload size, and
 the returned length selects how many bytes become part of that packet. The slice
-is not cleared before the callback runs.
+is not cleared before the callback runs, which is why `send` is unsafe: the
+callback must initialize every byte in `payload[..returned_len]`. The example
+copies a reusable payload template and writes the sequence prefix with the shared
+benchmark helper, which uses a direct big-endian word store for payloads of at
+least eight bytes.
 
 ```rust,ignore
 if accepted == 0 {
     socket.drain_tx_completions()?;
 }
 ```
+
+Workers drain TX completions after `--drain-every-batches` accepted batches and
+also when the socket makes no progress. Progress counters and shutdown checks
+are amortized across many batches so they do not dominate the hot packet loop.
 
 The XDP backend refreshes the cached endpoint header if the route table changes,
 so the hot path gets the prepared header copy while route updates still take
