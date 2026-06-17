@@ -1,4 +1,4 @@
-# Example Binaries
+# Example Programs
 
 The `examples` package contains small binaries that exercise the core UDP
 socket traits through OS sockets, AF_XDP sockets, and the Tokio actor adapter.

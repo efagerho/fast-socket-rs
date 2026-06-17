@@ -7,8 +7,9 @@
 
 # Examples
 
-- [Sockets and Workers](./sockets-and-workers.md)
-- [Example Binaries](./examples/index.md)
+- [XDP Backend Setup](./xdp-backend-setup.md)
+- [OS Backend Setup](./os-backend-setup.md)
+- [Example Programs](./examples/index.md)
   - [udp-discard](./examples/udp-discard.md)
   - [udp-echo](./examples/udp-echo.md)
   - [udp-pong](./examples/udp-pong.md)

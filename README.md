@@ -62,8 +62,8 @@ Start with:
 
 - `docs/src/core-design.md` for the ownership and batching model;
 - `docs/src/core-traits.md` for the current public trait surface;
-- `docs/src/sockets-and-workers.md` for socket construction, worker loops,
-  pinning, and override points;
+- `docs/src/xdp-backend-setup.md` for common AF_XDP factory deployment shapes;
+- `docs/src/os-backend-setup.md` for common OS socket deployment shapes;
 - `docs/src/examples/index.md` for the runnable example binaries.
 
 ## License

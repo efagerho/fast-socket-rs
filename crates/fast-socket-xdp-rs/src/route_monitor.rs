@@ -121,19 +121,6 @@ impl XdpRouteMonitor {
         Arc::strong_count(&self.shared).saturating_sub(1)
     }
 
-    /// Starts a placeholder monitor thread. Real netlink polling is wired in a
-    /// later pass; the fanout shape is fixed here so queues need only one
-    /// monitor source.
-    pub fn start(self, initial: RouteSnapshot) -> JoinHandle<Self> {
-        thread::Builder::new()
-            .name("fastsock-xdp-route-monitor".to_string())
-            .spawn(move || {
-                let _ = self.publish(initial);
-                self
-            })
-            .expect("route monitor thread starts")
-    }
-
     /// Starts one netlink snapshot-refresh thread and fans each snapshot out to
     /// all registered queues.
     ///
