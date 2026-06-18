@@ -26,7 +26,8 @@ pub use affinity::{
 pub use batch::{RecvBatch, SendError, TxSlot};
 pub use buffer::{
     BufferAccessError, BufferCapabilities, BufferLayout, OwnedPacketBuffer, PacketBuffer,
-    PacketBufferMut, QueueBufferConfig, ReserveError, ScatterGather, Segment, Segments,
+    PacketBufferMut, QueueBufferConfig, ReserveError, ScatterGather, Segment, SegmentMut, Segments,
+    SegmentsMut,
 };
 pub use device::{Capabilities, RawDevice, RawDeviceStats};
 pub use error::{DeviceError, DeviceErrorKind, Error};

@@ -43,7 +43,7 @@ use std::thread::{self, ThreadId};
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
     BufferAccessError, BufferLayout, Error, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
-    ReserveError, Segment,
+    ReserveError, Segment, SegmentMut,
 };
 
 use crate::ring::XdpDesc;
@@ -205,6 +205,39 @@ impl<'a> Iterator for XdpSegments<'a> {
 }
 
 impl ExactSizeIterator for XdpSegments<'_> {}
+
+/// Iterator over mutable XDP packet segments.
+#[derive(Debug)]
+pub struct XdpSegmentsMut<'a> {
+    segment: Option<&'a mut [u8]>,
+}
+
+impl<'a> XdpSegmentsMut<'a> {
+    fn one(segment: &'a mut [u8]) -> Self {
+        Self {
+            segment: Some(segment),
+        }
+    }
+
+    fn empty() -> Self {
+        Self { segment: None }
+    }
+}
+
+impl<'a> Iterator for XdpSegmentsMut<'a> {
+    type Item = SegmentMut<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.segment.take()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = usize::from(self.segment.is_some());
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for XdpSegmentsMut<'_> {}
 
 #[derive(Debug)]
 struct HeapReclaim {
@@ -1453,6 +1486,14 @@ impl PacketBuffer for XdpPacketBufMut {
         }
     }
 
+    fn first_segment(&self) -> Option<Segment<'_>> {
+        (!self.is_empty()).then_some(self.as_slice())
+    }
+
+    fn contiguous(&self) -> Option<&[u8]> {
+        Some(self.as_slice())
+    }
+
     fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
         read_contiguous(self.as_slice(), offset, dst)
     }
@@ -1488,6 +1529,14 @@ impl PacketBuffer for XdpPacketBuf {
         }
     }
 
+    fn first_segment(&self) -> Option<Segment<'_>> {
+        (!self.is_empty()).then_some(self.as_slice())
+    }
+
+    fn contiguous(&self) -> Option<&[u8]> {
+        Some(self.as_slice())
+    }
+
     fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError> {
         read_contiguous(self.as_slice(), offset, dst)
     }
@@ -1495,6 +1544,23 @@ impl PacketBuffer for XdpPacketBuf {
 
 impl PacketBufferMut for XdpPacketBufMut {
     type Frozen = XdpPacketBuf;
+    type SegmentsMut<'a> = XdpSegmentsMut<'a>;
+
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_> {
+        if self.is_empty() {
+            XdpSegmentsMut::empty()
+        } else {
+            XdpSegmentsMut::one(self.as_mut_slice())
+        }
+    }
+
+    fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>> {
+        (!self.is_empty()).then_some(self.as_mut_slice())
+    }
+
+    fn contiguous_mut(&mut self) -> Option<&mut [u8]> {
+        Some(self.as_mut_slice())
+    }
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
         prepend_to_inner(&mut self.inner, bytes)

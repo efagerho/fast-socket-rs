@@ -13,8 +13,8 @@ each trait's shape is easy to scan.
 ### `PacketBuffer`
 
 `PacketBuffer` is the immutable view of owned packet bytes. It exposes the
-packet length, headroom, tailroom, allocation layout, segment iterator, and safe
-read operations.
+packet length, headroom, tailroom, allocation layout, borrowed segment views,
+and safe read operations.
 
 It exists so packet-processing code can inspect packet data without caring
 whether the bytes live in a heap buffer, a DMA chunk, a single contiguous slice,
@@ -32,6 +32,8 @@ pub trait PacketBuffer {
     fn tailroom(&self) -> usize;
     fn layout(&self) -> &BufferLayout;
     fn segments(&self) -> Self::Segments<'_>;
+    fn first_segment(&self) -> Option<Segment<'_>>;
+    fn contiguous(&self) -> Option<&[u8]>;
     fn read_at_exact(
         &self,
         offset: usize,
@@ -53,6 +55,14 @@ decides how that maps onto its memory layout.
 ```rust,ignore
 pub trait PacketBufferMut: PacketBuffer {
     type Frozen: PacketBuffer;
+
+    type SegmentsMut<'a>: Iterator<Item = SegmentMut<'a>>
+    where
+        Self: 'a;
+
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_>;
+    fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>>;
+    fn contiguous_mut(&mut self) -> Option<&mut [u8]>;
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;
     fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;

@@ -6,10 +6,18 @@ use core::num::NonZeroUsize;
 /// A borrowed packet segment.
 pub type Segment<'a> = &'a [u8];
 
+/// A mutable borrowed packet segment.
+pub type SegmentMut<'a> = &'a mut [u8];
+
 /// Iterator over packet segments in packet-byte order.
 ///
 /// This alias is useful for single-segment packet buffers.
 pub type Segments<'a> = core::option::IntoIter<Segment<'a>>;
+
+/// Iterator over mutable packet segments in packet-byte order.
+///
+/// This alias is useful for single-segment packet buffers.
+pub type SegmentsMut<'a> = core::option::IntoIter<SegmentMut<'a>>;
 
 /// Borrowed scatter-gather view over packet segments.
 #[derive(Clone, Copy, Debug)]
@@ -412,6 +420,21 @@ pub trait PacketBuffer {
     /// Iterates packet segments in packet-byte order.
     fn segments(&self) -> Self::Segments<'_>;
 
+    /// Returns the first packet segment, if the packet has any bytes.
+    fn first_segment(&self) -> Option<Segment<'_>> {
+        self.segments().next()
+    }
+
+    /// Returns the packet as one contiguous borrowed slice when available.
+    fn contiguous(&self) -> Option<&[u8]> {
+        if self.is_empty() {
+            return Some(&[]);
+        }
+
+        let first = self.first_segment()?;
+        (first.len() == self.len()).then_some(first)
+    }
+
     /// Reads exactly `dst.len()` bytes at `offset` across packet segments.
     fn read_at_exact(&self, offset: usize, dst: &mut [u8]) -> Result<(), BufferAccessError>;
 }
@@ -420,6 +443,30 @@ pub trait PacketBuffer {
 pub trait PacketBufferMut: PacketBuffer {
     /// Immutable buffer type produced by freezing this buffer.
     type Frozen: PacketBuffer;
+
+    /// Mutable segment iterator type returned by this buffer.
+    type SegmentsMut<'a>: Iterator<Item = SegmentMut<'a>>
+    where
+        Self: 'a;
+
+    /// Iterates mutable packet segments in packet-byte order.
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_>;
+
+    /// Returns the first mutable packet segment, if the packet has any bytes.
+    fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>> {
+        self.segments_mut().next()
+    }
+
+    /// Returns the packet as one contiguous mutable borrowed slice when available.
+    fn contiguous_mut(&mut self) -> Option<&mut [u8]> {
+        let len = self.len();
+        if len == 0 {
+            return Some(&mut []);
+        }
+
+        let first = self.first_segment_mut()?;
+        (first.len() == len).then_some(first)
+    }
 
     /// Prepends bytes immediately before the current packet start.
     ///

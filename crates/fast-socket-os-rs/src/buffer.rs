@@ -34,7 +34,7 @@ use std::thread::{self, ThreadId};
 use crossbeam_queue::ArrayQueue;
 use fast_socket_rs::{
     BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
-    ReserveError, Segment,
+    ReserveError, Segment, SegmentMut,
 };
 
 const SLAB_SIZE: usize = 64;
@@ -614,6 +614,14 @@ macro_rules! impl_os_packet_buffer {
                 (!self.is_empty()).then_some(self.as_slice()).into_iter()
             }
 
+            fn first_segment(&self) -> Option<Segment<'_>> {
+                (!self.is_empty()).then_some(self.as_slice())
+            }
+
+            fn contiguous(&self) -> Option<&[u8]> {
+                Some(self.as_slice())
+            }
+
             fn read_at_exact(
                 &self,
                 offset: usize,
@@ -630,6 +638,21 @@ impl_os_packet_buffer!(OsPacketBufMut);
 
 impl PacketBufferMut for OsPacketBufMut {
     type Frozen = OsPacketBuf;
+    type SegmentsMut<'a> = std::option::IntoIter<SegmentMut<'a>>;
+
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_> {
+        (!self.is_empty())
+            .then_some(self.as_mut_slice())
+            .into_iter()
+    }
+
+    fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>> {
+        (!self.is_empty()).then_some(self.as_mut_slice())
+    }
+
+    fn contiguous_mut(&mut self) -> Option<&mut [u8]> {
+        Some(self.as_mut_slice())
+    }
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
         if bytes.len() > self.headroom() {

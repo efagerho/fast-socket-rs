@@ -37,14 +37,14 @@ pub trait PacketBuffer {
 
     fn len(&self) -> usize;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    fn is_empty(&self) -> bool;
 
     fn headroom(&self) -> usize;
     fn tailroom(&self) -> usize;
     fn layout(&self) -> &BufferLayout;
     fn segments(&self) -> Self::Segments<'_>;
+    fn first_segment(&self) -> Option<Segment<'_>>;
+    fn contiguous(&self) -> Option<&[u8]>;
     fn read_at_exact(
         &self,
         offset: usize,
@@ -55,26 +55,39 @@ pub trait PacketBuffer {
 pub trait PacketBufferMut: PacketBuffer {
     type Frozen: PacketBuffer;
 
+    type SegmentsMut<'a>: Iterator<Item = SegmentMut<'a>>
+    where
+        Self: 'a;
+
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_>;
+    fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>>;
+    fn contiguous_mut(&mut self) -> Option<&mut [u8]>;
+
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;
 
-    fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
-        self.prepend(bytes)
-    }
+    fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;
 
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError>;
 
     fn extend_from_slice_relocating(
         &mut self,
         bytes: &[u8],
-    ) -> Result<(), BufferAccessError> {
-        self.extend_from_slice(bytes)
-    }
+    ) -> Result<(), BufferAccessError>;
 
     fn trim_prefix(&mut self, len: usize) -> Result<(), BufferAccessError>;
     fn trim_suffix(&mut self, len: usize) -> Result<(), BufferAccessError>;
     fn freeze(self) -> Self::Frozen;
 }
 ```
+
+`segments` exposes borrowed packet chunks in packet-byte order. Parsers that can
+consume scatter-gather input can use it directly. Parsers that need one slice
+can first try `contiguous`; when it returns `None`, the packet spans more than
+one segment and the parser must either handle segments or copy the needed bytes
+with `read_at_exact`. `first_segment` is useful for header parsers that only
+need the leading contiguous bytes. Mutable buffers expose the same model through
+`segments_mut`, `first_segment_mut`, and `contiguous_mut` for in-place parsing
+and edits.
 
 Some layers accept immutable packet buffers and then need to recover mutable
 ownership to prepend or append protocol headers. Immutable buffers that support
@@ -178,12 +191,8 @@ where
 
     fn socket_id(&self) -> SocketId;
     fn mtu(&self) -> usize;
-    fn worker_affinity(&self) -> QueueAffinity {
-        QueueAffinity::Any
-    }
-    fn capabilities(&self) -> UdpCapabilities {
-        UdpCapabilities::default()
-    }
+    fn worker_affinity(&self) -> QueueAffinity;
+    fn capabilities(&self) -> UdpCapabilities;
     fn allocate_tx_batch(
         &mut self,
         out: &mut Vec<UdpTxBufferMut<Self>>,
@@ -244,9 +253,7 @@ where
         out: &mut RecvBatch<UdpReceive<UdpRxBuffer<Self>, Self::RecvMeta>>,
     ) -> Result<usize, Error>;
     fn drain_tx_completions(&mut self) -> Result<usize, Error>;
-    fn notify_tx(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
+    fn notify_tx(&mut self) -> Result<(), Error>;
 }
 ```
 
@@ -307,9 +314,7 @@ where
 
     fn socket_id(&self) -> SocketId;
     fn mtu(&self) -> usize;
-    fn worker_affinity(&self) -> QueueAffinity {
-        QueueAffinity::Any
-    }
+    fn worker_affinity(&self) -> QueueAffinity;
     fn driver(&self) -> &Self::Driver;
     fn driver_mut(&mut self) -> &mut Self::Driver;
     fn allocate_tx_batch(
@@ -328,9 +333,7 @@ where
     fn recv(&mut self, out: &mut RecvBatch<IpPacketRxItem<Self>>)
         -> Result<usize, Error>;
     fn drain_tx_completions(&mut self) -> Result<usize, Error>;
-    fn notify_tx(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
+    fn notify_tx(&mut self) -> Result<(), Error>;
 }
 ```
 

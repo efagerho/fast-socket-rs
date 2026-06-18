@@ -2,7 +2,7 @@
 
 use fast_socket_rs::{
     BufferAccessError, BufferLayout, OwnedPacketBuffer, PacketBuffer, PacketBufferMut,
-    ReserveError, Segments,
+    ReserveError, Segments, SegmentsMut,
 };
 
 #[derive(Debug)]
@@ -169,6 +169,15 @@ impl PacketBuffer for PacketBufMut {
 
 impl PacketBufferMut for PacketBufMut {
     type Frozen = PacketBuf;
+    type SegmentsMut<'a> = SegmentsMut<'a>;
+
+    fn segments_mut(&mut self) -> Self::SegmentsMut<'_> {
+        if self.is_empty() {
+            None.into_iter()
+        } else {
+            Some(self.as_mut_slice()).into_iter()
+        }
+    }
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
         if bytes.len() > self.headroom() {

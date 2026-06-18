@@ -913,8 +913,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use fast_socket_rs::{
-        BufferAccessError, BufferLayout, PacketBuffer, ReserveError, Segment, Segments, SocketId,
-        UdpRecvMeta, WaitOutcome, WakeHandle,
+        BufferAccessError, BufferLayout, PacketBuffer, ReserveError, Segment, Segments,
+        SegmentsMut, SocketId, UdpRecvMeta, WaitOutcome, WakeHandle,
     };
 
     use super::*;
@@ -982,6 +982,15 @@ mod tests {
 
     impl PacketBufferMut for TestBuf {
         type Frozen = Self;
+        type SegmentsMut<'a> = SegmentsMut<'a>;
+
+        fn segments_mut(&mut self) -> Self::SegmentsMut<'_> {
+            if self.is_empty() {
+                None.into_iter()
+            } else {
+                Some(self.bytes.as_mut_slice()).into_iter()
+            }
+        }
 
         fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError> {
             if bytes.is_empty() {
