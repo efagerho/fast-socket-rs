@@ -4,9 +4,9 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use fast_socket_rs::{
-    BufferLayout, BusyPollDriver, EgressResolver, Error, IpPacketReceive, IpPacketRecvMeta,
-    IpPacketSocket, IpPacketTransmit, IpVersion, PacketBuffer, PacketBufferMut, RecvBatch,
-    SendError, TxSlot, V4Only,
+    BufferLayout, BusyPollDriver, Error, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
+    IpPacketTransmit, IpVersion, PacketBuffer, PacketBufferMut, RecvBatch, SendError, TxSlot,
+    V4Only,
 };
 
 #[path = "../tests/support/mod.rs"]
@@ -130,8 +130,8 @@ impl IpPacketSocket for BenchIpPacketSocket {
 #[derive(Clone, Copy, Debug)]
 struct StaticResolver;
 
-impl EgressResolver<V4Only, ()> for StaticResolver {
-    fn resolve_egress(&self, _dst: Ipv4Addr) -> Option<()> {
+impl StaticResolver {
+    fn resolve(&self, _dst: Ipv4Addr) -> Option<()> {
         Some(())
     }
 }
@@ -156,9 +156,7 @@ fn route_one(socket: &mut BenchIpPacketSocket, resolver: &StaticResolver) {
     }
     let mut item = rx.drain().next().unwrap();
     item.packet.as_mut_slice()[8] -= 1;
-    resolver
-        .resolve_egress(Ipv4Addr::new(198, 51, 100, 1))
-        .unwrap();
+    resolver.resolve(Ipv4Addr::new(198, 51, 100, 1)).unwrap();
     let mut tx = [TxSlot::Ready(IpPacketTransmit::new(
         item.packet.freeze(),
         (),

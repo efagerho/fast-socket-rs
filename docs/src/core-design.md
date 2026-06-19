@@ -81,10 +81,10 @@ packet path:
 - IP family and egress handle for complete IP datagram sockets.
 
 Those associated types let generic worker code be monomorphized for the exact
-backend and packet representation in use. The same pattern appears in routing:
-`RouteTable`, `NeighborTable`, and `EgressResolver` let general code use normal
-routing state while specialized applications can provide static or precomputed
-answers.
+backend and packet representation in use. Routing and egress customization stays
+backend-specific: each backend can expose the context and cached data-plane
+state it actually needs without forcing every implementation through a generic
+route-table or neighbor-table model.
 
 Polling is also type-shaped. Every socket has a `PollDriver` with a compile-time
 `PollMode`. A worker can choose a wait-driven or busy-poll loop once at startup

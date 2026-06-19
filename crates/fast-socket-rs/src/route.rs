@@ -1,10 +1,7 @@
-//! Route and neighbor identifiers.
+//! Routing identifiers.
 use core::fmt;
 
-use crate::ip_packet::IpPacketEgress;
-use crate::{IfIndex, IpFamily, Mixed};
-
-/// Opaque route identifier for core egress handles and table implementations.
+/// Opaque route identifier for core egress handles and backend route state.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct RouteId(u64);
@@ -117,89 +114,5 @@ impl core::str::FromStr for LinkAddr {
             return Err(LinkAddrParseError::WrongOctetCount);
         }
         Ok(Self(octets))
-    }
-}
-
-/// Result of routing an IP destination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RouteHop<A> {
-    /// Outgoing interface.
-    pub ifindex: IfIndex,
-    /// Next-hop IP address. For directly attached subnets this equals the destination.
-    pub next_hop: A,
-}
-
-/// Destination-IP to route-hop lookup.
-pub trait RouteTable<F: IpFamily = Mixed> {
-    /// Resolves a destination IP into an outgoing interface and next hop.
-    fn resolve_route(&self, dst: F::Addr) -> Option<RouteHop<F::Addr>>;
-}
-
-/// Next-hop-IP to link-layer-address lookup.
-pub trait NeighborTable<F: IpFamily = Mixed> {
-    /// Resolves a next-hop IP into a link-layer address.
-    fn resolve_l2(&self, next_hop: F::Addr) -> Option<LinkAddr>;
-}
-
-/// Destination-IP to fully resolved backend egress lookup.
-pub trait EgressResolver<F: IpFamily, E: IpPacketEgress> {
-    /// Resolves a destination IP into the concrete egress value consumed by IP packet sends.
-    fn resolve_egress(&self, dst: F::Addr) -> Option<E>;
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::Ipv4Addr;
-
-    use super::*;
-    use crate::{CoreEgress, V4Only};
-
-    struct StaticRoute;
-
-    impl RouteTable<V4Only> for StaticRoute {
-        fn resolve_route(&self, dst: Ipv4Addr) -> Option<RouteHop<Ipv4Addr>> {
-            Some(RouteHop {
-                ifindex: IfIndex::new(2),
-                next_hop: dst,
-            })
-        }
-    }
-
-    struct StaticNeighbor;
-
-    impl NeighborTable<V4Only> for StaticNeighbor {
-        fn resolve_l2(&self, _next_hop: Ipv4Addr) -> Option<LinkAddr> {
-            Some(LinkAddr::new([0, 1, 2, 3, 4, 5]))
-        }
-    }
-
-    struct Resolver<R, N> {
-        route: R,
-        neighbor: N,
-    }
-
-    impl<R, N> EgressResolver<V4Only, CoreEgress> for Resolver<R, N>
-    where
-        R: RouteTable<V4Only>,
-        N: NeighborTable<V4Only>,
-    {
-        fn resolve_egress(&self, dst: Ipv4Addr) -> Option<CoreEgress> {
-            let route = self.route.resolve_route(dst)?;
-            let _link = self.neighbor.resolve_l2(route.next_hop)?;
-            Some(CoreEgress::Neighbor(NeighborId::new(42)))
-        }
-    }
-
-    #[test]
-    fn resolver_composes_route_and_neighbor_tables() {
-        let resolver = Resolver {
-            route: StaticRoute,
-            neighbor: StaticNeighbor,
-        };
-
-        assert_eq!(
-            resolver.resolve_egress(Ipv4Addr::new(192, 0, 2, 1)),
-            Some(CoreEgress::Neighbor(NeighborId::new(42)))
-        );
     }
 }

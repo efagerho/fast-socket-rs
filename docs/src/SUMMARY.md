@@ -19,6 +19,7 @@
 # Internals
 
 - [OS Socket Backend](./os-socket-backend.md)
+- [XDP Socket Backend](./xdp-socket-backend.md)
 - [Poptrie Route Tables](./poptrie-route-tables.md)
 
 # Reference

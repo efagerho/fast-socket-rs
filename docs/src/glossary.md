@@ -171,50 +171,6 @@ routing model while the core IP packet trait remains generic over that handle.
 pub trait IpPacketEgress: Copy + 'static {}
 ```
 
-### `RouteTable`
-
-`RouteTable` resolves a destination IP address into a `RouteHop`: the outgoing
-interface and next-hop address.
-
-It exists to keep layer-3 route lookup separate from sockets and transmit
-descriptors. Applications can use a general route table or provide a specialized
-one that encodes deployment-specific knowledge.
-
-```rust,ignore
-pub trait RouteTable<F: IpFamily = Mixed> {
-    fn resolve_route(&self, dst: F::Addr) -> Option<RouteHop<F::Addr>>;
-}
-```
-
-### `NeighborTable`
-
-`NeighborTable` resolves a next-hop IP address into a link-layer address.
-
-It exists to keep layer-2 neighbor resolution separate from route lookup. That
-separation lets an application replace only the neighbor path, cache fixed
-answers, or compose different route and neighbor implementations.
-
-```rust,ignore
-pub trait NeighborTable<F: IpFamily = Mixed> {
-    fn resolve_l2(&self, next_hop: F::Addr) -> Option<LinkAddr>;
-}
-```
-
-### `EgressResolver`
-
-`EgressResolver` resolves a destination IP address directly into the concrete
-egress handle consumed by an IP packet socket.
-
-It exists as the composition point between routing, neighbor resolution, and
-backend-specific transmit handles. General code can resolve egress through route
-and neighbor tables, while specialized code can return a precomputed handle.
-
-```rust,ignore
-pub trait EgressResolver<F: IpFamily, E: IpPacketEgress> {
-    fn resolve_egress(&self, dst: F::Addr) -> Option<E>;
-}
-```
-
 ### `UdpSocket`
 
 `UdpSocket` is the high-level socket trait for UDP payloads. It exposes
@@ -417,13 +373,11 @@ where
 
 ### Route structs
 
-- `RouteId` is an opaque route identifier used by core egress handles and route
-  table implementations.
+- `RouteId` is an opaque route identifier used by core egress handles and
+  backend route state.
 - `NeighborId` is an opaque neighbor identifier used by core egress handles and
-  neighbor table implementations.
+  backend neighbor state.
 - `LinkAddr` is a six-octet link-layer address.
-- `RouteHop<A>` is the result of route lookup: outgoing interface plus next-hop
-  address.
 
 ### System structs
 

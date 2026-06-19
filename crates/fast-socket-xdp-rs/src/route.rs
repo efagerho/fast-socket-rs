@@ -7,9 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use fast_socket_rs::{
-    EgressResolver, IfIndex, LinkAddr, NeighborTable, QueueId, RouteHop, RouteTable, V4Only,
-};
+use fast_socket_rs::{IfIndex, LinkAddr, QueueId};
 use poptrie::Ipv4Poptrie;
 
 use crate::egress::{ResolvedL2, XdpEgress, XdpResolvedEgress, build_ethernet_header};
@@ -250,16 +248,6 @@ impl RouteSnapshot {
     pub fn upsert_interface(&mut self, interface: InterfaceInfo) {
         self.interfaces.insert(interface.ifindex, interface);
         self.rebuild_egress_index_v4();
-    }
-
-    /// Resolves an IPv4 route.
-    #[must_use]
-    pub fn route_v4(&self, dst: Ipv4Addr) -> Option<RouteHop<Ipv4Addr>> {
-        let route = self.lookup_route_v4(dst)?;
-        Some(RouteHop {
-            ifindex: route.ifindex,
-            next_hop: route.gateway.unwrap_or(dst),
-        })
     }
 
     /// Resolves an IPv4 egress handle.
@@ -521,35 +509,6 @@ impl RouteSnapshot {
     }
 }
 
-impl RouteTable<V4Only> for RouteSnapshot {
-    fn resolve_route(&self, dst: Ipv4Addr) -> Option<RouteHop<Ipv4Addr>> {
-        self.route_v4(dst)
-    }
-}
-
-impl NeighborTable<V4Only> for RouteSnapshot {
-    /// Best-effort L2 resolution by next-hop IP **only**.
-    ///
-    /// The `NeighborTable` trait has no interface parameter, so on a multi-homed
-    /// host where the same next-hop IP exists on more than one interface this
-    /// returns the first matching MAC across any interface and may pick the
-    /// wrong one. The AF_XDP transmit path does not use this method; it resolves
-    /// through the interface-keyed [`Self::egress_v4_for_interface`], which
-    /// disambiguates by `(ifindex, next_hop)`. Prefer that for queue-local
-    /// egress; this impl exists only for generic `NeighborTable` consumers.
-    fn resolve_l2(&self, next_hop: Ipv4Addr) -> Option<LinkAddr> {
-        self.neighbors_v4
-            .iter()
-            .find_map(|((_ifindex, ip), mac)| (*ip == next_hop).then_some(*mac))
-    }
-}
-
-impl EgressResolver<V4Only, XdpEgress> for RouteSnapshot {
-    fn resolve_egress(&self, dst: Ipv4Addr) -> Option<XdpEgress> {
-        self.egress_v4(dst)
-    }
-}
-
 /// Queue-local route state with cold-path update adoption.
 #[derive(Clone, Debug)]
 pub struct XdpLocalRoutes {
@@ -633,12 +592,6 @@ impl XdpLocalRoutes {
 impl Default for XdpLocalRoutes {
     fn default() -> Self {
         Self::new(RouteSnapshot::new())
-    }
-}
-
-impl EgressResolver<V4Only, XdpEgress> for XdpLocalRoutes {
-    fn resolve_egress(&self, dst: Ipv4Addr) -> Option<XdpEgress> {
-        self.resolve_v4(dst)
     }
 }
 
@@ -791,18 +744,20 @@ mod tests {
             mtu: 1500,
         });
 
-        let hop = snapshot
-            .route_v4(Ipv4Addr::new(10, 1, 2, 200))
+        let route = snapshot
+            .lookup_route_v4(Ipv4Addr::new(10, 1, 2, 200))
             .expect("longest prefix match");
-        assert_eq!(hop.ifindex, IfIndex::new(9), "lowest priority /24 wins");
+        assert_eq!(route.ifindex, IfIndex::new(9), "lowest priority /24 wins");
 
-        let hop = snapshot
-            .route_v4(Ipv4Addr::new(10, 9, 9, 9))
+        let route = snapshot
+            .lookup_route_v4(Ipv4Addr::new(10, 9, 9, 9))
             .expect("falls back to the covering /8");
-        assert_eq!(hop.ifindex, IfIndex::new(2));
+        assert_eq!(route.ifindex, IfIndex::new(2));
 
         assert!(
-            snapshot.route_v4(Ipv4Addr::new(11, 0, 0, 1)).is_none(),
+            snapshot
+                .lookup_route_v4(Ipv4Addr::new(11, 0, 0, 1))
+                .is_none(),
             "no route outside the /8"
         );
     }

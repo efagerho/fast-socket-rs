@@ -11,12 +11,12 @@ use std::time::Duration;
 #[cfg(test)]
 use fast_socket_rs::OwnedPacketBuffer;
 use fast_socket_rs::{
-    BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, EgressResolver,
-    Error, IfIndex, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion,
-    NumaNode, PacketBuffer, PacketBufferMut, PollDriver, PollMode, QueueAffinity, QueueId,
-    RawDevice, RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities,
-    UdpEndpointInfo, UdpEndpointSpec, UdpEndpointTransmit, UdpReceive, UdpRecvMeta, UdpSocket,
-    UdpTransmit, V4Only, WaitOutcome, WakeHandle,
+    BusyPollDriver, Capabilities, ChecksumStatus, DeviceError, DeviceErrorKind, Error, IfIndex,
+    IpPacketReceive, IpPacketRecvMeta, IpPacketSocket, IpPacketTransmit, IpVersion, NumaNode,
+    PacketBuffer, PacketBufferMut, PollDriver, PollMode, QueueAffinity, QueueId, RawDevice,
+    RawDeviceStats, RecvBatch, SendError, SocketId, TxSlot, UdpCapabilities, UdpEndpointInfo,
+    UdpEndpointSpec, UdpEndpointTransmit, UdpReceive, UdpRecvMeta, UdpSocket, UdpTransmit, V4Only,
+    WaitOutcome, WakeHandle,
 };
 
 use crate::buffer::{
@@ -191,7 +191,7 @@ pub trait XdpUdpRouter {
     /// [`Self::resolve_udp_egress_resolved`] and rejects any egress that does
     /// not match `context` (wrong interface/queue) or is not IPv4. Routers
     /// backed by a queue-local snapshot override this to return the prebuilt
-    /// header **by reference** with no per-packet copy, queue stamp, or
+    /// header by reference with no per-packet copy, queue stamp, or
     /// revalidation.
     fn resolve_udp_l2(&self, dst: Ipv4Addr, context: XdpRouteContext) -> Option<ResolvedL2<'_>> {
         let resolved = self.resolve_udp_egress_resolved(dst, context)?;
@@ -294,17 +294,9 @@ impl XdpUdpRouter for XdpQueueLocalRouter {
             .resolve_l2_for_interface(dst, context.ifindex, context.mtu)
     }
 
+    #[inline]
     fn route_generation(&self) -> u64 {
         self.routes.generation()
-    }
-}
-
-impl<T> XdpUdpRouter for T
-where
-    T: EgressResolver<V4Only, XdpEgress>,
-{
-    fn resolve_udp_egress(&self, dst: Ipv4Addr, _context: XdpRouteContext) -> Option<XdpEgress> {
-        EgressResolver::resolve_egress(self, dst)
     }
 }
 
@@ -1965,7 +1957,7 @@ impl UdpEgressContext {
             return Err(Error::InvalidPacket);
         };
         let resolved = router
-            .resolve_udp_egress_resolved(
+            .resolve_udp_l2(
                 *destination.ip(),
                 XdpRouteContext {
                     ifindex: self.ifindex,
@@ -1974,13 +1966,13 @@ impl UdpEgressContext {
                 },
             )
             .ok_or(Error::NoEgressRoute)?;
-        let egress = resolved.egress();
-
-        validate_xdp_udp_egress(self.ifindex, self.queue_id, egress)?;
+        let l2_header = resolved.l2_header();
+        let mut header = [0; VLAN_HEADER_LEN];
+        header[..l2_header.len()].copy_from_slice(l2_header);
         Ok(ResolvedUdpEgress {
-            l2_header: resolved.l2_header_array(),
-            l2_len: resolved.l2_len(),
-            ip_mtu: self.mtu.min(resolved.mtu() as usize),
+            l2_header: header,
+            l2_len: l2_header.len(),
+            ip_mtu: resolved.ip_mtu(),
         })
     }
 }
@@ -3354,21 +3346,6 @@ fn validate_xdp_udp_endpoint_payload(
     Ok(())
 }
 
-#[cfg(test)]
-fn validate_xdp_udp_egress(
-    ifindex: IfIndex,
-    queue_id: QueueId,
-    egress: XdpEgress,
-) -> Result<(), Error> {
-    if egress.ifindex != ifindex || egress.queue != queue_id {
-        return Err(Error::NoEgressRoute);
-    }
-    if egress.ethertype != ETHERTYPE_IPV4 {
-        return Err(Error::InvalidPacket);
-    }
-    Ok(())
-}
-
 fn validate_xdp_ip_transmit(
     ifindex: IfIndex,
     queue_id: QueueId,
@@ -4067,8 +4044,29 @@ mod tests {
             _dst: Ipv4Addr,
             context: XdpRouteContext,
         ) -> Option<XdpEgress> {
-            (context.ifindex == self.egress.ifindex && context.queue == self.egress.queue)
+            (context.ifindex == self.egress.ifindex
+                && context.queue == self.egress.queue
+                && self.egress.ethertype == ETHERTYPE_IPV4)
                 .then_some(self.egress)
+        }
+
+        fn resolve_udp_l2(
+            &self,
+            _dst: Ipv4Addr,
+            context: XdpRouteContext,
+        ) -> Option<ResolvedL2<'_>> {
+            if context.ifindex != self.egress.ifindex
+                || context.queue != self.egress.queue
+                || self.egress.ethertype != ETHERTYPE_IPV4
+            {
+                return None;
+            }
+            let (l2_header, l2_len) = crate::egress::build_ethernet_header(self.egress);
+            Some(ResolvedL2::Inline {
+                l2_header,
+                l2_len,
+                ip_mtu: context.mtu.min(self.egress.mtu as usize),
+            })
         }
     }
 

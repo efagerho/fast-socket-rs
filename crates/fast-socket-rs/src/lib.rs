@@ -40,10 +40,7 @@ pub use policy::{
     BusyPollDriver, BusyPollDriverKind, IpFamily, Mixed, PollDriver, PollMode, V4Only, V6Only,
     WaitDrivenDriverKind, WaitOutcome, WakeHandle,
 };
-pub use route::{
-    EgressResolver, LinkAddr, LinkAddrParseError, NeighborId, NeighborTable, RouteHop, RouteId,
-    RouteTable,
-};
+pub use route::{LinkAddr, LinkAddrParseError, NeighborId, RouteId};
 pub use sys::{HugePageSize, IfIndex, NumaNode, QueueAffinity, QueueId, SocketId};
 pub use udp::{
     EcnCodepoint, GenericUdpEndpoint, UdpCapabilities, UdpEndpointBatchBuilder, UdpEndpointInfo,

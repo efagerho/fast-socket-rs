@@ -7,6 +7,10 @@ application and a backend.
 This chapter is a map of the current public surface. Backend-specific builders
 and async integration layers are covered in later chapters.
 
+The trait snippets below are intentionally high-level: they omit default
+implementations and `where` clauses when those bounds are API plumbing rather
+than the behavior being documented.
+
 ## Buffers
 
 Avoiding packet copies is central to the fast socket model. On the receive path,
@@ -31,17 +35,15 @@ place, freeze the buffer, and submit it to another transmit path.
 
 ```rust,ignore
 pub trait PacketBuffer {
-    type Segments<'a>: Iterator<Item = Segment<'a>>
-    where
-        Self: 'a;
+    type Segments<'a>: Iterator<Item = Segment<'a>>;
 
     fn len(&self) -> usize;
-
     fn is_empty(&self) -> bool;
 
     fn headroom(&self) -> usize;
     fn tailroom(&self) -> usize;
     fn layout(&self) -> &BufferLayout;
+
     fn segments(&self) -> Self::Segments<'_>;
     fn first_segment(&self) -> Option<Segment<'_>>;
     fn contiguous(&self) -> Option<&[u8]>;
@@ -55,20 +57,15 @@ pub trait PacketBuffer {
 pub trait PacketBufferMut: PacketBuffer {
     type Frozen: PacketBuffer;
 
-    type SegmentsMut<'a>: Iterator<Item = SegmentMut<'a>>
-    where
-        Self: 'a;
+    type SegmentsMut<'a>: Iterator<Item = SegmentMut<'a>>;
 
     fn segments_mut(&mut self) -> Self::SegmentsMut<'_>;
     fn first_segment_mut(&mut self) -> Option<SegmentMut<'_>>;
     fn contiguous_mut(&mut self) -> Option<&mut [u8]>;
 
     fn prepend(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;
-
     fn prepend_relocating(&mut self, bytes: &[u8]) -> Result<(), ReserveError>;
-
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BufferAccessError>;
-
     fn extend_from_slice_relocating(
         &mut self,
         bytes: &[u8],
@@ -152,22 +149,6 @@ an `Arc` pointing to the socket's internal pool in every buffer. Incrementing
 the `Arc` on every packet adds significant overhead due to cross-core
 communication.
 
-## Batch Ownership
-
-`RecvBatch<T>` is caller-provided receive storage with fixed item capacity. A
-worker usually creates one batch per loop, calls `clear` before receiving, and
-drains the items after `recv`. `RecvBatch::with_capacity` requires capacity at
-least one.
-
-`TxSlot<T>` is the transmit ownership container. `TxSlot::Ready` contains a
-packet still owned by the caller. When a socket accepts a packet, it takes the
-packet out of the slot and leaves `TxSlot::Taken`.
-
-`send` accepts packets in order. On success, the returned count is the accepted
-prefix. On failure, `SendError::accepted` reports how many leading slots were
-accepted before the failing slot. Slots after the accepted prefix remain in the
-caller-provided slice and still belong to the caller.
-
 ## UDP Sockets
 
 `UdpSocket` is the core trait for UDP payload sockets. Its associated types
@@ -178,11 +159,7 @@ For normal OS backends, a concrete `UdpSocket` maps to one OS socket. For
 kernel-bypass backends, it usually maps to one NIC queue.
 
 ```rust,ignore
-pub trait UdpSocket
-where
-    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
-{
+pub trait UdpSocket {
     type RxBuffer: PacketBufferMut + Send;
     type TxBufferMut: PacketBufferMut + Send;
     type Driver: PollDriver;
@@ -197,9 +174,7 @@ where
         &mut self,
         out: &mut Vec<UdpTxBufferMut<Self>>,
         max: usize,
-    ) -> Result<usize, Error>
-    where
-        Self: Sized;
+    ) -> Result<usize, Error>;
     fn driver(&self) -> &Self::Driver;
     fn driver_mut(&mut self) -> &mut Self::Driver;
     fn send(
@@ -216,38 +191,27 @@ where
         &mut self,
         endpoint: &mut Self::Endpoint,
         batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
-    ) -> Result<usize, SendError>
-    where
-        Self: Sized;
+    ) -> Result<usize, SendError>;
     fn udp_endpoint_batch<'a>(
         &'a mut self,
         endpoint: &'a mut Self::Endpoint,
         max: usize,
-    ) -> UdpEndpointBatchBuilder<'a, Self>
-    where
-        Self: Sized;
-    fn send_udp_endpoint_batch<F>(
+    ) -> UdpEndpointBatchBuilder<'a, Self>;
+    fn send_udp_endpoint_batch(
         &mut self,
         endpoint: &mut Self::Endpoint,
         max: usize,
-        fill_payload: F,
-    ) -> Result<usize, SendError>
-    where
-        Self: Sized,
-        F: FnMut(usize, &mut [u8]) -> usize;
+        fill_payload: impl FnMut(usize, &mut [u8]) -> usize,
+    ) -> Result<usize, SendError>;
     fn send_all(
         &mut self,
         batch: &mut [TxSlot<UdpTransmit<UdpTxBuffer<Self>>>],
-    ) -> Result<usize, SendError>
-    where
-        Self: Sized;
+    ) -> Result<usize, SendError>;
     fn send_all_to_udp_endpoint(
         &mut self,
         endpoint: &mut Self::Endpoint,
         batch: &mut [TxSlot<UdpEndpointTransmit<UdpTxBuffer<Self>>>],
-    ) -> Result<usize, SendError>
-    where
-        Self: Sized;
+    ) -> Result<usize, SendError>;
     fn recv(
         &mut self,
         out: &mut RecvBatch<UdpReceive<UdpRxBuffer<Self>, Self::RecvMeta>>,
@@ -300,11 +264,7 @@ It adds two associated types:
 - `Egress`, the backend's resolved output handle for transmitted packets.
 
 ```rust,ignore
-pub trait IpPacketSocket
-where
-    <Self::RxBuffer as PacketBufferMut>::Frozen: Send,
-    <Self::TxBufferMut as PacketBufferMut>::Frozen: Send,
-{
+pub trait IpPacketSocket {
     type RxBuffer: PacketBufferMut + Send;
     type TxBufferMut: PacketBufferMut + Send;
     type Family: IpFamily;
@@ -321,15 +281,11 @@ where
         &mut self,
         out: &mut Vec<IpPacketTxBufferMut<Self>>,
         max: usize,
-    ) -> Result<usize, Error>
-    where
-        Self: Sized;
+    ) -> Result<usize, Error>;
     fn send(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>])
         -> Result<usize, SendError>;
     fn send_all(&mut self, batch: &mut [TxSlot<IpPacketTxItem<Self>>])
-        -> Result<usize, SendError>
-    where
-        Self: Sized;
+        -> Result<usize, SendError>;
     fn recv(&mut self, out: &mut RecvBatch<IpPacketRxItem<Self>>)
         -> Result<usize, Error>;
     fn drain_tx_completions(&mut self) -> Result<usize, Error>;
@@ -344,12 +300,22 @@ optional hop-limit handling, checksum offload flags, and an optional TSO segment
 size.
 
 The current core API has UDP and IP-packet socket traits. It does not expose a
-link-level socket trait.
+link-level socket trait. Endpoint fast paths do not currently exist for
+`IpPacketSocket`, but can be added later.
 
 ## Polling
 
 Every socket has a `PollDriver`. The driver declares a compile-time `MODE`:
 `PollMode::WaitDriven` or `PollMode::BusyPoll`.
+
+```rust,ignore
+pub trait PollDriver {
+    const MODE: PollMode;
+
+    fn wait(&mut self, timeout: Option<Duration>) -> Result<WaitOutcome, Error>;
+    fn wake_handle(&self) -> Option<WakeHandle<'_>>;
+}
+```
 
 Wait-driven drivers can wait for work through `wait(timeout)` and may expose a
 borrowed `WakeHandle`. On Unix, that wake handle wraps a borrowed file
@@ -366,14 +332,11 @@ code select wait-driven or busy-poll socket loops at compile time.
 `IpFamily` is the type-level address-family policy used by routing and IP packet
 metadata. The built-in policies are `Mixed`, `V4Only`, and `V6Only`.
 
-`RouteTable` maps a destination IP address to a `RouteHop`: outgoing interface
-and next-hop address. `NeighborTable` maps a next-hop address to a link-layer
-address. `EgressResolver` maps a destination directly to the concrete egress
-handle consumed by a backend.
-
-These traits are intentionally small. A general implementation can compose route
-and neighbor tables. A specialized implementation can return a cached egress
-handle or precomputed link-layer information.
+The core API does not expose generic route-table, neighbor-table, or egress
+resolver traits. Routing hooks are backend-specific because each backend needs
+different context and returns different cached data-plane state. For example,
+the XDP backend exposes `XdpUdpRouter`, whose resolved value can borrow cached
+link-layer headers from queue-local route state.
 
 ## Device-Side API
 

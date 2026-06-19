@@ -2,9 +2,8 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
 use fast_socket_rs::{
-    BufferLayout, BusyPollDriver, EgressResolver, Error, IpPacketReceive, IpPacketRecvMeta,
-    IpPacketSocket, IpPacketTransmit, IpVersion, PacketBufferMut, RecvBatch, SendError, TxSlot,
-    V4Only,
+    BufferLayout, BusyPollDriver, Error, IpPacketReceive, IpPacketRecvMeta, IpPacketSocket,
+    IpPacketTransmit, IpVersion, PacketBufferMut, RecvBatch, SendError, TxSlot, V4Only,
 };
 
 mod support;
@@ -123,8 +122,8 @@ impl IpPacketSocket for CaptureIpPacketSocket {
 #[derive(Clone, Copy, Debug)]
 struct StaticResolver;
 
-impl EgressResolver<V4Only, ()> for StaticResolver {
-    fn resolve_egress(&self, _dst: Ipv4Addr) -> Option<()> {
+impl StaticResolver {
+    fn resolve(&self, _dst: Ipv4Addr) -> Option<()> {
         Some(())
     }
 }
@@ -142,21 +141,18 @@ fn ipv4_packet(payload: &[u8], ttl: u8) -> Vec<u8> {
     packet
 }
 
-fn route_one<R>(
+fn route_one(
     socket: &mut CaptureIpPacketSocket,
-    resolver: &R,
+    resolver: &StaticResolver,
     dst: Ipv4Addr,
-) -> Result<usize, Error>
-where
-    R: EgressResolver<V4Only, ()>,
-{
+) -> Result<usize, Error> {
     let mut rx = RecvBatch::with_capacity(1);
     if socket.recv(&mut rx)? == 0 {
         return Ok(0);
     }
     let mut item = rx.drain().next().expect("one received item");
     item.packet.as_mut_slice()[8] -= 1;
-    resolver.resolve_egress(dst).ok_or(Error::NoEgressRoute)?;
+    resolver.resolve(dst).ok_or(Error::NoEgressRoute)?;
     let mut tx = [TxSlot::Ready(IpPacketTransmit::new(
         item.packet.freeze(),
         (),
